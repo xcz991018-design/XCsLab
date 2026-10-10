@@ -17,6 +17,7 @@ void ONVIFDeviceManager::logMessage(const std::string& msg) {
 }
 
 #include <QUdpSocket>
+#include <QTcpSocket>
 #include <QHostAddress>
 #include <QNetworkInterface>
 #include <QElapsedTimer>
@@ -178,7 +179,7 @@ std::vector<ONVIFDeviceInfo> ONVIFDeviceManager::probeDevicesWSDiscovery(int tim
                     }
 
                     dev.serialNumber = "SN-" + QString::number(qHash(senderIp)).toStdString();
-                    dev.rtspUri = "rtsp://admin:admin123@" + ipStd + ":554/h264/ch1/main/av_stream";
+                    dev.rtspUri = "rtsp://admin:@" + ipStd + ":554/h264/ch1/main/av_stream";
 
                     list.push_back(dev);
                 }
@@ -190,8 +191,65 @@ std::vector<ONVIFDeviceInfo> ONVIFDeviceManager::probeDevicesWSDiscovery(int tim
     return list;
 }
 
-#include <thread>
-#include <mutex>
+#ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#pragma comment(lib, "ws2_32.lib")
+#endif
+
+bool ONVIFDeviceManager::checkTcpPort(const std::string& ip, int port, int timeoutMs) {
+    if (ip.empty() || port <= 0) return false;
+#ifdef _WIN32
+    static bool wsaStarted = false;
+    if (!wsaStarted) {
+        WSADATA wsa;
+        WSAStartup(MAKEWORD(2, 2), &wsa);
+        wsaStarted = true;
+    }
+
+    SOCKET sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (sock == INVALID_SOCKET) return false;
+
+    u_long mode = 1;
+    ioctlsocket(sock, FIONBIO, &mode);
+
+    sockaddr_in addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(static_cast<u_short>(port));
+    inet_pton(AF_INET, ip.c_str(), &addr.sin_addr);
+
+    connect(sock, reinterpret_cast<sockaddr*>(&addr), sizeof(addr));
+
+    fd_set writeSet;
+    FD_ZERO(&writeSet);
+    FD_SET(sock, &writeSet);
+
+    timeval tv;
+    tv.tv_sec = timeoutMs / 1000;
+    tv.tv_usec = (timeoutMs % 1000) * 1000;
+
+    int res = select(0, nullptr, &writeSet, nullptr, &tv);
+    bool connected = false;
+    if (res > 0 && FD_ISSET(sock, &writeSet)) {
+        int optErr = 0;
+        int optLen = sizeof(optErr);
+        if (getsockopt(sock, SOL_SOCKET, SO_ERROR, reinterpret_cast<char*>(&optErr), &optLen) == 0) {
+            connected = (optErr == 0);
+        }
+    }
+    closesocket(sock);
+    return connected;
+#else
+    return true;
+#endif
+}
 
 bool ONVIFDeviceManager::open() {
     logMessage("Connecting to ONVIF Device XAddr: " + m_info.xaddr);
@@ -208,11 +266,24 @@ bool ONVIFDeviceManager::open() {
     m_isOpen = true;
     m_capAttempted = false;
     m_isRealStreamActive = false;
+    m_reconnectAttempts = 0;
+    m_consecutiveFailures = 0;
+
     {
         std::lock_guard<std::mutex> lock(m_mutex);
         m_sampleFrame = cv::Mat(); // Clear sample frame so network camera never defaults to 5-1-2.png
+        m_latestFrame = cv::Mat();
     }
-    tryOpenRealStreamAsync();
+
+    // Stop previous worker thread if any
+    m_workerRunning = false;
+    if (m_workerThread.joinable()) {
+        m_workerThread.join();
+    }
+
+    // Start background capture & reconnection watchdog thread
+    m_workerRunning = true;
+    m_workerThread = std::thread(&ONVIFDeviceManager::workerLoop, this);
     return true;
 }
 
@@ -242,88 +313,126 @@ void ONVIFDeviceManager::setSampleFrame(const cv::Mat& sample) {
     }
 }
 
-void ONVIFDeviceManager::tryOpenRealStreamAsync() {
-    if (m_capAttempted && m_isRealStreamActive) return;
-    m_capAttempted = true;
+void ONVIFDeviceManager::workerLoop() {
+    while (m_workerRunning) {
+        if (!m_isRealStreamActive) {
+            // STATE: DISCONNECTED / RECONNECTING
+            std::string ip = m_info.ipAddress;
+            int rtspPort = m_info.port > 0 ? m_info.port : 554;
 
-    std::string ip = m_info.ipAddress;
-    std::string user = m_info.username;
-    std::string pass = m_info.password;
+            // 1. Check physical network link (RTSP 554, Web 80, JLink 34567)
+            bool portOpen = checkTcpPort(ip, 554, 250) || 
+                           checkTcpPort(ip, static_cast<quint16>(rtspPort), 250) || 
+                           checkTcpPort(ip, 80, 250) ||
+                           checkTcpPort(ip, 34567, 250);
 
-    logMessage("[ONVIF] Initiating background RTSP stream probe for camera at " + ip + "...");
+            if (!portOpen) {
+                m_reconnectAttempts++;
+                std::this_thread::sleep_for(std::chrono::milliseconds(500));
+                continue;
+            }
 
-    std::thread([this, ip, user, pass]() {
-        std::vector<std::string> streamUrls = {
-            // Xiongmai & ONVIF Substream & Mainstream RTSP URLs (Empty Pass & Substream prioritized)
-            "rtsp://admin:@" + ip + ":554/h264/ch1/sub/av_stream",
-            "rtsp://admin:@" + ip + ":554/h264/ch1/main/av_stream",
-            "rtsp://admin:@" + ip + ":554/user=admin&password=&channel=1&stream=1.sdp",
-            "rtsp://admin:@" + ip + ":554/user=admin&password=&channel=1&stream=0.sdp",
-            "rtsp://" + user + ":" + pass + "@" + ip + ":554/h264/ch1/sub/av_stream",
-            "rtsp://" + user + ":" + pass + "@" + ip + ":554/h264/ch1/main/av_stream",
-            "rtsp://admin:123456@" + ip + ":554/h264/ch1/sub/av_stream",
-            "rtsp://admin:123456@" + ip + ":554/h264/ch1/main/av_stream",
-            "rtsp://admin:admin123@" + ip + ":554/h264/ch1/sub/av_stream",
-            "rtsp://admin:admin123@" + ip + ":554/h264/ch1/main/av_stream",
-            "rtsp://admin:admin@" + ip + ":554/h264/ch1/sub/av_stream",
-            "rtsp://admin:admin@" + ip + ":554/h264/ch1/main/av_stream",
-            "rtsp://" + ip + ":554/h264/ch1/sub/av_stream",
-            "rtsp://" + ip + ":554/h264/ch1/main/av_stream",
-            "rtsp://" + ip + ":554/cam/realmonitor?channel=1&subtype=1",
-            "rtsp://" + ip + ":554/cam/realmonitor?channel=1&subtype=0",
-            "rtsp://" + ip + ":554/live/sub",
-            "rtsp://" + ip + ":554/live/main",
-            // Xiongmai HTTP Snapshot URLs
-            "http://" + ip + ":80/snapshot.cgi",
-            "http://admin:@" + ip + ":80/snapshot.cgi",
-            "http://admin:123456@" + ip + ":80/snapshot.cgi",
-            "http://" + ip + ":80/jpeg",
-            "http://" + ip + ":80/cgi-bin/snapshot.cgi"
-        };
+            // 2. Physical link established! Camera is online!
+            logMessage("[ONVIF] 🟢 检测到摄像头物理网线已接通 (IP: " + ip + ")，正在启动自动拉流恢复...");
 
-        for (const auto& url : streamUrls) {
-            if (!m_isOpen) break;
-            logMessage("[ONVIF] Probing stream URL: " + url);
+            // 3. Candidate RTSP URLs (Xiongmai default empty password URLs prioritized)
+            std::vector<std::string> streamUrls;
+            if (!m_connectedUrl.empty()) streamUrls.push_back(m_connectedUrl);
+            if (!m_info.rtspUri.empty() && m_info.rtspUri != m_connectedUrl) streamUrls.push_back(m_info.rtspUri);
+            streamUrls.push_back("rtsp://admin:@" + ip + ":554/h264/ch1/main/av_stream");
+            streamUrls.push_back("rtsp://admin:@" + ip + ":554/h264/ch1/sub/av_stream");
+            streamUrls.push_back("rtsp://" + ip + ":554/user=admin&password=&channel=1&stream=0.sdp");
+            streamUrls.push_back("rtsp://" + ip + ":554/user=admin&password=&channel=1&stream=1.sdp");
+            streamUrls.push_back("rtsp://" + ip + ":554/h264/ch1/main/av_stream");
+            streamUrls.push_back("rtsp://" + ip + ":554/h264/ch1/sub/av_stream");
+            streamUrls.push_back("rtsp://admin:@" + ip + ":554/live/main");
+            streamUrls.push_back("rtsp://admin:@" + ip + ":554/live/sub");
+            streamUrls.push_back("rtsp://" + ip + ":554/live/main");
+            streamUrls.push_back("rtsp://" + ip + ":554/live/sub");
+            streamUrls.push_back("http://" + ip + ":80/snapshot.cgi");
 
-            cv::VideoCapture cap;
-            cap.open(url, cv::CAP_FFMPEG);
-            if (cap.isOpened()) {
-                cv::Mat testMat;
-                if (cap.read(testMat) && !testMat.empty()) {
+            bool connectSuccess = false;
+            for (const auto& url : streamUrls) {
+                if (!m_workerRunning) break;
+
+                cv::VideoCapture testCap;
+                std::vector<int> params = {
+                    cv::CAP_PROP_OPEN_TIMEOUT_MSEC, 2500,
+                    cv::CAP_PROP_READ_TIMEOUT_MSEC, 2500
+                };
+                testCap.open(url, cv::CAP_FFMPEG, params);
+                if (testCap.isOpened()) {
+                    cv::Mat testMat;
+                    if (testCap.read(testMat) && !testMat.empty()) {
+                        std::lock_guard<std::mutex> lock(m_mutex);
+                        if (m_cap.isOpened()) m_cap.release();
+                        m_cap = std::move(testCap);
+                        m_latestFrame = testMat.clone();
+                        m_isRealStreamActive = true;
+                        m_connectedUrl = url;
+                        m_consecutiveFailures = 0;
+                        m_reconnectAttempts = 0;
+                        m_lastFrameTime = std::chrono::steady_clock::now();
+                        connectSuccess = true;
+                        logMessage("[ONVIF] 视频流连接成功！实时画面已全面恢复: " + url);
+                        break;
+                    }
+                }
+            }
+
+            if (!connectSuccess) {
+                m_reconnectAttempts++;
+                std::this_thread::sleep_for(std::chrono::milliseconds(500));
+            }
+        } else {
+            // STATE: ACTIVE STREAMING
+            cv::Mat frame;
+            bool ok = false;
+            {
+                std::lock_guard<std::mutex> lock(m_mutex);
+                if (m_cap.isOpened()) {
+                    ok = m_cap.read(frame);
+                }
+            }
+
+            if (ok && !frame.empty()) {
+                {
                     std::lock_guard<std::mutex> lock(m_mutex);
-                    m_cap = std::move(cap);
-                    m_isRealStreamActive = true;
-                    m_connectedUrl = url;
-                    logMessage("[ONVIF] SUCCESS! Connected to live ONVIF stream at: " + url);
-                    break;
+                    m_latestFrame = std::move(frame);
+                    m_lastFrameTime = std::chrono::steady_clock::now();
+                    m_consecutiveFailures = 0;
+                }
+                std::this_thread::sleep_for(std::chrono::milliseconds(20));
+            } else {
+                // Read frame failed
+                m_consecutiveFailures++;
+                if (m_consecutiveFailures >= 3) {
+                    logMessage("[ONVIF] 检测到网络视频流中断（网线拔出或连接断开），释放底层连接并进入自动重连监控...");
+                    std::lock_guard<std::mutex> lock(m_mutex);
+                    if (m_cap.isOpened()) m_cap.release();
+                    m_isRealStreamActive = false;
+                    m_consecutiveFailures = 0;
                 }
             }
         }
-
-        if (!m_isRealStreamActive && m_isOpen) {
-            logMessage("[ONVIF] WARNING: Could not connect to RTSP/HTTP stream on " + ip);
-        }
-    }).detach();
+    }
 }
 
 bool ONVIFDeviceManager::grabFrame(cv::Mat& frame) {
     if (!m_isOpen) return false;
-
     m_frameCount++;
 
-    // 1. Read from real camera RTSP video stream if active (zero-delay buffer flush)
-    {
+    // 1. Read latest frame from background streaming worker (zero-delay)
+    if (m_isRealStreamActive) {
         std::lock_guard<std::mutex> lock(m_mutex);
-        if (m_isRealStreamActive && m_cap.isOpened()) {
-            // Quickly flush any accumulated stale frames in OpenCV FFmpeg queue to get the newest frame
-            int flushed = 0;
-            while (m_cap.grab() && flushed < 3) {
-                flushed++;
-            }
-            if (m_cap.retrieve(frame) && !frame.empty()) {
+        if (!m_latestFrame.empty()) {
+            auto now = std::chrono::steady_clock::now();
+            auto ageMs = std::chrono::duration_cast<std::chrono::milliseconds>(now - m_lastFrameTime).count();
+            if (ageMs < 2000) {
+                frame = m_latestFrame.clone();
                 std::stringstream ss;
-                ss << "ONVIF RTSP Stream (LIVE STREAM) | IP: " << m_info.ipAddress
-                   << " | URL: " << m_connectedUrl << " | Frm: " << m_frameCount;
+                ss << "ONVIF RTSP Stream (LIVE) | IP: " << m_info.ipAddress
+                   << " | Frm: " << m_frameCount;
                 cv::putText(frame, ss.str(), cv::Point(20, 30),
                             cv::FONT_HERSHEY_SIMPLEX, 0.55, cv::Scalar(0, 255, 0), 2);
                 return true;
@@ -345,7 +454,7 @@ bool ONVIFDeviceManager::grabFrame(cv::Mat& frame) {
         }
     }
 
-    // 3. Dynamic Real-Time Diagnostic Connection Screen (DO NOT SILENTLY DISPLAY 5-1-2.png!)
+    // 3. Dynamic Real-Time Diagnostic Connection Screen (ASCII only, prevents ????)
     int w = 1280, h = 720;
     frame = cv::Mat::zeros(h, w, CV_8UC3);
 
@@ -353,23 +462,86 @@ bool ONVIFDeviceManager::grabFrame(cv::Mat& frame) {
     cv::line(frame, cv::Point(0, scanY), cv::Point(w, scanY), cv::Scalar(0, 80, 120), 2);
 
     std::stringstream ss1, ss2, ss3, ss4;
-    ss1 << "📷 ONVIF Camera RTSP Stream";
+    ss1 << "ONVIF Camera RTSP Stream";
     ss2 << "IP Address: " << m_info.ipAddress;
-    ss3 << "Status: Connecting to ONVIF RTSP/HTTP Stream (Attempt #" << (m_frameCount / 25 + 1) << ")...";
-    ss4 << "Check ONVIF Service & RTSP Password in Camera Settings";
+    if (m_reconnectAttempts.load() > 0 || !m_isRealStreamActive) {
+        ss3 << "Status: Video stream interrupted. Auto-reconnecting... (Attempt #" << m_reconnectAttempts.load() << ")";
+        ss4 << "Tip: Re-plugging network cable will restore feed automatically in 1-2s.";
+    } else {
+        ss3 << "Status: Connecting to ONVIF RTSP Video Stream...";
+        ss4 << "Checking camera RTSP service and TCP port...";
+    }
 
     cv::putText(frame, ss1.str(), cv::Point(50, 200), cv::FONT_HERSHEY_SIMPLEX, 1.1, cv::Scalar(0, 229, 255), 2);
     cv::putText(frame, ss2.str(), cv::Point(50, 270), cv::FONT_HERSHEY_SIMPLEX, 0.85, cv::Scalar(255, 255, 255), 2);
-    cv::putText(frame, ss3.str(), cv::Point(50, 340), cv::FONT_HERSHEY_SIMPLEX, 0.85, cv::Scalar(0, 215, 255), 2);
+    cv::putText(frame, ss3.str(), cv::Point(50, 340), cv::FONT_HERSHEY_SIMPLEX, 0.85, cv::Scalar(0, 165, 255), 2);
     cv::putText(frame, ss4.str(), cv::Point(50, 410), cv::FONT_HERSHEY_SIMPLEX, 0.75, cv::Scalar(150, 160, 180), 2);
 
     return true;
 }
 
+bool ONVIFDeviceManager::captureSingleSnapshot(cv::Mat& frame) {
+    // 1. If real-time stream already active and has fresh frame, return it immediately
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        if (m_isRealStreamActive && !m_latestFrame.empty()) {
+            frame = m_latestFrame.clone();
+            return true;
+        }
+    }
+
+    // 2. Perform fast standalone snapshot fetch without continuous background thread
+    std::string ip = m_info.ipAddress;
+    std::vector<std::string> snapshotCandidates;
+    if (!m_connectedUrl.empty()) snapshotCandidates.push_back(m_connectedUrl);
+    if (!m_info.rtspUri.empty() && m_info.rtspUri != m_connectedUrl) snapshotCandidates.push_back(m_info.rtspUri);
+    snapshotCandidates.push_back("rtsp://admin:@" + ip + ":554/h264/ch1/main/av_stream");
+    snapshotCandidates.push_back("rtsp://admin:@" + ip + ":554/live/main");
+    snapshotCandidates.push_back("http://" + ip + ":80/web/snapshot.jpg");
+    snapshotCandidates.push_back("http://" + ip + ":80/snapshot.cgi");
+
+    for (const auto& url : snapshotCandidates) {
+        cv::VideoCapture cap;
+        std::vector<int> params = {
+            cv::CAP_PROP_OPEN_TIMEOUT_MSEC, 2000,
+            cv::CAP_PROP_READ_TIMEOUT_MSEC, 2000
+        };
+        cap.open(url, cv::CAP_FFMPEG, params);
+        if (cap.isOpened()) {
+            cv::Mat tmp;
+            for (int k = 0; k < 2; ++k) {
+                if (cap.read(tmp) && !tmp.empty()) {
+                    frame = tmp.clone();
+                }
+            }
+            cap.release();
+            if (!frame.empty()) {
+                logMessage("[SNAPSHOT] 📷 单张高清抓拍图像已获取: " + url);
+                return true;
+            }
+        }
+    }
+
+    // 3. Fallback to sample frame if available
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        if (!m_sampleFrame.empty()) {
+            frame = m_sampleFrame.clone();
+            return true;
+        }
+    }
+
+    return grabFrame(frame);
+}
+
 void ONVIFDeviceManager::close() {
-    if (m_isOpen) {
+    if (m_isOpen || m_workerRunning) {
         logMessage("Closing ONVIF RTSP Stream connection for " + m_info.ipAddress);
         m_isOpen = false;
+        m_workerRunning = false;
+        if (m_workerThread.joinable()) {
+            m_workerThread.join();
+        }
         std::lock_guard<std::mutex> lock(m_mutex);
         if (m_cap.isOpened()) {
             m_cap.release();

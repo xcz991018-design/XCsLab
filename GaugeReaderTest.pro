@@ -7,6 +7,12 @@ QT       += core gui widgets concurrent network
 CONFIG   += c++17
 CONFIG   += utf8_source
 
+# Force MSVC compiler to use UTF-8 source and execution charset
+win32:MSVC {
+    QMAKE_CXXFLAGS += /utf-8
+    QMAKE_CFLAGS += /utf-8
+}
+
 TARGET    = GaugeReaderTest
 TEMPLATE  = app
 
@@ -22,6 +28,8 @@ win32 {
     } else {
         LIBS += -L"C:/openCV/opencv/build/x64/vc16/lib" -lopencv_world4120
     }
+
+    LIBS += -lws2_32
 }
 
 # Header Files
@@ -37,7 +45,8 @@ HEADERS += \
     $$PWD/include/PointerDetector.hpp \
     $$PWD/include/GB28181StreamManager.hpp \
     $$PWD/include/ONVIFDeviceManager.hpp \
-    $$PWD/include/AutoCameraDiscoveryService.hpp
+    $$PWD/include/AutoCameraDiscoveryService.hpp \
+    $$PWD/include/DeviceConfigManager.hpp
 
 # Source Files
 SOURCES += \
@@ -51,7 +60,8 @@ SOURCES += \
     $$PWD/src/FileCameraSource.cpp \
     $$PWD/src/GB28181StreamManager.cpp \
     $$PWD/src/ONVIFDeviceManager.cpp \
-    $$PWD/src/AutoCameraDiscoveryService.cpp
+    $$PWD/src/AutoCameraDiscoveryService.cpp \
+    $$PWD/src/DeviceConfigManager.cpp
 
 # Copy OpenCV DLL to output folder after build
 win32:MSVC {
@@ -61,3 +71,12 @@ win32:MSVC {
         QMAKE_POST_LINK += $(COPY_FILE) "C:\\openCV\\opencv\\build\\x64\\vc16\\bin\\opencv_world4120.dll" "$$OUT_PWD"
     }
 }
+
+# Deploy config directory (devices.json, gauge_profile.json) to output folder
+win32 {
+    CONFIG_IN_PATH = $$shell_path($$PWD/config)
+    CONFIG_OUT_PATH = $$shell_path($$OUT_PWD/config)
+    QMAKE_POST_LINK += $$escape_expand(\n\t) if not exist \"$$CONFIG_OUT_PATH\" $(MKDIR) \"$$CONFIG_OUT_PATH\"
+    QMAKE_POST_LINK += $$escape_expand(\n\t) $(COPY_DIR) \"$$CONFIG_IN_PATH\" \"$$CONFIG_OUT_PATH\"
+}
+

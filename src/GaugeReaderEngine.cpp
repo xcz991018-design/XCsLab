@@ -108,6 +108,11 @@ double GaugeReaderEngine::detectPointerAngleRobust(const cv::Mat& gray, const cv
     cfg.fineAngleRange = profile.fineAngleRange;
     cfg.minValidSectionRatio = profile.minValidSectionRatio;
 
+    // Forward optical polarity & dark entity constraints
+    cfg.requireDarkPointer = profile.require_dark_pointer;
+    cfg.minPointerDarkContrast = profile.min_pointer_dark_contrast;
+    cfg.maxPointerInsideGray = profile.max_pointer_inside_gray;
+
     PointerDetector detector(cfg);
     PointerResult ptrRes = detector.detect(gray, outScanVis);
     return ptrRes.angle;
@@ -257,7 +262,9 @@ GaugeResult GaugeReaderEngine::process(const cv::Mat& frame, GaugeProfile& profi
     res.unit = profile.unit;
 
     if (frame.empty()) {
-        res.errorMessage = "Input frame is empty";
+        res.errorStep = "步骤 1: 原始采集图像 (Original Stream Frame)";
+        res.errorMessage = "输入图像帧为空 (frame is empty)";
+        res.detailedDebugInfo = "❌ [Pipeline Error] 摄像头或输入图像源未采集到有效图像帧 (cv::Mat::empty)。";
         return res;
     }
 
@@ -325,75 +332,78 @@ GaugeResult GaugeReaderEngine::process(const cv::Mat& frame, GaugeProfile& profi
     }
     res.grayImage = gray.clone();
 
-    // 1. CLAHE (Contrast Limited Adaptive Histogram Equalization for Glare & Reflection Balancing)
-    double clipLimit = profile.clahe_clip_limit > 0 ? profile.clahe_clip_limit : 2.5;
-    int gridS = profile.clahe_grid_size > 0 ? profile.clahe_grid_size : 8;
-    cv::Ptr<cv::CLAHE> clahe = cv::createCLAHE(clipLimit, cv::Size(gridS, gridS));
     cv::Mat claheGray;
-    clahe->apply(gray, claheGray);
-
-    // 2. Gaussian Blur to reduce high-frequency specular noise
-    int gSize = (profile.gaussian_blur_size > 0 && profile.gaussian_blur_size % 2 == 1) ? profile.gaussian_blur_size : 7;
-    double gSigma = profile.gaussian_blur_sigma > 0 ? profile.gaussian_blur_sigma : 1.5;
     cv::Mat blurred;
-    cv::GaussianBlur(claheGray, blurred, cv::Size(gSize, gSize), gSigma);
-    cv::cvtColor(blurred, res.blurredImage, cv::COLOR_GRAY2BGR);
-
-    // 3. Channel A: Standard Otsu Thresholding
     cv::Mat threshOtsu;
-    cv::threshold(blurred, threshOtsu, 0, 255, cv::THRESH_BINARY + cv::THRESH_OTSU);
-
-    // 4. Channel B: Black-Hat Morphological Filter (Exposes solid dark pointer under reflections)
-    cv::Mat blackHat;
-    int hatSize = (profile.blackhat_kernel_size > 0 && profile.blackhat_kernel_size % 2 == 1) ? profile.blackhat_kernel_size : 21;
-    double hatThresh = profile.blackhat_threshold >= 0 ? profile.blackhat_threshold : 32.0;
-    cv::Mat kernelHat = cv::getStructuringElement(cv::MORPH_ELLIPSE, cv::Size(hatSize, hatSize));
-    cv::morphologyEx(claheGray, blackHat, cv::MORPH_BLACKHAT, kernelHat);
-
     cv::Mat threshBlackHat;
-    cv::threshold(blackHat, threshBlackHat, hatThresh, 255, cv::THRESH_BINARY);
-    cv::bitwise_not(threshBlackHat, threshBlackHat); // Invert so dark pointer is 0, background is 255
+    cv::Mat adaptMask;
+    cv::Mat threshCombined;
 
-    // 5. Channel C: High-Gradient Shadow Discrimination Mask
-    int bgSize = (profile.local_bg_kernel_size > 0 && profile.local_bg_kernel_size % 2 == 1) ? profile.local_bg_kernel_size : 35;
-    double diffThresh = profile.adapt_diff_threshold >= 0 ? profile.adapt_diff_threshold : 35.0;
-    float gradThresh = profile.grad_mag_threshold >= 0 ? static_cast<float>(profile.grad_mag_threshold) : 22.0f;
+    if (profile.enable_steps_4_to_9) {
+        // 1. CLAHE (Contrast Limited Adaptive Histogram Equalization for Glare & Reflection Balancing)
+        double clipLimit = profile.clahe_clip_limit > 0 ? profile.clahe_clip_limit : 2.5;
+        int gridS = profile.clahe_grid_size > 0 ? profile.clahe_grid_size : 8;
+        cv::Ptr<cv::CLAHE> clahe = cv::createCLAHE(clipLimit, cv::Size(gridS, gridS));
+        clahe->apply(gray, claheGray);
 
-    cv::Mat localBg;
-    cv::GaussianBlur(claheGray, localBg, cv::Size(bgSize, bgSize), 0);
+        // 2. Gaussian Blur to reduce high-frequency specular noise
+        int gSize = (profile.gaussian_blur_size > 0 && profile.gaussian_blur_size % 2 == 1) ? profile.gaussian_blur_size : 7;
+        double gSigma = profile.gaussian_blur_sigma > 0 ? profile.gaussian_blur_sigma : 1.5;
+        cv::GaussianBlur(claheGray, blurred, cv::Size(gSize, gSize), gSigma);
+        cv::cvtColor(blurred, res.blurredImage, cv::COLOR_GRAY2BGR);
 
-    cv::Mat adaptDiff;
-    cv::subtract(localBg, claheGray, adaptDiff);
+        // 3. Channel A: Standard Otsu Thresholding
+        cv::threshold(blurred, threshOtsu, 0, 255, cv::THRESH_BINARY + cv::THRESH_OTSU);
 
-    cv::Mat gradX, gradY, gradMag;
-    cv::Sobel(claheGray, gradX, CV_32F, 1, 0, 3);
-    cv::Sobel(claheGray, gradY, CV_32F, 0, 1, 3);
-    cv::magnitude(gradX, gradY, gradMag);
+        // 4. Channel B: Black-Hat Morphological Filter (Exposes solid dark pointer under reflections)
+        cv::Mat blackHat;
+        int hatSize = (profile.blackhat_kernel_size > 0 && profile.blackhat_kernel_size % 2 == 1) ? profile.blackhat_kernel_size : 21;
+        double hatThresh = profile.blackhat_threshold >= 0 ? profile.blackhat_threshold : 32.0;
+        cv::Mat kernelHat = cv::getStructuringElement(cv::MORPH_ELLIPSE, cv::Size(hatSize, hatSize));
+        cv::morphologyEx(claheGray, blackHat, cv::MORPH_BLACKHAT, kernelHat);
 
-    cv::Mat adaptMask = cv::Mat::ones(gray.size(), CV_8UC1) * 255;
-    for (int y = 0; y < gray.rows; ++y) {
-        for (int x = 0; x < gray.cols; ++x) {
-            int diff = static_cast<int>(adaptDiff.at<uchar>(y, x));
-            float mag = gradMag.at<float>(y, x);
-            // High gradient threshold discriminates sharp physical pointer edges from soft diffuse shadows
-            if (diff > diffThresh && mag > gradThresh) {
-                adaptMask.at<uchar>(y, x) = 0; // Solid pointer pixel under glare
-            }
-        }
+        cv::threshold(blackHat, threshBlackHat, hatThresh, 255, cv::THRESH_BINARY);
+        cv::bitwise_not(threshBlackHat, threshBlackHat); // Invert so dark pointer is 0, background is 255
+
+        // 5. Channel C: High-Gradient Shadow Discrimination Mask
+        int bgSize = (profile.local_bg_kernel_size > 0 && profile.local_bg_kernel_size % 2 == 1) ? profile.local_bg_kernel_size : 35;
+        double diffThresh = profile.adapt_diff_threshold >= 0 ? profile.adapt_diff_threshold : 35.0;
+        float gradThresh = profile.grad_mag_threshold >= 0 ? static_cast<float>(profile.grad_mag_threshold) : 22.0f;
+
+        cv::Mat localBg;
+        cv::GaussianBlur(claheGray, localBg, cv::Size(bgSize, bgSize), 0);
+
+        cv::Mat adaptDiff;
+        cv::subtract(localBg, claheGray, adaptDiff);
+
+        cv::Mat gradX, gradY, gradMag;
+        cv::Sobel(claheGray, gradX, CV_32F, 1, 0, 3);
+        cv::Sobel(claheGray, gradY, CV_32F, 0, 1, 3);
+        cv::magnitude(gradX, gradY, gradMag);
+
+        cv::Mat diffMask, magMask;
+        cv::compare(adaptDiff, diffThresh, diffMask, cv::CMP_GT);
+        cv::compare(gradMag, gradThresh, magMask, cv::CMP_GT);
+        cv::Mat solidPointer = diffMask & magMask;
+        cv::bitwise_not(solidPointer, adaptMask);
+
+        // 6. Multi-Channel Anti-Glare Fusion & Shadow Discrimination
+        cv::Mat threshFilteredOtsu = threshOtsu | adaptMask;
+        threshCombined = threshFilteredOtsu & threshBlackHat & adaptMask;
+
+        // 7. Morphological Micro-Closing to repair tiny glare gaps along pointer shaft
+        int closeSize = (profile.morph_close_size > 0 && profile.morph_close_size % 2 == 1) ? profile.morph_close_size : 3;
+        cv::Mat kernelClose = cv::getStructuringElement(cv::MORPH_ELLIPSE, cv::Size(closeSize, closeSize));
+        cv::morphologyEx(threshCombined, threshCombined, cv::MORPH_CLOSE, kernelClose);
+
+        cv::Mat threshBgr;
+        cv::cvtColor(threshCombined, threshBgr, cv::COLOR_GRAY2BGR);
+        res.step3_preprocessed = threshBgr;
+    } else {
+        // Fast path: skip heavy morphological filtering (Steps 4-9) to save execution time
+        cv::cvtColor(gray, res.blurredImage, cv::COLOR_GRAY2BGR);
+        res.step3_preprocessed = res.blurredImage.clone();
     }
-
-    // 6. Multi-Channel Anti-Glare Fusion & Shadow Discrimination
-    cv::Mat threshFilteredOtsu = threshOtsu | adaptMask;
-    cv::Mat threshCombined = threshFilteredOtsu & threshBlackHat & adaptMask;
-
-    // 7. Morphological Micro-Closing to repair tiny glare gaps along pointer shaft
-    int closeSize = (profile.morph_close_size > 0 && profile.morph_close_size % 2 == 1) ? profile.morph_close_size : 3;
-    cv::Mat kernelClose = cv::getStructuringElement(cv::MORPH_ELLIPSE, cv::Size(closeSize, closeSize));
-    cv::morphologyEx(threshCombined, threshCombined, cv::MORPH_CLOSE, kernelClose);
-
-    cv::Mat threshBgr;
-    cv::cvtColor(threshCombined, threshBgr, cv::COLOR_GRAY2BGR);
-    res.step3_preprocessed = threshBgr;
 
     // Step 4: 识别 (Dial Center, Pointer Angle, Value & Overlay Result)
     if (profile.perspective_correction_enabled && !profile.auto_detect_roi && profile.center.x > 0 && profile.center.y > 0 && !invH.empty()) {
@@ -443,16 +453,65 @@ GaugeResult GaugeReaderEngine::process(const cv::Mat& frame, GaugeProfile& profi
     cfg.maxAllowedWidthStep = profile.maxAllowedWidthStep;
     cfg.maxCenterlineOffset = profile.maxCenterlineOffset;
 
+    // Forward anti-interference & text occlusion parameters from profile JSON
+    cfg.maxConsecutiveGapSamples = profile.maxConsecutiveGapSamples;
+    cfg.minEdgeSupportDensity = profile.minEdgeSupportDensity;
+    cfg.rawGradientThreshold = profile.rawGradientThreshold;
+    cfg.minGradientNormalAlignment = profile.minGradientNormalAlignment;
+    cfg.minLocalStepContrast = profile.minLocalStepContrast;
+    cfg.maxStartBaseGapPx = profile.maxStartBaseGapPx;
+    cfg.maxParallelAngleDiffDeg = profile.maxParallelAngleDiffDeg;
+    cfg.minCommonLengthPx = profile.minCommonLengthPx;
+    cfg.maxLineFitResidualPx = profile.maxLineFitResidualPx;
+    cfg.maxOcclusionGap = profile.maxOcclusionGap;
+    cfg.corridorHalfWidthPx = profile.corridorHalfWidthPx;
+
+    // Forward tail detection parameters
+    cfg.enableTailDetection = profile.enable_tail_detection;
+    cfg.tailMaxRadius = profile.tail_max_radius;
+    cfg.tailMinWidth = profile.tail_min_width;
+    cfg.tailMaxWidth = profile.tail_max_width;
+    cfg.tailCorridorHalfWidth = profile.tail_corridor_half_width;
+    cfg.tailMinGradientNormalAlignment = profile.tail_min_gradient_normal_alignment;
+
+    // Forward optical polarity & dark entity constraints
+    cfg.requireDarkPointer = profile.require_dark_pointer;
+    cfg.minPointerDarkContrast = profile.min_pointer_dark_contrast;
+    cfg.maxPointerInsideGray = profile.max_pointer_inside_gray;
+
+    // Forward pointer scoring weights
+    cfg.geomWeight = profile.w_geom_weight;
+    cfg.wEdgePairCoherence = profile.w_edge_pair_coherence;
+    cfg.wCenterStability = profile.w_center_stability;
+    cfg.wAxisCenter = profile.w_axis_center;
+    cfg.wOrientation = profile.w_orientation;
+    cfg.wReach = profile.w_reach;
+    cfg.wValidLength = profile.w_valid_length;
+    cfg.wSlenderness = profile.w_slenderness;
+    cfg.wPersistence = profile.w_persistence;
+    cfg.wWidthTrend = profile.w_width_trend;
+    cfg.wWidthContinuity = profile.w_width_continuity;
+    cfg.wEdgeStrength = profile.w_edge_strength;
+    cfg.wGapPenalty = profile.w_gap_penalty;
+    cfg.wTrackingJumpPenalty = profile.w_tracking_jump_penalty;
+    cfg.wTailScore = profile.w_tail_score;
+    cfg.wTailPolarityBoost = profile.w_tail_polarity_boost;
+    cfg.confidenceDivisor = profile.confidence_divisor;
+
     PointerDetector detector(cfg);
 
-    // 1. Generate Binary Diagnostic Image (for Step 3)
+    // Single-pass detection: perform detection directly and overlay markers onto rectified image canvas
+    cv::Mat rectOverlay = res.rectifiedImage.clone();
+    res.pointerDetectorResult = detector.detect(gray, cv::Point2d(res.center.x, res.center.y), &rectOverlay);
+    res.diagnosticHudImage = res.pointerDetectorResult.hudImage.clone();
+    res.diagnosticText = res.pointerDetectorResult.hudText;
+
+    // Fast diagnostic visualization for Step 3 & Step 11 using existing detection result (no redundant detect call!)
     cv::Mat binaryVis;
-    res.pointerDetectorResult = detector.detect(gray, cv::Point2d(res.center.x, res.center.y), &binaryVis);
+    detector.renderDebugVisualization(binaryVis, cv::Point2d(res.center.x, res.center.y), res.pointerDetectorResult);
     res.needleBinaryImage = binaryVis.clone();
     if (!binaryVis.empty()) {
         res.step3_preprocessed = binaryVis;
-    } else {
-        res.step3_preprocessed = threshBgr.clone();
     }
 
     res.pointer_angle_deg = res.pointerDetectorResult.angle;
@@ -476,6 +535,24 @@ GaugeResult GaugeReaderEngine::process(const cv::Mat& frame, GaugeProfile& profi
     res.confidence = res.pointerDetectorResult.confidence;
     res.success = res.pointerDetectorResult.valid;
 
+    if (!res.success) {
+        res.errorStep = "步骤 11: 径向截面与轨迹指针检测 (Radial Trajectory Visual)";
+        res.errorMessage = res.pointerDetectorResult.failureReason.empty() ?
+            "指针特征检测未通过 (置信度不足或有效截面缺失)" : res.pointerDetectorResult.failureReason;
+        res.detailedDebugInfo = res.pointerDetectorResult.detailedDebugText;
+    } else {
+        res.detailedDebugInfo = res.pointerDetectorResult.detailedDebugText;
+        double maxSpanAllowed = totalSpanDeg + 15.0;
+        if (ptrSpanDeg > maxSpanAllowed && ptrSpanDeg < (360.0 - 15.0)) {
+            char rangeWarn[256];
+            snprintf(rangeWarn, sizeof(rangeWarn), "⚠️ [量程警告] 指针角度 (%.1f°) 超出标定量程跨度 [%.1f°, %.1f°] (超出 %.1f°)",
+                     res.pointer_angle_deg, profile.min_angle_deg, profile.max_angle_deg, ptrSpanDeg - totalSpanDeg);
+            if (!res.centerInconsistent) {
+                res.warningMessage = rangeWarn;
+            }
+        }
+    }
+
     float tipR = static_cast<float>(res.pointerDetectorResult.tipRadius > 0 ? res.pointerDetectorResult.tipRadius : (res.radius * 0.8f));
     double tipRad = res.pointer_angle_deg * M_PI / 180.0;
     res.pointer_tip = cv::Point2f(res.center.x + tipR * static_cast<float>(std::cos(tipRad)),
@@ -484,15 +561,9 @@ GaugeResult GaugeReaderEngine::process(const cv::Mat& frame, GaugeProfile& profi
     res.overlayImage = frame.clone();
     drawOverlay(res.overlayImage, profile, res, invH);
 
-    // 2. Generate Color Diagnostic Image (for Step 4)
-    cv::Mat rectOverlay = res.rectifiedImage.clone();
-    PointerDetectionResult detResult = detector.detect(gray, cv::Point2d(res.center.x, res.center.y), &rectOverlay); // Overlays cross-sections, green trajectory, base radius circle with thin lines (1 px)
-    res.diagnosticHudImage = detResult.hudImage.clone();
-    res.diagnosticText = detResult.hudText;
-
     cv::Mat emptyInvH;
     drawOverlay(rectOverlay, profile, res, emptyInvH); // Draws reading result badge
-    res.step4_recognition = rectOverlay; // Step 4 now contains clean thin diagnostic markers without HUD blocking the dial
+    res.step4_recognition = rectOverlay; // Step 4 contains clean thin diagnostic markers without HUD blocking the dial
 
     // Build complete 12 intermediate steps container for inspection & tuning
     res.intermediateSteps.clear();
@@ -529,53 +600,55 @@ GaugeResult GaugeReaderEngine::process(const cv::Mat& frame, GaugeProfile& profi
         toBgrMat(gray)
     });
 
-    // 4. Step 4: CLAHE 自适应对比度增强图
-    res.intermediateSteps.push_back({
-        4,
-        "步骤 4: CLAHE 对比度增强图 (CLAHE Balanced)",
-        "限制对比度自适应直方图均衡化，消除局部阴影与光照不均",
-        toBgrMat(claheGray)
-    });
+    if (profile.enable_steps_4_to_9) {
+        // 4. Step 4: CLAHE 自适应对比度增强图
+        res.intermediateSteps.push_back({
+            4,
+            "步骤 4: CLAHE 对比度增强图 (CLAHE Balanced)",
+            "限制对比度自适应直方图均衡化，消除局部阴影与光照不均",
+            toBgrMat(claheGray)
+        });
 
-    // 5. Step 5: 高斯平滑降噪图
-    res.intermediateSteps.push_back({
-        5,
-        "步骤 5: 高斯平滑降噪图 (Gaussian Blur)",
-        "7x7高斯核低通滤波，滤除高频高光噪点与噪波",
-        toBgrMat(blurred)
-    });
+        // 5. Step 5: 高斯平滑降噪图
+        res.intermediateSteps.push_back({
+            5,
+            "步骤 5: 高斯平滑降噪图 (Gaussian Blur)",
+            "7x7高斯核低通滤波，滤除高频高光噪点与噪波",
+            toBgrMat(blurred)
+        });
 
-    // 6. Step 6: 通道 A - Otsu 二值化图
-    res.intermediateSteps.push_back({
-        6,
-        "步骤 6: 通道 A - Otsu 二值化图 (Channel A: Otsu Threshold)",
-        "全局自适应 Otsu 阈值分割得到初步指针与刻度二值掩码",
-        toBgrMat(threshOtsu)
-    });
+        // 6. Step 6: 通道 A - Otsu 二值化图
+        res.intermediateSteps.push_back({
+            6,
+            "步骤 6: 通道 A - Otsu 二值化图 (Channel A: Otsu Threshold)",
+            "全局自适应 Otsu 阈值分割得到初步指针与刻度二值掩码",
+            toBgrMat(threshOtsu)
+        });
 
-    // 7. Step 7: 通道 B - 黑帽形态学滤波图
-    res.intermediateSteps.push_back({
-        7,
-        "步骤 7: 通道 B - 黑帽形态学滤波图 (Channel B: Black-Hat Filter)",
-        "21x21椭圆核黑帽滤波提取细微深色指针特征，有效抑制反光",
-        toBgrMat(threshBlackHat)
-    });
+        // 7. Step 7: 通道 B - 黑帽形态学滤波图
+        res.intermediateSteps.push_back({
+            7,
+            "步骤 7: 通道 B - 黑帽形态学滤波图 (Channel B: Black-Hat Filter)",
+            "21x21椭圆核黑帽滤波提取细微深色指针特征，有效抑制反光",
+            toBgrMat(threshBlackHat)
+        });
 
-    // 8. Step 8: 通道 C - 高梯度阴影鉴别掩码
-    res.intermediateSteps.push_back({
-        8,
-        "步骤 8: 通道 C - 阴影鉴别掩码 (Channel C: High-Gradient Mask)",
-        "Sobel梯度与局部背景差分掩码，精准区分物理指针边缘与漫反射软阴影",
-        toBgrMat(adaptMask)
-    });
+        // 8. Step 8: 通道 C - 高梯度阴影鉴别掩码
+        res.intermediateSteps.push_back({
+            8,
+            "步骤 8: 通道 C - 阴影鉴别掩码 (Channel C: High-Gradient Mask)",
+            "Sobel梯度与局部背景差分掩码，精准区分物理指针边缘与漫反射软阴影",
+            toBgrMat(adaptMask)
+        });
 
-    // 9. Step 9: 多通道二值融合与微闭合二值图
-    res.intermediateSteps.push_back({
-        9,
-        "步骤 9: 多通道二值融合与微闭合二值图 (Multi-Channel Fused)",
-        "Otsu & 黑帽 & 梯度掩码与运算，配合3x3椭圆核微闭合修复小空洞",
-        toBgrMat(threshCombined)
-    });
+        // 9. Step 9: 多通道二值融合与微闭合二值图
+        res.intermediateSteps.push_back({
+            9,
+            "步骤 9: 多通道二值融合与微闭合二值图 (Multi-Channel Fused)",
+            "Otsu & 黑帽 & 梯度掩码与运算，配合3x3椭圆核微闭合修复小空洞",
+            toBgrMat(threshCombined)
+        });
+    }
 
     // 10. Step 10: 表盘圆心与旋转轴心定位图与二次防错校验
     cv::Mat hubVis;
@@ -641,42 +714,81 @@ GaugeResult GaugeReaderEngine::process(const cv::Mat& frame, GaugeProfile& profi
         toBgrMat(res.step4_recognition)
     });
 
-    // Save step photo outputs safely to files & debug_steps directory (using std::filesystem to avoid CMD window popup)
-    std::filesystem::create_directories("debug_steps");
+    // Save step photo outputs to files only if explicitly enabled in profile (avoids ~1000ms disk I/O lag)
+    if (profile.save_debug_images) {
+        std::filesystem::create_directories("debug_steps");
 
-    if (!res.step1_original.empty()) cv::imwrite("step1_original.png", res.step1_original);
-    if (!res.step2_rectified.empty()) cv::imwrite("step2_rectified.png", res.step2_rectified);
-    if (!res.step3_preprocessed.empty()) cv::imwrite("step3_preprocessed.png", res.step3_preprocessed);
-    if (!res.step4_recognition.empty()) cv::imwrite("step4_recognition.png", res.step4_recognition);
+        if (!res.step1_original.empty()) cv::imwrite("step1_original.png", res.step1_original);
+        if (!res.step2_rectified.empty()) cv::imwrite("step2_rectified.png", res.step2_rectified);
+        if (!res.step3_preprocessed.empty()) cv::imwrite("step3_preprocessed.png", res.step3_preprocessed);
+        if (!res.step4_recognition.empty()) cv::imwrite("step4_recognition.png", res.step4_recognition);
 
-    for (const auto& stepItem : res.intermediateSteps) {
-        if (!stepItem.image.empty()) {
-            char filename[128];
-            snprintf(filename, sizeof(filename), "debug_steps/step%02d_%s.png", stepItem.stepNumber,
-                     (stepItem.stepNumber == 1 ? "original" :
-                      stepItem.stepNumber == 2 ? "rectified" :
-                      stepItem.stepNumber == 3 ? "gray" :
-                      stepItem.stepNumber == 4 ? "clahe" :
-                      stepItem.stepNumber == 5 ? "gaussian_blur" :
-                      stepItem.stepNumber == 6 ? "otsu_threshold" :
-                      stepItem.stepNumber == 7 ? "blackhat_filter" :
-                      stepItem.stepNumber == 8 ? "shadow_mask" :
-                      stepItem.stepNumber == 9 ? "fused_binary" :
-                      stepItem.stepNumber == 10 ? "hub_location" :
-                      stepItem.stepNumber == 11 ? "trajectory_binary" : "recognition_result"));
-            cv::imwrite(filename, stepItem.image);
+        for (const auto& stepItem : res.intermediateSteps) {
+            if (!stepItem.image.empty()) {
+                char filename[128];
+                snprintf(filename, sizeof(filename), "debug_steps/step%02d_%s.png", stepItem.stepNumber,
+                         (stepItem.stepNumber == 1 ? "original" :
+                          stepItem.stepNumber == 2 ? "rectified" :
+                          stepItem.stepNumber == 3 ? "gray" :
+                          stepItem.stepNumber == 4 ? "clahe" :
+                          stepItem.stepNumber == 5 ? "gaussian_blur" :
+                          stepItem.stepNumber == 6 ? "otsu_threshold" :
+                          stepItem.stepNumber == 7 ? "blackhat_filter" :
+                          stepItem.stepNumber == 8 ? "shadow_mask" :
+                          stepItem.stepNumber == 9 ? "fused_binary" :
+                          stepItem.stepNumber == 10 ? "hub_location" :
+                          stepItem.stepNumber == 11 ? "trajectory_binary" : "recognition_result"));
+                cv::imwrite(filename, stepItem.image);
+            }
         }
-    }
 
-    if (!res.diagnosticHudImage.empty()) {
-        cv::imwrite("debug_steps/step12_diagnostics_hud.png", res.diagnosticHudImage);
+        if (!res.diagnosticHudImage.empty()) {
+            cv::imwrite("debug_steps/step12_diagnostics_hud.png", res.diagnosticHudImage);
+        }
     }
 
     return res;
 }
 
 void GaugeReaderEngine::drawOverlay(cv::Mat& canvas, const GaugeProfile& profile, const GaugeResult& res, const cv::Mat& invH) {
-    if (!res.success) return;
+    if (!res.success) {
+        // Draw visual error diagnostic banner on canvas
+        int boxW = std::min(canvas.cols - 20, 580);
+        int boxH = 145;
+        int boxX = 10;
+        int boxY = 10;
+
+        cv::rectangle(canvas, cv::Rect(boxX, boxY, boxW, boxH), cv::Scalar(25, 20, 30), -1);
+        cv::rectangle(canvas, cv::Rect(boxX, boxY, boxW, boxH), cv::Scalar(0, 0, 235), 2);
+
+        int textY = boxY + 26;
+        char buf[256];
+        snprintf(buf, sizeof(buf), "[RECOGNITION FAILED / 仪表识别失败] %s", profile.gauge_id.c_str());
+        cv::putText(canvas, buf, cv::Point(boxX + 12, textY), cv::FONT_HERSHEY_SIMPLEX, 0.55, cv::Scalar(0, 80, 255), 2, cv::LINE_AA);
+
+        textY += 28;
+        snprintf(buf, sizeof(buf), "Error Step: %s", res.errorStep.empty() ? "Pointer Detection" : res.errorStep.c_str());
+        cv::putText(canvas, buf, cv::Point(boxX + 12, textY), cv::FONT_HERSHEY_SIMPLEX, 0.44, cv::Scalar(220, 220, 220), 1, cv::LINE_AA);
+
+        textY += 24;
+        snprintf(buf, sizeof(buf), "Reason: %s", res.errorMessage.empty() ? "Low confidence or feature mismatch" : res.errorMessage.c_str());
+        cv::putText(canvas, buf, cv::Point(boxX + 12, textY), cv::FONT_HERSHEY_SIMPLEX, 0.44, cv::Scalar(100, 100, 255), 1, cv::LINE_AA);
+
+        textY += 24;
+        snprintf(buf, sizeof(buf), "Dial Center: (%.1f, %.1f), Radius: %.1f px", res.center.x, res.center.y, res.radius);
+        cv::putText(canvas, buf, cv::Point(boxX + 12, textY), cv::FONT_HERSHEY_SIMPLEX, 0.42, cv::Scalar(180, 180, 180), 1, cv::LINE_AA);
+
+        textY += 22;
+        snprintf(buf, sizeof(buf), "Detected Angle: %.1f deg (Score: %.2f, Confidence: %.1f%%)",
+                 res.pointer_angle_deg, res.pointerDetectorResult.score, res.confidence * 100.0);
+        cv::putText(canvas, buf, cv::Point(boxX + 12, textY), cv::FONT_HERSHEY_SIMPLEX, 0.40, cv::Scalar(160, 160, 160), 1, cv::LINE_AA);
+
+        if (res.center.x > 0 && res.center.y > 0 && res.radius > 5.0f) {
+            cv::circle(canvas, res.center, 5, cv::Scalar(0, 0, 255), -1);
+            cv::circle(canvas, res.center, static_cast<int>(res.radius), cv::Scalar(0, 0, 180), 1, cv::LINE_AA);
+        }
+        return;
+    }
 
     cv::Point2f drawCenter = res.center;
     cv::Point2f drawTip = res.pointer_tip;

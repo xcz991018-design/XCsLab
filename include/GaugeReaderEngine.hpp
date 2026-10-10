@@ -1,4 +1,4 @@
-#ifndef GAUGE_READER_ENGINE_HPP
+﻿#ifndef GAUGE_READER_ENGINE_HPP
 #define GAUGE_READER_ENGINE_HPP
 
 #include "GaugeProfile.hpp"
@@ -58,6 +58,8 @@ struct GaugeResult {
     std::string diagnosticText;
 
     std::string errorMessage;
+    std::string errorStep;               // Pipeline step where error occurred
+    std::string detailedDebugInfo;       // Detailed debug diagnostic text
     double confidence{0.0};
 };
 

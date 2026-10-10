@@ -78,6 +78,51 @@ struct GaugeProfile {
     double maxAllowedWidthStep{6.0};      // Maximum allowed width change step (px)
     double maxCenterlineOffset{8.0};      // Maximum allowed centerline offset (px)
 
+    // Anti-Interference / Occlusion Bridging Parameters (Tolerate text & scale marks)
+    int maxConsecutiveGapSamples{16};         // Maximum consecutive gap samples before termination (allows crossing ~32px text)
+    double minEdgeSupportDensity{0.45};       // Minimum verified edge point ratio along track (allows text occlusion)
+    double rawGradientThreshold{45.0};        // Minimum raw Scharr gradient magnitude for valid edge
+    double minGradientNormalAlignment{0.72};  // Perpendicular alignment |dot(grad, normal)|
+    double minLocalStepContrast{12.0};        // Minimum contrast across needle edge
+    double maxStartBaseGapPx{16.0};           // Hub search gap tolerance
+    double maxParallelAngleDiffDeg{15.0};     // Angle divergence tolerance for tapered needles
+    double minCommonLengthPx{35.0};           // Minimum required pointer length overlap
+    double maxLineFitResidualPx{2.2};         // Maximum orthogonal residual to straight line
+    int maxOcclusionGap{12};                  // Maximum radial section bridge gap across text
+    double corridorHalfWidthPx{22.0};         // Lateral search corridor half-width
+
+    // Pointer Tail (Counterweight) Detection Parameters
+    bool enable_tail_detection{true};         // Enable joint needle tail detection
+    double tail_max_radius{130.0};            // Maximum radial search reach for tail (px)
+    double tail_min_width{4.0};               // Minimum allowed tail width (px)
+    double tail_max_width{65.0};              // Maximum allowed tail width (px, wider for counterweight)
+    double tail_corridor_half_width{45.0};    // Search corridor half-width for tail (px)
+    double tail_min_gradient_normal_alignment{0.50}; // Alignment threshold for widening tail edge (relaxed vs slender body)
+
+    // Optical Polarity & Dark Entity Constraints
+    bool require_dark_pointer{true};          // Enforce needle body and tail are dark entities on a lighter dial
+    double min_pointer_dark_contrast{10.0};   // Minimum (meanOutsideGray - meanInsideGray)
+    double max_pointer_inside_gray{165.0};    // Maximum average gray level inside pointer entity
+
+    // Pointer Structure & Confidence Scoring Weights
+    double w_geom_weight{4.0};                // Weight for first-layer candidate geometry score
+    double w_edge_pair_coherence{3.5};        // Weight for mutual bilateral edge pair coherence
+    double w_center_stability{3.0};           // Weight for centerline variance and stability
+    double w_axis_center{2.5};                // Weight for transverse offset penalty from axis
+    double w_orientation{2.0};                // Weight for gradient normal orientation alignment
+    double w_reach{2.5};                      // Weight for radial pointer reach
+    double w_valid_length{2.5};               // Weight for continuous valid length
+    double w_slenderness{3.0};                // Weight for slenderness ratio (length / width)
+    double w_persistence{3.0};                // Weight for bilateral edge persistence
+    double w_width_trend{1.5};                // Weight for tapering/parallel width trend
+    double w_width_continuity{1.5};           // Weight for section-to-section width smoothness
+    double w_edge_strength{0.3};              // Weight for edge gradient magnitude (auxiliary)
+    double w_gap_penalty{1.5};                // Penalty weight for maximum occlusion gap
+    double w_tracking_jump_penalty{2.5};       // Penalty weight for lateral tracking jumps
+    double w_tail_score{1.8};                 // Weight for counterweight tail score in joint evaluation
+    double w_tail_polarity_boost{2.5};        // Boost weight for tail in needle head polarity resolution
+    double confidence_divisor{12.0};          // Normalization divisor to convert bodyScore to confidence [0.0 ~ 1.0]
+
     // Asset Metadata: GIS, Location & Specifications
     GisInfo gis;
     LocationInfo location;
@@ -108,6 +153,8 @@ struct GaugeProfile {
     double adapt_diff_threshold{35.0};        // Adaptive background difference threshold
     double grad_mag_threshold{22.0};          // Sobel gradient magnitude threshold
     int morph_close_size{3};                  // Morphological closing kernel size (odd px)
+    bool enable_steps_4_to_9{false};          // Whether to execute intermediate steps 4-9 (CLAHE, BlackHat, Sobel, Otsu). Default false for high speed.
+    bool save_debug_images{false};            // Whether to synchronously write 17 PNG images to disk on each run (disabled by default for speed)
 
     bool loadFromFile(const std::string& configFilePath, const std::string& targetCameraId = "");
     bool saveToFile(const std::string& configFilePath, const std::string& targetCameraId = "") const;

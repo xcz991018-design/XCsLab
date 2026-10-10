@@ -24,17 +24,66 @@ PointerDetector::PointerDetector(const PointerShapeModel& model)
     m_config.radialStepPx = (model.radialStep > 0.0f) ? static_cast<double>(model.radialStep) : 2.0;
     m_config.radialStep = m_config.radialStepPx;
     m_config.angleStep = (model.coarseAngleStep > 0.0f) ? static_cast<double>(model.coarseAngleStep) : 1.0;
+    m_config.tailMinRadius = std::max(8.0, m_config.pointerBaseRadius * 0.25);
+    m_config.tailMaxRadius = std::min(m_config.pointerBaseRadius * 1.8, m_config.maxSearchRadius * 0.30);
+    m_config.tailMinWidth = std::max(4.0, m_config.minPointerWidth * 1.2);
+    m_config.tailMaxWidth = std::max(25.0, m_config.maxPointerWidth * 1.5);
+    m_config.tailCorridorHalfWidth = std::max(25.0, m_config.tailMaxWidth * 0.7);
 }
 
 PointerDetector::PointerDetector(const GaugeConfig& config)
     : m_model(config.toShapeModel()) {
     m_config.pointerBaseRadius = std::max(15.0, config.pointerBaseRadius);
     m_config.maxSearchRadius = std::max(100.0, config.radius > 50.0 ? config.radius * 0.92 : 360.0);
-    m_config.minPointerWidth = std::max(1.5, config.pointerMinWidth);
-    m_config.maxPointerWidth = std::min(45.0, config.pointerMaxWidth);
+    m_config.minPointerWidth = (config.pointerMinWidth > 0.0) ? config.pointerMinWidth : 1.5;
+    m_config.maxPointerWidth = (config.pointerMaxWidth > 0.0) ? config.pointerMaxWidth : 35.0;
     m_config.radialStepPx = 2.0;
     m_config.radialStep = 2.0;
     m_config.angleStep = (config.coarseAngleStep > 0.0) ? config.coarseAngleStep : 1.0;
+    m_config.enableTailDetection = config.enableTailDetection;
+    m_config.tailMinRadius = std::max(8.0, m_config.pointerBaseRadius * 0.25);
+    m_config.tailMaxRadius = (config.tailMaxRadius > 0.0) ? config.tailMaxRadius : std::max(m_config.pointerBaseRadius + 60.0, 130.0);
+    m_config.tailMinWidth = (config.tailMinWidth > 0.0) ? config.tailMinWidth : 4.0;
+    m_config.tailMaxWidth = (config.tailMaxWidth > 0.0) ? config.tailMaxWidth : 65.0;
+    m_config.tailCorridorHalfWidth = (config.tailCorridorHalfWidth > 0.0) ? config.tailCorridorHalfWidth : 45.0;
+
+    // Forward anti-interference & text occlusion parameters
+    if (config.maxConsecutiveGapSamples > 0) m_config.maxConsecutiveGapSamples = config.maxConsecutiveGapSamples;
+    if (config.minEdgeSupportDensity > 0.0) m_config.minEdgeSupportDensity = config.minEdgeSupportDensity;
+    if (config.rawGradientThreshold > 0.0) m_config.rawGradientThreshold = config.rawGradientThreshold;
+    if (config.minGradientNormalAlignment > 0.0) m_config.minGradientNormalAlignment = config.minGradientNormalAlignment;
+    if (config.minLocalStepContrast > 0.0) m_config.minLocalStepContrast = config.minLocalStepContrast;
+    if (config.maxStartBaseGapPx > 0.0) m_config.maxStartBaseGapPx = config.maxStartBaseGapPx;
+    if (config.maxParallelAngleDiffDeg > 0.0) m_config.maxParallelAngleDiffDeg = config.maxParallelAngleDiffDeg;
+    if (config.minCommonLengthPx > 0.0) m_config.minCommonLengthPx = config.minCommonLengthPx;
+    if (config.maxLineFitResidualPx > 0.0) m_config.maxLineFitResidualPx = config.maxLineFitResidualPx;
+    if (config.maxOcclusionGap > 0) m_config.maxOcclusionGap = config.maxOcclusionGap;
+    if (config.corridorHalfWidthPx > 0.0) m_config.corridorHalfWidthPx = config.corridorHalfWidthPx;
+    if (config.tailMinGradientNormalAlignment > 0.0) m_config.tailMinGradientNormalAlignment = config.tailMinGradientNormalAlignment;
+
+    // Forward scoring weights
+    if (config.geomWeight > 0.0) m_config.geomWeight = config.geomWeight;
+    if (config.wEdgePairCoherence > 0.0) m_config.wEdgePairCoherence = config.wEdgePairCoherence;
+    if (config.wCenterStability > 0.0) m_config.wCenterStability = config.wCenterStability;
+    if (config.wAxisCenter > 0.0) m_config.wAxisCenter = config.wAxisCenter;
+    if (config.wOrientation > 0.0) m_config.wOrientation = config.wOrientation;
+    if (config.wReach > 0.0) m_config.wReach = config.wReach;
+    if (config.wValidLength > 0.0) m_config.wValidLength = config.wValidLength;
+    if (config.wSlenderness > 0.0) m_config.wSlenderness = config.wSlenderness;
+    if (config.wPersistence > 0.0) m_config.wPersistence = config.wPersistence;
+    if (config.wWidthTrend > 0.0) m_config.wWidthTrend = config.wWidthTrend;
+    if (config.wWidthContinuity > 0.0) m_config.wWidthContinuity = config.wWidthContinuity;
+    if (config.wEdgeStrength >= 0.0) m_config.wEdgeStrength = config.wEdgeStrength;
+    if (config.wGapPenalty >= 0.0) m_config.wGapPenalty = config.wGapPenalty;
+    if (config.wTrackingJumpPenalty >= 0.0) m_config.wTrackingJumpPenalty = config.wTrackingJumpPenalty;
+    if (config.wTailScore > 0.0) m_config.wTailScore = config.wTailScore;
+    if (config.wTailPolarityBoost > 0.0) m_config.wTailPolarityBoost = config.wTailPolarityBoost;
+    if (config.confidenceDivisor > 0.0) m_config.confidenceDivisor = config.confidenceDivisor;
+
+    // Forward optical polarity & dark entity constraints
+    m_config.requireDarkPointer = config.requireDarkPointer;
+    if (config.minPointerDarkContrast > 0.0) m_config.minPointerDarkContrast = config.minPointerDarkContrast;
+    if (config.maxPointerInsideGray > 0.0) m_config.maxPointerInsideGray = config.maxPointerInsideGray;
 }
 
 void PointerDetector::setConfig(const PointerDetectorConfig& config) {
@@ -45,11 +94,55 @@ void PointerDetector::setConfig(const GaugeConfig& config) {
     m_model = config.toShapeModel();
     m_config.pointerBaseRadius = std::max(15.0, config.pointerBaseRadius);
     m_config.maxSearchRadius = std::max(100.0, config.radius > 50.0 ? config.radius * 0.92 : 360.0);
-    m_config.minPointerWidth = std::max(1.5, config.pointerMinWidth);
-    m_config.maxPointerWidth = std::min(45.0, config.pointerMaxWidth);
+    m_config.minPointerWidth = (config.pointerMinWidth > 0.0) ? config.pointerMinWidth : 1.5;
+    m_config.maxPointerWidth = (config.pointerMaxWidth > 0.0) ? config.pointerMaxWidth : 35.0;
     m_config.radialStepPx = 2.0;
     m_config.radialStep = 2.0;
     m_config.angleStep = (config.coarseAngleStep > 0.0) ? config.coarseAngleStep : 1.0;
+    m_config.enableTailDetection = config.enableTailDetection;
+    m_config.tailMinRadius = std::max(8.0, m_config.pointerBaseRadius * 0.25);
+    m_config.tailMaxRadius = (config.tailMaxRadius > 0.0) ? config.tailMaxRadius : std::max(m_config.pointerBaseRadius + 60.0, 130.0);
+    m_config.tailMinWidth = (config.tailMinWidth > 0.0) ? config.tailMinWidth : 4.0;
+    m_config.tailMaxWidth = (config.tailMaxWidth > 0.0) ? config.tailMaxWidth : 65.0;
+    m_config.tailCorridorHalfWidth = (config.tailCorridorHalfWidth > 0.0) ? config.tailCorridorHalfWidth : 45.0;
+    m_config.tailMinGradientNormalAlignment = (config.tailMinGradientNormalAlignment > 0.0) ? config.tailMinGradientNormalAlignment : 0.50;
+
+    // Forward anti-interference & text occlusion parameters
+    if (config.maxConsecutiveGapSamples > 0) m_config.maxConsecutiveGapSamples = config.maxConsecutiveGapSamples;
+    if (config.minEdgeSupportDensity > 0.0) m_config.minEdgeSupportDensity = config.minEdgeSupportDensity;
+    if (config.rawGradientThreshold > 0.0) m_config.rawGradientThreshold = config.rawGradientThreshold;
+    if (config.minGradientNormalAlignment > 0.0) m_config.minGradientNormalAlignment = config.minGradientNormalAlignment;
+    if (config.minLocalStepContrast > 0.0) m_config.minLocalStepContrast = config.minLocalStepContrast;
+    if (config.maxStartBaseGapPx > 0.0) m_config.maxStartBaseGapPx = config.maxStartBaseGapPx;
+    if (config.maxParallelAngleDiffDeg > 0.0) m_config.maxParallelAngleDiffDeg = config.maxParallelAngleDiffDeg;
+    if (config.minCommonLengthPx > 0.0) m_config.minCommonLengthPx = config.minCommonLengthPx;
+    if (config.maxLineFitResidualPx > 0.0) m_config.maxLineFitResidualPx = config.maxLineFitResidualPx;
+    if (config.maxOcclusionGap > 0) m_config.maxOcclusionGap = config.maxOcclusionGap;
+    if (config.corridorHalfWidthPx > 0.0) m_config.corridorHalfWidthPx = config.corridorHalfWidthPx;
+
+    // Forward scoring weights
+    if (config.geomWeight > 0.0) m_config.geomWeight = config.geomWeight;
+    if (config.wEdgePairCoherence > 0.0) m_config.wEdgePairCoherence = config.wEdgePairCoherence;
+    if (config.wCenterStability > 0.0) m_config.wCenterStability = config.wCenterStability;
+    if (config.wAxisCenter > 0.0) m_config.wAxisCenter = config.wAxisCenter;
+    if (config.wOrientation > 0.0) m_config.wOrientation = config.wOrientation;
+    if (config.wReach > 0.0) m_config.wReach = config.wReach;
+    if (config.wValidLength > 0.0) m_config.wValidLength = config.wValidLength;
+    if (config.wSlenderness > 0.0) m_config.wSlenderness = config.wSlenderness;
+    if (config.wPersistence > 0.0) m_config.wPersistence = config.wPersistence;
+    if (config.wWidthTrend > 0.0) m_config.wWidthTrend = config.wWidthTrend;
+    if (config.wWidthContinuity > 0.0) m_config.wWidthContinuity = config.wWidthContinuity;
+    if (config.wEdgeStrength >= 0.0) m_config.wEdgeStrength = config.wEdgeStrength;
+    if (config.wGapPenalty >= 0.0) m_config.wGapPenalty = config.wGapPenalty;
+    if (config.wTrackingJumpPenalty >= 0.0) m_config.wTrackingJumpPenalty = config.wTrackingJumpPenalty;
+    if (config.wTailScore > 0.0) m_config.wTailScore = config.wTailScore;
+    if (config.wTailPolarityBoost > 0.0) m_config.wTailPolarityBoost = config.wTailPolarityBoost;
+    if (config.confidenceDivisor > 0.0) m_config.confidenceDivisor = config.confidenceDivisor;
+
+    // Forward optical polarity & dark entity constraints
+    m_config.requireDarkPointer = config.requireDarkPointer;
+    if (config.minPointerDarkContrast > 0.0) m_config.minPointerDarkContrast = config.minPointerDarkContrast;
+    if (config.maxPointerInsideGray > 0.0) m_config.maxPointerInsideGray = config.maxPointerInsideGray;
 }
 
 void PointerDetector::setModel(const PointerShapeModel& model) {
@@ -68,89 +161,6 @@ double PointerDetector::normalizeAngle(double angleDeg) {
     double a = std::fmod(angleDeg, 360.0);
     if (a < 0.0) a += 360.0;
     return a;
-}
-
-// -------------------------------------------------------------------------
-// Legacy compatibility implementation for PointerTemplateBuilderDialog
-// -------------------------------------------------------------------------
-std::vector<TemplatePoint> PointerDetector::buildUnifiedTemplate(const PointerShapeModel& model) {
-    std::vector<TemplatePoint> pts;
-    float step = std::max(2.0f, model.radialStep);
-
-    auto sampleCustomContour = [&](const std::vector<cv::Point2f>& contour, RegionType region, float weight, bool closed) {
-        if (contour.size() < 2) return;
-        size_t nSegs = closed ? contour.size() : (contour.size() - 1);
-        for (size_t i = 0; i < nSegs; ++i) {
-            cv::Point2f p1 = contour[i];
-            cv::Point2f p2 = contour[(i + 1) % contour.size()];
-            cv::Point2f vec = p2 - p1;
-            float len = static_cast<float>(cv::norm(vec));
-            if (len < 1e-3f) continue;
-
-            cv::Point2f dir = vec * (1.0f / len);
-            cv::Point2f norm(-dir.y, dir.x);
-
-            int nSamples = std::max(1, static_cast<int>(std::round(len / step)));
-            for (int k = 0; k <= nSamples; ++k) {
-                float t = static_cast<float>(k) / nSamples;
-                cv::Point2f samplePt = p1 + t * vec;
-                if (cv::norm(samplePt) < model.centerExclusionRadius) continue;
-                pts.push_back({ samplePt, norm, weight, region });
-            }
-        }
-    };
-
-    if (!model.customTipPoints.empty() && model.customTipPoints.size() >= 2) {
-        sampleCustomContour(model.customTipPoints, RegionType::Tip, 1.4f, true);
-    } else {
-        float tipRStart = std::max(model.bodyMaxRadius, model.tipMinRadius);
-        float tipREnd = model.tipMaxRadius;
-        if (tipREnd > tipRStart) {
-            float baseHalfW = model.tipBaseWidth * 0.5f;
-            float totalTipLen = tipREnd - tipRStart;
-            for (float r = tipRStart; r < tipREnd; r += step) {
-                float frac = (r - tipRStart) / totalTipLen;
-                float currentHalfW = baseHalfW * (1.0f - frac);
-                float dwdr = -baseHalfW / totalTipLen;
-                cv::Vec2f nLeftVec(-dwdr, 1.0f);
-                cv::Vec2f nLeftNorm = cv::normalize(nLeftVec);
-                cv::Vec2f nRightVec(-dwdr, -1.0f);
-                cv::Vec2f nRightNorm = cv::normalize(nRightVec);
-                pts.push_back({ cv::Point2f(r, currentHalfW), cv::Point2f(nLeftNorm[0], nLeftNorm[1]), 1.2f, RegionType::Tip });
-                pts.push_back({ cv::Point2f(r, -currentHalfW), cv::Point2f(nRightNorm[0], nRightNorm[1]), 1.2f, RegionType::Tip });
-            }
-            pts.push_back({ cv::Point2f(tipREnd, 0.0f), cv::Point2f(1.0f, 0.0f), 1.5f, RegionType::Tip });
-        }
-    }
-
-    if (!model.customBodyPoints.empty() && model.customBodyPoints.size() >= 2) {
-        sampleCustomContour(model.customBodyPoints, RegionType::Body, 1.0f, false);
-    } else {
-        float bodyRStart = std::max(model.centerExclusionRadius + 2.0f, model.bodyMinRadius);
-        float bodyREnd = std::min(model.tipMinRadius, model.bodyMaxRadius);
-        if (bodyREnd > bodyRStart) {
-            float halfW = model.bodyWidth * 0.5f;
-            for (float r = bodyRStart; r <= bodyREnd; r += step) {
-                pts.push_back({ cv::Point2f(r, halfW), cv::Point2f(0.0f, 1.0f), 1.0f, RegionType::Body });
-                pts.push_back({ cv::Point2f(r, -halfW), cv::Point2f(0.0f, -1.0f), 1.0f, RegionType::Body });
-            }
-        }
-    }
-
-    if (!model.customTailPoints.empty() && model.customTailPoints.size() >= 2) {
-        sampleCustomContour(model.customTailPoints, RegionType::Tail, 1.2f, true);
-    } else {
-        float tailRStart = std::max(model.centerExclusionRadius + 2.0f, model.tailMinRadius);
-        float tailREnd = model.tailMaxRadius;
-        if (tailREnd > tailRStart) {
-            float tailHalfW = model.tailWidth * 0.5f;
-            for (float r = tailRStart; r <= tailREnd; r += step) {
-                pts.push_back({ cv::Point2f(-r, tailHalfW), cv::Point2f(0.0f, 1.0f), 1.1f, RegionType::Tail });
-                pts.push_back({ cv::Point2f(-r, -tailHalfW), cv::Point2f(0.0f, -1.0f), 1.1f, RegionType::Tail });
-            }
-        }
-    }
-    return pts;
 }
 
 // -------------------------------------------------------------------------
@@ -274,23 +284,22 @@ EdgeTrack PointerDetector::trackEdgeInCorridor(
 
     double prevT = -999.0;
     int consecutiveMisses = 0;
-    int maxConsecutiveGap = (m_config.maxConsecutiveGapSamples > 0) ? m_config.maxConsecutiveGapSamples : 2;
+    int maxConsecutiveGap = (m_config.maxConsecutiveGapSamples > 0) ? m_config.maxConsecutiveGapSamples : 16;
 
-    double rawGradThresh = (m_config.rawGradientThreshold > 0.0) ? m_config.rawGradientThreshold : 55.0;
-    double minNormalAlign = (m_config.minGradientNormalAlignment > 0.0) ? m_config.minGradientNormalAlignment : 0.85;
-    double minStepContrast = (m_config.minLocalStepContrast > 0.0) ? m_config.minLocalStepContrast : 16.0;
-    double maxStartGap = (m_config.maxStartBaseGapPx > 0.0) ? m_config.maxStartBaseGapPx : 8.0;
+    double rawGradThresh = (m_config.rawGradientThreshold > 0.0) ? m_config.rawGradientThreshold : 45.0;
+    double minNormalAlign = (m_config.minGradientNormalAlignment > 0.0) ? m_config.minGradientNormalAlignment : 0.72;
+    double minStepContrast = (m_config.minLocalStepContrast > 0.0) ? m_config.minLocalStepContrast : 12.0;
+    double maxStartGap = (m_config.maxStartBaseGapPx > 0.0) ? m_config.maxStartBaseGapPx : 16.0;
 
     std::vector<EdgePoint> rawPoints;
+    std::vector<EdgePoint> pendingGapPoints;
     double sumStrength = 0.0;
     std::vector<double> strengths;
     int jumpCount = 0;
     int verifiedSupportCount = 0;
 
     for (double r = rStart; r <= rEnd; r += stepR) {
-        // Principle 11: Base proximity hard check.
-        // If we haven't found any valid edge within maxStartGap from pointerBaseRadius,
-        // it means this corridor starts in empty dial background. Terminate immediately!
+        // Principle 11: Base proximity check with hub clearance
         if (rawPoints.empty() && (r - rStart) > maxStartGap) {
             break;
         }
@@ -327,25 +336,52 @@ EdgeTrack PointerDetector::trackEdgeInCorridor(
             float ux = sampleBilinear(features.gradUnitX, static_cast<float>(Q.x), static_cast<float>(Q.y));
             float uy = sampleBilinear(features.gradUnitY, static_cast<float>(Q.x), static_cast<float>(Q.y));
 
-            float dirScore = std::abs(static_cast<float>(ux * v.x + uy * v.y));
+            float proj = static_cast<float>(ux * v.x + uy * v.y);
+            // Gradient polarity: for dark needle on bright dial,
+            // left edge (t < 0) gradient points outward towards -v (proj < 0),
+            // right edge (t > 0) gradient points outward towards +v (proj > 0).
+            float dirScore = m_config.requireDarkPointer ? (isLeft ? -proj : proj) : std::abs(proj);
+            if (dirScore < 0.1f) dirScore = 0.0f;
             float edgeScore = mag * dirScore;
 
             profile[i] = { t, mag, dirScore, edgeScore, gVal };
         }
 
-        // Principle 10: Pure white or flat background check!
-        // If the peak-to-peak intensity contrast across the slice is less than minStepContrast,
-        // it is impossible for a genuine pointer physical edge to exist here!
+        // If slice contrast is low (e.g. inside dark text/number or pure flat background)
         if ((maxGray - minGray) < static_cast<float>(minStepContrast)) {
             consecutiveMisses++;
             if (consecutiveMisses > maxConsecutiveGap) {
-                // Principle 3 & 4: Max Consecutive Gap exceeded -> TERMINATE TRACK!
                 break;
+            }
+            if (prevT > -900.0) {
+                // Synthesize inertial gap point while crossing low-contrast text
+                double predT = prevT;
+                if (rawPoints.size() >= 4) {
+                    double dt_hist = rawPoints.back().t - rawPoints[rawPoints.size() - 4].t;
+                    double dr_hist = rawPoints.back().radius - rawPoints[rawPoints.size() - 4].radius;
+                    if (dr_hist > 1e-3) {
+                        double slope = dt_hist / dr_hist;
+                        if (std::abs(slope) < 0.12) {
+                            predT = rawPoints.back().t + slope * (r - rawPoints.back().radius);
+                        }
+                    }
+                }
+                EdgePoint gp;
+                gp.radius = r;
+                gp.t = predT;
+                cv::Point2d imgPt = P_r + v * predT;
+                gp.x = imgPt.x;
+                gp.y = imgPt.y;
+                gp.strength = 15.0;
+                gp.orientation = 0.72;
+                gp.hasRawSupport = false;
+                gp.valid = false;
+                pendingGapPoints.push_back(gp);
             }
             continue;
         }
 
-        // 2. Find local peaks with STRICT RAW GRADIENT HARD GATE & PROMINENCE
+        // 2. Find local peaks with prominence
         struct LocalPeak {
             double t;
             float edgeScore;
@@ -355,32 +391,32 @@ EdgeTrack PointerDetector::trackEdgeInCorridor(
         std::vector<LocalPeak> peaks;
 
         for (int i = 1; i < numSamples - 1; ++i) {
-            // Hard gates:
-            // a. Gradient magnitude must exceed rawGradThresh (e.g. >= 55.0)
-            // b. Direction must be tightly perpendicular to needle axis (|dot(grad, v)| >= 0.85)
-            // c. Combined edgeScore must exceed minGradThresh
             if (profile[i].mag >= rawGradThresh && profile[i].dirScore >= minNormalAlign && profile[i].edgeScore >= minGradThresh) {
-                // Strict local peak
                 if (profile[i].edgeScore > profile[i - 1].edgeScore &&
                     profile[i].edgeScore >= profile[i + 1].edgeScore) {
                     float prominence = profile[i].edgeScore - std::min(profile[i - 1].edgeScore, profile[i + 1].edgeScore);
-                    if (prominence >= 3.0f) {
+                    if (prominence >= 2.0f) {
                         peaks.push_back({ profile[i].t, profile[i].edgeScore, profile[i].dirScore, profile[i].mag });
                     }
                 }
             }
         }
 
-        // 3. Select best peak using tracking window
+        // 3. Select best peak using tracking window and reference position
         LocalPeak bestPeak{ 0.0, -1.0f, 0.0f, 0.0f };
         double bestPeakScore = -1.0;
 
+        double refT = prevT;
+        if (!pendingGapPoints.empty()) {
+            refT = pendingGapPoints.back().t;
+        }
+
         for (const auto& p : peaks) {
             if (prevT > -900.0) {
-                // Tracking mode: prioritize proximity to prevT
-                double dt = std::abs(p.t - prevT);
-                if (dt > trackingWindow * 1.5) continue; // Outside local tracking window
-                if (dt > maxJump * 1.5) continue;       // Reject massive jump
+                // Tracking mode: prioritize proximity to refT (inertial trajectory)
+                double dt = std::abs(p.t - refT);
+                if (dt > trackingWindow * 1.6) continue; // Reject points outside narrow tracking window around needle
+                if (dt > maxJump * 1.5) continue;
 
                 double sJump = std::max(0.0, 1.0 - dt / maxJump);
                 double sDir = p.dirScore;
@@ -392,7 +428,7 @@ EdgeTrack PointerDetector::trackEdgeInCorridor(
                     bestPeak = p;
                 }
             } else {
-                // Initial detection mode: choose strongest peak with good orientation
+                // Initial detection mode
                 double sDir = p.dirScore;
                 double sMag = std::min(1.0, static_cast<double>(p.edgeScore) / 100.0);
                 double score = 0.60 * sDir + 0.40 * sMag;
@@ -404,6 +440,14 @@ EdgeTrack PointerDetector::trackEdgeInCorridor(
         }
 
         if (bestPeak.edgeScore > 0.0f) {
+            // Re-acquisition after occlusion gap: commit bridged points!
+            if (!pendingGapPoints.empty()) {
+                for (const auto& gp : pendingGapPoints) {
+                    rawPoints.push_back(gp);
+                }
+                pendingGapPoints.clear();
+            }
+
             if (prevT > -900.0) {
                 double dt = std::abs(bestPeak.t - prevT);
                 if (dt > maxJump * 0.75) {
@@ -422,18 +466,23 @@ EdgeTrack PointerDetector::trackEdgeInCorridor(
             pt.strength = bestPeak.edgeScore;
             pt.orientation = bestPeak.dirScore;
 
-            // Principle 5: Raw edge support verification on exact image coordinates
+            // Raw edge support verification
             float rawMag = sampleBilinear(features.gradMag, static_cast<float>(pt.x), static_cast<float>(pt.y));
             float rawUx = sampleBilinear(features.gradUnitX, static_cast<float>(pt.x), static_cast<float>(pt.y));
             float rawUy = sampleBilinear(features.gradUnitY, static_cast<float>(pt.x), static_cast<float>(pt.y));
-            float rawDir = std::abs(static_cast<float>(rawUx * v.x + rawUy * v.y));
+            float rawProj = static_cast<float>(rawUx * v.x + rawUy * v.y);
+            float rawDir = m_config.requireDarkPointer ? (isLeft ? -rawProj : rawProj) : std::abs(rawProj);
+            rawDir = std::max(0.0f, rawDir);
 
-            // Check local step contrast across the edge point (+/- 2px along normal v)
-            float gIn = sampleBilinear(gray, static_cast<float>(pt.x - v.x * 2.0), static_cast<float>(pt.y - v.y * 2.0));
-            float gOut = sampleBilinear(gray, static_cast<float>(pt.x + v.x * 2.0), static_cast<float>(pt.y + v.y * 2.0));
-            float localStep = std::abs(gOut - gIn);
+            // Step contrast: gIn is inside needle (towards t=0), gOut is outside needle
+            float gIn = isLeft ? sampleBilinear(gray, static_cast<float>(pt.x + v.x * 2.0), static_cast<float>(pt.y + v.y * 2.0))
+                               : sampleBilinear(gray, static_cast<float>(pt.x - v.x * 2.0), static_cast<float>(pt.y - v.y * 2.0));
+            float gOut = isLeft ? sampleBilinear(gray, static_cast<float>(pt.x - v.x * 2.0), static_cast<float>(pt.y - v.y * 2.0))
+                                : sampleBilinear(gray, static_cast<float>(pt.x + v.x * 2.0), static_cast<float>(pt.y + v.y * 2.0));
+            float localStep = m_config.requireDarkPointer ? (gOut - gIn) : std::abs(gOut - gIn);
 
-            pt.hasRawSupport = (rawMag >= rawGradThresh && rawDir >= minNormalAlign && localStep >= (minStepContrast * 0.7f));
+            bool darkOk = !m_config.requireDarkPointer || (gIn <= static_cast<float>(m_config.maxPointerInsideGray) && localStep >= (minStepContrast * 0.5f));
+            pt.hasRawSupport = (rawMag >= rawGradThresh && rawDir >= minNormalAlign && localStep >= (minStepContrast * 0.6f) && darkOk);
             pt.valid = pt.hasRawSupport;
 
             if (pt.hasRawSupport) {
@@ -445,16 +494,40 @@ EdgeTrack PointerDetector::trackEdgeInCorridor(
             strengths.push_back(bestPeak.edgeScore);
         } else {
             consecutiveMisses++;
-            // Principle 3 & 4: HARD GAP CONSTRAINT - Stop immediately if no genuine edge found for maxConsecutiveGap samples!
-            // Strictly forbid bridging long gaps across white dial background!
             if (consecutiveMisses > maxConsecutiveGap) {
+                // Exceeded max consecutive gap tolerance -> terminate track
                 break;
+            }
+            if (prevT > -900.0) {
+                // Synthesize inertial gap point for potential re-acquisition across text/scale
+                double predT = prevT;
+                if (rawPoints.size() >= 4) {
+                    double dt_hist = rawPoints.back().t - rawPoints[rawPoints.size() - 4].t;
+                    double dr_hist = rawPoints.back().radius - rawPoints[rawPoints.size() - 4].radius;
+                    if (dr_hist > 1e-3) {
+                        double slope = dt_hist / dr_hist;
+                        if (std::abs(slope) < 0.12) {
+                            predT = rawPoints.back().t + slope * (r - rawPoints.back().radius);
+                        }
+                    }
+                }
+                EdgePoint gp;
+                gp.radius = r;
+                gp.t = predT;
+                cv::Point2d imgPt = P_r + v * predT;
+                gp.x = imgPt.x;
+                gp.y = imgPt.y;
+                gp.strength = 15.0;
+                gp.orientation = 0.72;
+                gp.hasRawSupport = false;
+                gp.valid = false;
+                pendingGapPoints.push_back(gp);
             }
         }
     }
 
     // Minimum points check: a real pointer edge must extend over a meaningful distance
-    if (rawPoints.size() < 8) {
+    if (rawPoints.size() < 6) {
         return track;
     }
 
@@ -467,13 +540,13 @@ EdgeTrack PointerDetector::trackEdgeInCorridor(
     track.baseDistance = track.startRadius - m_config.pointerBaseRadius;
 
     // Minimum physical length
-    if (track.length < 25.0) {
+    if (track.length < 20.0) {
         return track;
     }
 
     track.meanStrength = sumStrength / rawPoints.size();
     std::sort(strengths.begin(), strengths.end());
-    track.medianStrength = strengths[strengths.size() / 2];
+    track.medianStrength = strengths.empty() ? 0.0 : strengths[strengths.size() / 2];
     track.jumpCount = jumpCount;
     track.trackingJumpPenalty = static_cast<double>(jumpCount) / std::max(1, static_cast<int>(rawPoints.size()) - 1);
 
@@ -497,20 +570,15 @@ EdgeTrack PointerDetector::trackEdgeInCorridor(
     }
     track.maxConsecutiveGap = maxConsecutiveGapInTrack;
 
-    // HARD GATES:
-    // 1. edgeSupportDensity >= minEdgeSupportDensity (0.75)
-    // 2. maxConsecutiveGap <= maxConsecutiveGapSamples (2)
-    // 3. continuity >= 0.70
-    double minSupportThresh = (m_config.minEdgeSupportDensity > 0.0) ? m_config.minEdgeSupportDensity : 0.75;
+    double minSupportThresh = (m_config.minEdgeSupportDensity > 0.0) ? m_config.minEdgeSupportDensity : 0.45;
     if (track.edgeSupportDensity < minSupportThresh ||
         track.maxConsecutiveGap > maxConsecutiveGap ||
-        track.continuity < 0.70) {
-        // Principle 2: REJECT TRACK! Do not allow sparse or synthetic points to pass!
+        track.continuity < 0.60) {
         track.valid = false;
         return track;
     }
 
-    // Principle 1 & 8: Line fitting ONLY to verify straightness of genuine physical track
+    // Principle 1 & 8: Robust line fitting (cv::DIST_HUBER) to resist text boundary outliers
     std::vector<cv::Point2f> cvPts;
     cvPts.reserve(rawPoints.size());
     for (const auto& p : rawPoints) {
@@ -519,13 +587,13 @@ EdgeTrack PointerDetector::trackEdgeInCorridor(
         }
     }
 
-    if (cvPts.size() < 6) {
+    if (cvPts.size() < 5) {
         track.valid = false;
         return track;
     }
 
     cv::Vec4f lineParams;
-    cv::fitLine(cvPts, lineParams, cv::DIST_L2, 0, 0.01, 0.01);
+    cv::fitLine(cvPts, lineParams, cv::DIST_HUBER, 0, 0.01, 0.01);
     float vx = lineParams[0];
     float vy = lineParams[1];
     float x0 = lineParams[2];
@@ -559,8 +627,8 @@ EdgeTrack PointerDetector::trackEdgeInCorridor(
     track.curvature = meanRes;
 
     // Principle 8 & 9: Straightness residual hard gate
-    double maxResThresh = (m_config.maxLineFitResidualPx > 0.0) ? m_config.maxLineFitResidualPx : 1.8;
-    track.valid = (track.length >= 35.0 &&
+    double maxResThresh = (m_config.maxLineFitResidualPx > 0.0) ? m_config.maxLineFitResidualPx : 2.2;
+    track.valid = (track.length >= 25.0 &&
                    track.edgeSupportDensity >= minSupportThresh &&
                    track.lineFitResidual <= maxResThresh &&
                    track.maxConsecutiveGap <= maxConsecutiveGap);
@@ -583,6 +651,15 @@ PointerCandidateRegion PointerDetector::evaluateCandidateRegion(
     // 1. Independently track Left Edge (t < 0) and Right Edge (t > 0)
     region.leftEdge = trackEdgeInCorridor(gray, features, effectivePivot, thetaDeg, true);
     region.rightEdge = trackEdgeInCorridor(gray, features, effectivePivot, thetaDeg, false);
+
+    double maxResThresh = (m_config.maxLineFitResidualPx > 0.0) ? m_config.maxLineFitResidualPx : 2.2;
+    // Unilateral edge complementation: if one side is fully valid and long, and the other side has decent points,
+    // prevent unilateral text occlusion from rejecting the entire candidate
+    if (!region.leftEdge.valid && region.rightEdge.valid && region.leftEdge.points.size() >= 6 && region.leftEdge.lineFitResidual <= maxResThresh * 1.25) {
+        region.leftEdge.valid = true;
+    } else if (region.leftEdge.valid && !region.rightEdge.valid && region.rightEdge.points.size() >= 6 && region.rightEdge.lineFitResidual <= maxResThresh * 1.25) {
+        region.rightEdge.valid = true;
+    }
 
     if (!region.leftEdge.valid || !region.rightEdge.valid) {
         return region;
@@ -618,44 +695,45 @@ PointerCandidateRegion PointerDetector::evaluateCandidateRegion(
     double diffAng = std::abs(angL - angR);
     if (diffAng > 90.0) diffAng = 180.0 - diffAng;
 
-    double maxParallelDiff = (m_config.maxParallelAngleDiffDeg > 0.0) ? m_config.maxParallelAngleDiffDeg : 5.0;
+    double maxParallelDiff = (m_config.maxParallelAngleDiffDeg > 0.0) ? m_config.maxParallelAngleDiffDeg : 15.0;
     region.parallelism = std::max(0.0, 1.0 - diffAng / maxParallelDiff);
 
     // 4. Section XII: Base Proximity Check
     double baseDistL = std::abs(region.leftEdge.baseDistance);
     double baseDistR = std::abs(region.rightEdge.baseDistance);
-    double maxBaseDist = (m_config.maxBaseDistancePx > 0.0) ? m_config.maxBaseDistancePx : 20.0;
+    double maxBaseDist = (m_config.maxBaseDistancePx > 0.0) ? m_config.maxBaseDistancePx : 25.0;
     double baseProxL = std::max(0.0, 1.0 - baseDistL / maxBaseDist);
     double baseProxR = std::max(0.0, 1.0 - baseDistR / maxBaseDist);
     region.baseProximity = (baseProxL + baseProxR) * 0.5;
 
     // 5. Section XVI: First Layer - Geometry Score Gate with Strict Straightness & Raw Support
-    double minCommonLen = (m_config.minCommonLengthPx > 0.0) ? m_config.minCommonLengthPx : 50.0;
-    double lenScore = std::min(1.0, commonLen / minCommonLen);
+    double minCommonLen = (m_config.minCommonLengthPx > 0.0) ? m_config.minCommonLengthPx : 35.0;
+    double lenBase = std::min(1.0, commonLen / minCommonLen);
+    double lenExt = std::min(1.5, commonLen / 120.0);
+    double lenScore = 0.40 * lenBase + 0.60 * lenExt;
 
-    region.geometryScore = 0.25 * lenScore +
-                           0.25 * region.parallelism +
+    region.geometryScore = 0.30 * lenScore +
+                           0.20 * region.parallelism +
                            0.20 * region.straightness +
                            0.15 * region.baseProximity +
                            0.15 * region.edgeSupportDensity;
 
-    double maxResThresh = (m_config.maxLineFitResidualPx > 0.0) ? m_config.maxLineFitResidualPx : 1.8;
-    double minSupportThresh = (m_config.minEdgeSupportDensity > 0.0) ? m_config.minEdgeSupportDensity : 0.75;
+    double minSupportThresh = (m_config.minEdgeSupportDensity > 0.0) ? m_config.minEdgeSupportDensity : 0.45;
 
     // HARD GEOMETRY GATE (Principle 11):
     // 1. Both edges must be approximately straight: lineFitResidual <= maxResThresh
     // 2. Both edges must be approximately parallel: diffAng <= maxParallelDiff
     // 3. Both edges must have sufficient common overlap: commonLen >= minCommonLen
-    // 4. Both edges must start near pointerBaseRadius: baseProximity >= 0.50
-    // 5. Both edges must have high Raw Edge Support Density: supportDensity >= minSupportThresh
+    // 4. Both edges must start near pointerBaseRadius: baseProximity >= 0.40
+    // 5. Both edges must have high Raw Edge Support Density: supportDensity >= minSupportThresh * 0.85
     bool straightValid = (region.leftEdge.lineFitResidual <= maxResThresh &&
                           region.rightEdge.lineFitResidual <= maxResThresh &&
-                          region.straightness >= 0.70);
+                          region.straightness >= 0.58);
     bool parallelValid = (diffAng <= maxParallelDiff);
     bool lengthValid = (commonLen >= minCommonLen);
-    bool baseValid = (region.baseProximity >= 0.50);
-    bool supportValid = (region.leftSupportDensity >= minSupportThresh &&
-                         region.rightSupportDensity >= minSupportThresh);
+    bool baseValid = (region.baseProximity >= 0.40);
+    bool supportValid = (region.leftSupportDensity >= minSupportThresh * 0.85 &&
+                         region.rightSupportDensity >= minSupportThresh * 0.85);
 
     if (straightValid && parallelValid && lengthValid && baseValid && supportValid) {
         region.geometryValid = true;
@@ -681,6 +759,15 @@ PointerCandidateRegion PointerDetector::evaluateCandidateRegion(
     std::vector<double> widths;
     std::vector<double> radii;
 
+    double sumInside = 0.0;
+    double sumOutside = 0.0;
+    int sliceCount = 0;
+    std::vector<double> sliceInVals;
+
+    double rad = thetaDeg * M_PI / 180.0;
+    cv::Point2d u(std::cos(rad), std::sin(rad));
+    cv::Point2d v(-std::sin(rad), std::cos(rad));
+
     for (double r = commonStart; r <= commonEnd; r += stepR) {
         int rKey = static_cast<int>(std::round(r * 2.0));
         if (leftTMap.find(rKey) != leftTMap.end() && rightTMap.find(rKey) != rightTMap.end()) {
@@ -688,6 +775,28 @@ PointerCandidateRegion PointerDetector::evaluateCandidateRegion(
             if (w >= m_config.minPointerWidth && w <= m_config.maxPointerWidth) {
                 widths.push_back(w);
                 radii.push_back(r);
+
+                double tL = leftTMap[rKey];
+                double tR = rightTMap[rKey];
+                cv::Point2d P_r = effectivePivot + u * r;
+                double tC = (tL + tR) * 0.5;
+
+                float valCenter = sampleBilinear(gray, static_cast<float>(P_r.x + v.x * tC), static_cast<float>(P_r.y + v.y * tC));
+                double sliceIn = valCenter;
+                if (w >= 4.0) {
+                    float valInL = sampleBilinear(gray, static_cast<float>(P_r.x + v.x * (tL + 1.2)), static_cast<float>(P_r.y + v.y * (tL + 1.2)));
+                    float valInR = sampleBilinear(gray, static_cast<float>(P_r.x + v.x * (tR - 1.2)), static_cast<float>(P_r.y + v.y * (tR - 1.2)));
+                    sliceIn = (valCenter * 2.0 + valInL + valInR) / 4.0;
+                }
+
+                float valOutL = sampleBilinear(gray, static_cast<float>(P_r.x + v.x * (tL - 3.5)), static_cast<float>(P_r.y + v.y * (tL - 3.5)));
+                float valOutR = sampleBilinear(gray, static_cast<float>(P_r.x + v.x * (tR + 3.5)), static_cast<float>(P_r.y + v.y * (tR + 3.5)));
+                double sliceOut = (valOutL + valOutR) * 0.5;
+
+                sliceInVals.push_back(sliceIn);
+                sumInside += sliceIn;
+                sumOutside += sliceOut;
+                sliceCount++;
             }
         }
     }
@@ -698,6 +807,29 @@ PointerCandidateRegion PointerDetector::evaluateCandidateRegion(
         return region;
     }
 
+    if (sliceCount > 0) {
+        // 使用 40% 分位数（或稳健中位数），有效排除穿越表盘刻度线或字母时的白斑干扰
+        std::vector<double> sortedIns = sliceInVals;
+        std::sort(sortedIns.begin(), sortedIns.end());
+        size_t pIdx = std::min(sortedIns.size() - 1, static_cast<size_t>(sortedIns.size() * 0.40));
+        region.meanInsideGray = sortedIns[pIdx];
+        region.meanOutsideGray = sumOutside / sliceCount;
+        region.entityContrast = region.meanOutsideGray - region.meanInsideGray;
+    }
+
+    // Optical polarity & dark entity hard gate
+    if (m_config.requireDarkPointer) {
+        region.darkEntityValid = (region.entityContrast >= m_config.minPointerDarkContrast &&
+                                  region.meanInsideGray <= m_config.maxPointerInsideGray);
+        if (!region.darkEntityValid) {
+            region.geometryValid = false;
+            region.bodyScore = 0.0;
+            return region;
+        }
+    } else {
+        region.darkEntityValid = true;
+    }
+
     double sumW = 0.0;
     for (double w : widths) sumW += w;
     region.meanWidth = sumW / widths.size();
@@ -705,6 +837,13 @@ PointerCandidateRegion PointerDetector::evaluateCandidateRegion(
     std::vector<double> sortedW = widths;
     std::sort(sortedW.begin(), sortedW.end());
     region.medianWidth = sortedW[sortedW.size() / 2];
+
+    // Hard gate on needle body width: must strictly satisfy [minPointerWidth, maxPointerWidth]
+    if (region.medianWidth < m_config.minPointerWidth || region.medianWidth > m_config.maxPointerWidth) {
+        region.geometryValid = false;
+        region.bodyScore = 0.0;
+        return region;
+    }
 
     // Width continuity: small step changes
     double sumDw = 0.0;
@@ -750,12 +889,15 @@ PointerCandidateRegion PointerDetector::evaluateCandidateRegion(
     double slender = commonLen / std::max(1.0, region.medianWidth);
     double slendernessScore = slender / (slender + 12.0);
 
+    double contrastNorm = std::min(1.0, std::max(0.0, region.entityContrast / 60.0));
+
     // Section XVI: Final Body Score
-    region.bodyScore = 0.35 * region.geometryScore +
-                       0.25 * slendernessScore +
+    region.bodyScore = 0.30 * region.geometryScore +
+                       0.20 * slendernessScore +
                        0.15 * region.widthContinuity +
                        0.15 * widthTrend +
-                       0.10 * (commonLen / 250.0);
+                       0.10 * (commonLen / 250.0) +
+                       0.10 * contrastNorm;
 
     return region;
 }
@@ -1028,6 +1170,8 @@ RadialDirectionProfile PointerDetector::evaluateRadialDirectionProfile(
     prof.edgeSupportDensity = reg.edgeSupportDensity;
     prof.geometryScore = reg.geometryScore;
     prof.geometryValid = reg.geometryValid;
+    prof.meanInsideGray = reg.meanInsideGray;
+    prof.entityContrast = reg.entityContrast;
 
     if (!prof.geometryValid) {
         prof.bodyScore = 0.0;
@@ -1331,11 +1475,14 @@ RadialDirectionProfile PointerDetector::evaluateRadialDirectionProfile(
     prof.gapPenalty = std::min(1.0, static_cast<double>(prof.maxGap) / std::max(1, m_config.maxOcclusionGap));
     double edgeStrengthScore = std::min(1.0, prof.meanEdgeStrength / 60.0);
     double offsetPenalty = 1.0 / (1.0 + 0.04 * prof.tangentialOffset * prof.tangentialOffset);
+    double contrastScore = std::min(1.0, std::max(0.0, prof.entityContrast / 50.0));
+    double longSpanBonus = std::min(4.0, (prof.commonLength / 50.0));
 
     // Section XI & XVI: Final BodyScore heavily prioritizes Geometry Gate and Candidate Region
-    double geomWeight = 4.0;
+    double geomWeight = (m_config.geomWeight > 0.0) ? m_config.geomWeight : 4.0;
     prof.bodyScore = (
         geomWeight                    * prof.geometryScore +
+        longSpanBonus                 +
         m_config.wEdgePairCoherence   * prof.edgePairCoherence +
         m_config.wCenterStability     * prof.centerStability +
         m_config.wAxisCenter          * prof.axisCenterConsistency +
@@ -1346,7 +1493,8 @@ RadialDirectionProfile PointerDetector::evaluateRadialDirectionProfile(
         m_config.wPersistence         * prof.bilateralPersistence +
         m_config.wWidthTrend          * widthTrendScore +
         m_config.wWidthContinuity     * prof.widthContinuity +
-        m_config.wEdgeStrength        * edgeStrengthScore -
+        m_config.wEdgeStrength        * edgeStrengthScore +
+        m_config.wEntityContrast      * contrastScore -
         m_config.wGapPenalty          * prof.gapPenalty -
         m_config.wTrackingJumpPenalty * prof.trackingJumpPenalty
     ) * offsetPenalty;
@@ -1364,6 +1512,16 @@ RadialDirectionProfile PointerDetector::evaluateRadialDirectionProfile(
     // Incoherence filter: if center drifted or pair coherence is low, heavily suppress
     if (prof.centerStability < 0.55 || prof.axisCenterConsistency < 0.50 || prof.edgePairCoherence < 0.50) {
         prof.bodyScore *= 0.30;
+    }
+
+    // Hard gate on needle body width: must strictly satisfy [minPointerWidth, maxPointerWidth]
+    if (prof.validSectionCount >= 3) {
+        if (prof.medianWidth < m_config.minPointerWidth || prof.medianWidth > m_config.maxPointerWidth) {
+            prof.bodyScore = 0.0;
+            prof.valid = false;
+            prof.directionScore = 0.0;
+            return prof;
+        }
     }
 
     if (prof.validSectionCount < 4 || prof.validLength < 25.0) {
@@ -1387,6 +1545,350 @@ DirectionProfile PointerDetector::evaluateDirectionProfile(
 }
 
 // -------------------------------------------------------------------------
+// Evaluate Wide Counterweight Needle Tail Profile
+// -------------------------------------------------------------------------
+TailDirectionProfile PointerDetector::evaluateTailProfile(
+    const cv::Mat& gray,
+    const GradientFeatureMap& features,
+    const cv::Point2d& effectivePivot,
+    double thetaDeg) {
+
+    TailDirectionProfile prof;
+    double emitTheta = normalizeAngle(thetaDeg);
+    prof.angle = emitTheta;
+
+    if (!m_config.enableTailDetection || gray.empty()) {
+        return prof;
+    }
+
+    double rad = emitTheta * M_PI / 180.0;
+    cv::Point2d u(std::cos(rad), std::sin(rad));
+    cv::Point2d v(-std::sin(rad), std::cos(rad)); // Transverse normal
+
+    // Exclude center exclusion radius (pointerBaseRadius) from tail search as well
+    double rStart = std::max(5.0, m_config.pointerBaseRadius);
+    double rEnd = std::max(rStart + 20.0, std::min(m_config.tailMaxRadius, m_config.maxSearchRadius * 0.85));
+    double stepR = (m_config.tailRadialStepPx > 0.0) ? m_config.tailRadialStepPx : 2.0;
+
+    double maxHalfW = std::max(15.0, m_config.tailCorridorHalfWidth);
+    double minW = std::max(3.0, m_config.tailMinWidth);
+    double maxW = std::max(minW + 5.0, m_config.tailMaxWidth);
+    double stepT = 0.5;
+
+    std::vector<RadialSection> validSections;
+    double sumEdgeStrength = 0.0;
+    double sumCenterOffset = 0.0;
+    double sumTailInside = 0.0;
+    double sumTailOutside = 0.0;
+    std::vector<double> tailInsides;
+    std::vector<double> widths;
+
+    int consecutiveMisses = 0;
+    int maxConsecutiveGap = (m_config.maxConsecutiveGapSamples > 0) ? m_config.maxConsecutiveGapSamples : 5;
+    double maxStartGap = (m_config.maxStartBaseGapPx > 0.0) ? m_config.maxStartBaseGapPx : 16.0;
+
+    float minPeakScore = static_cast<float>(std::min(30.0, std::max(18.0, m_config.rawGradientThreshold * 0.55)));
+
+    for (double r = rStart; r <= rEnd; r += stepR) {
+        // Hub start proximity check: tail must start close to pointerBaseRadius
+        if (validSections.empty() && (r - rStart) > maxStartGap) {
+            break;
+        }
+
+        cv::Point2d rayCenter = effectivePivot + u * r;
+
+        struct LocalPeak {
+            double t;
+            double mag;
+            double dirScore;
+            double score;
+            double intensity;
+            float stepContrast;
+        };
+
+        std::vector<LocalPeak> leftPeaks;
+        std::vector<LocalPeak> rightPeaks;
+
+        int numT = static_cast<int>(std::round((maxHalfW * 2.0) / stepT));
+        std::vector<LocalPeak> sliceSamples;
+        sliceSamples.reserve(numT + 1);
+
+        for (int i = 0; i <= numT; ++i) {
+            double t = -maxHalfW + i * stepT;
+            cv::Point2d pt = rayCenter + v * t;
+
+            if (pt.x < 3.0 || pt.x >= gray.cols - 4.0 || pt.y < 3.0 || pt.y >= gray.rows - 4.0) {
+                sliceSamples.push_back({ t, 0.0, 0.0, 0.0, 0.0, 0.0f });
+                continue;
+            }
+
+            float mag = sampleBilinear(features.gradMag, static_cast<float>(pt.x), static_cast<float>(pt.y));
+            float ux = sampleBilinear(features.gradUnitX, static_cast<float>(pt.x), static_cast<float>(pt.y));
+            float uy = sampleBilinear(features.gradUnitY, static_cast<float>(pt.x), static_cast<float>(pt.y));
+            float intensity = sampleBilinear(gray, static_cast<float>(pt.x), static_cast<float>(pt.y));
+
+            float dirScore = std::abs(static_cast<float>(ux * v.x + uy * v.y));
+            float instantScore = mag * dirScore;
+
+            // 跨度 4~5 像素宏观阶跃差分 (Step Contrast)
+            // 当过渡带平缓（如 4~5 像素爬坡）时，瞬时梯度会被稀释，但跨越 ±2.5px 的总阶跃依然显著
+            cv::Point2d ptOut = (t < 0.0) ? (pt - v * 2.5) : (pt + v * 2.5);
+            cv::Point2d ptIn  = (t < 0.0) ? (pt + v * 2.5) : (pt - v * 2.5);
+            float iOut = sampleBilinear(gray, static_cast<float>(ptOut.x), static_cast<float>(ptOut.y));
+            float iIn  = sampleBilinear(gray, static_cast<float>(ptIn.x), static_cast<float>(ptIn.y));
+            float stepContrast = m_config.requireDarkPointer ? (iOut - iIn) : std::abs(iOut - iIn);
+            stepContrast = std::max(0.0f, stepContrast);
+
+            // 综合边缘强度：融合瞬时微观梯度与宏观跨步长阶跃
+            float score = std::max(instantScore, stepContrast * std::max(0.40f, dirScore) * 1.25f);
+
+            sliceSamples.push_back({ t, mag, dirScore, score, intensity, stepContrast });
+        }
+
+        double tailMinNormalAlign = (m_config.tailMinGradientNormalAlignment > 0.0) ? m_config.tailMinGradientNormalAlignment : 0.50;
+
+        // 识别边缘峰值：支持陡峭微观边缘，也支持 4~5 像素宽阶跃（stepContrast >= 18.0）的平缓过渡边缘
+        for (int i = 1; i < static_cast<int>(sliceSamples.size()) - 1; ++i) {
+            const auto& cur = sliceSamples[i];
+            bool peakCondition = (cur.score >= sliceSamples[i - 1].score && cur.score >= sliceSamples[i + 1].score);
+            bool alignCondition = (cur.dirScore >= tailMinNormalAlign || (cur.stepContrast >= 20.0f && cur.dirScore >= 0.35f));
+            bool strengthCondition = (cur.score >= minPeakScore || cur.stepContrast >= 20.0f);
+
+            if (alignCondition && strengthCondition && peakCondition) {
+                if (cur.t < -minW * 0.30 && cur.t >= -maxHalfW + 1.0) {
+                    leftPeaks.push_back(cur);
+                } else if (cur.t > minW * 0.30 && cur.t <= maxHalfW - 1.0) {
+                    rightPeaks.push_back(cur);
+                }
+            }
+        }
+
+        double bestPairScore = -1.0;
+        LocalPeak bestL{0.0, 0.0, 0.0, -1.0, 0.0, 0.0f}, bestR{0.0, 0.0, 0.0, -1.0, 0.0, 0.0f};
+        double bestInside = 0.0, bestOutside = 0.0;
+
+        double maxAllowedCenterT = std::max(m_config.maxCenterOffset * 1.2, maxHalfW * 0.45);
+
+        for (const auto& l : leftPeaks) {
+            for (const auto& rk : rightPeaks) {
+                double w = rk.t - l.t;
+                if (w < minW || w > maxW) continue;
+
+                double centerT = (l.t + rk.t) * 0.5;
+                if (std::abs(centerT) > maxAllowedCenterT) continue;
+
+                double sCenter = 1.0 / (1.0 + 0.15 * centerT * centerT);
+                double sSym = std::min(1.0, 1.0 - std::abs(rk.t + l.t) / (w + 1e-3));
+                double edgeScore = (l.score + rk.score) * 0.5;
+
+                int idxL = static_cast<int>(std::round((l.t + maxHalfW) / stepT));
+                int idxR = static_cast<int>(std::round((rk.t + maxHalfW) / stepT));
+                idxL = std::max(0, std::min(static_cast<int>(sliceSamples.size()) - 1, idxL));
+                idxR = std::max(0, std::min(static_cast<int>(sliceSamples.size()) - 1, idxR));
+
+                std::vector<double> insideInts;
+                insideInts.reserve(std::max(0, idxR - idxL));
+                for (int k = idxL + 1; k < idxR; ++k) {
+                    insideInts.push_back(sliceSamples[k].intensity);
+                }
+
+                double robustInside = 0.0;
+                if (!insideInts.empty()) {
+                    std::sort(insideInts.begin(), insideInts.end());
+                    // 采用第 35% 分位数作为深色实体的代表灰度，抗内部微弱反光
+                    size_t pIdx = std::min(insideInts.size() - 1, static_cast<size_t>(insideInts.size() * 0.35));
+                    robustInside = insideInts[pIdx];
+                } else {
+                    robustInside = (l.intensity + rk.intensity) * 0.5;
+                }
+
+                double avgOutside = (l.intensity + rk.intensity) * 0.5;
+                double contrast = m_config.requireDarkPointer ? (avgOutside - robustInside) : std::abs(avgOutside - robustInside);
+
+                if (m_config.requireDarkPointer && (contrast < 4.0 || robustInside > m_config.maxPointerInsideGray)) {
+                    continue; // Skip slice: needle tail must be a dark entity
+                }
+
+                // 核心防线 1：深色填充率检验 (Dark Pixel Fill Ratio)
+                // 针尾配重是深色实心块，区间内绝大多数像素必须显著低于表盘白底
+                // 彻底杜绝因宽步长搜索而把外部大面积表盘白底包入针尾
+                int darkCount = 0;
+                int totalIn = idxR - idxL - 1;
+                double darkThreshold = (avgOutside + robustInside) * 0.5;
+                for (int k = idxL + 1; k < idxR; ++k) {
+                    if (sliceSamples[k].intensity <= darkThreshold) {
+                        darkCount++;
+                    }
+                }
+                double darkRatio = totalIn > 0 ? (static_cast<double>(darkCount) / totalIn) : 0.0;
+                if (darkRatio < 0.65) {
+                    continue; // 内部超过 35% 为亮色背景，拒绝外扩假边缘！
+                }
+
+                // 核心防线 2：紧凑优先与最内侧过渡带偏好 (Innermost Transition Preference)
+                // 优先锁定由内向外遇到的第一道深浅过渡边缘，对异常宽的假边界施加衰减
+                double compactnessBonus = 1.0;
+                if (w > 48.0) {
+                    compactnessBonus = std::max(0.50, 1.0 - 0.015 * (w - 48.0));
+                }
+
+                double pairScore = edgeScore * (0.4 + 0.6 * sCenter) * (0.5 + 0.5 * sSym)
+                                   * (1.0 + std::min(1.0, std::max(0.0, contrast) / 25.0))
+                                   * (0.4 + 0.6 * darkRatio)
+                                   * compactnessBonus;
+
+                if (pairScore > bestPairScore) {
+                    bestPairScore = pairScore;
+                    bestL = l;
+                    bestR = rk;
+                    bestInside = robustInside;
+                    bestOutside = avgOutside;
+                }
+            }
+        }
+
+        if (bestPairScore > 0.0) {
+            consecutiveMisses = 0;
+            RadialSection sec;
+            sec.radius = r;
+            sec.valid = true;
+            sec.leftValid = true;
+            sec.rightValid = true;
+            sec.leftT = bestL.t;
+            sec.rightT = bestR.t;
+            sec.width = bestR.t - bestL.t;
+            sec.centerT = (bestL.t + bestR.t) * 0.5;
+            sec.leftStrength = bestL.mag;
+            sec.rightStrength = bestR.mag;
+            sec.leftDirectionScore = bestL.dirScore;
+            sec.rightDirectionScore = bestR.dirScore;
+            sec.leftPoint = rayCenter + v * bestL.t;
+            sec.rightPoint = rayCenter + v * bestR.t;
+            sec.centerPoint = rayCenter + v * sec.centerT;
+            validSections.push_back(sec);
+
+            sumEdgeStrength += (bestL.mag + bestR.mag) * 0.5;
+            sumCenterOffset += std::abs(sec.centerT);
+            sumTailInside += bestInside;
+            sumTailOutside += bestOutside;
+            tailInsides.push_back(bestInside);
+            widths.push_back(sec.width);
+        } else {
+            consecutiveMisses++;
+            if (!validSections.empty() && consecutiveMisses > maxConsecutiveGap) {
+                // Tail search terminated: consecutive missing slices exceeded tolerance limit
+                break;
+            }
+        }
+    }
+
+    prof.sections = validSections;
+    prof.validSectionCount = static_cast<int>(validSections.size());
+
+    if (prof.validSectionCount >= 3) {
+        prof.reach = validSections.back().radius;
+        double sumW = 0.0;
+        for (double w : widths) sumW += w;
+        prof.meanWidth = sumW / widths.size();
+
+        std::vector<double> sortedW = widths;
+        std::sort(sortedW.begin(), sortedW.end());
+        prof.medianWidth = sortedW[sortedW.size() / 2];
+
+        double avgCenterOffset = sumCenterOffset / prof.validSectionCount;
+        prof.symmetryScore = 1.0 / (1.0 + 0.20 * avgCenterOffset * avgCenterOffset);
+
+        double avgEdgeStr = sumEdgeStrength / prof.validSectionCount;
+        prof.contrastScore = std::min(1.5, avgEdgeStr / 40.0);
+
+        if (!tailInsides.empty()) {
+            std::vector<double> sortedTIns = tailInsides;
+            std::sort(sortedTIns.begin(), sortedTIns.end());
+            // 取第 35% 分位数作为针尾深色主体代表值，排除局部包含白底的影响
+            size_t tIdx = std::min(sortedTIns.size() - 1, static_cast<size_t>(sortedTIns.size() * 0.35));
+            prof.meanInsideGray = sortedTIns[tIdx];
+        } else {
+            prof.meanInsideGray = sumTailInside / prof.validSectionCount;
+        }
+        prof.meanOutsideGray = sumTailOutside / prof.validSectionCount;
+        prof.meanContrast = prof.meanOutsideGray - prof.meanInsideGray;
+
+        // 1. Calculate linear regression slope dW/dr along radius from center outward
+        int N = static_cast<int>(validSections.size());
+        double sumR = 0.0, sumW_cov = 0.0, sumR2 = 0.0, sumRW = 0.0;
+        int countIncreasing = 0;
+        double tol = 0.5; // pixel tolerance for discrete sampling noise
+        for (size_t i = 0; i < validSections.size(); ++i) {
+            double r_i = validSections[i].radius;
+            double w_i = validSections[i].width;
+            sumR += r_i;
+            sumW_cov += w_i;
+            sumR2 += r_i * r_i;
+            sumRW += r_i * w_i;
+            if (i + 1 < validSections.size()) {
+                if (validSections[i + 1].width >= validSections[i].width - tol) {
+                    countIncreasing++;
+                }
+            }
+        }
+        double denom = N * sumR2 - sumR * sumR;
+        double slope = (std::abs(denom) > 1e-4) ? ((N * sumRW - sumR * sumW_cov) / denom) : 0.0;
+        prof.widthSlope = slope;
+
+        double monoRatio = (N > 1) ? (static_cast<double>(countIncreasing) / (N - 1)) : 0.0;
+
+        // Widening score:
+        // A normal needle tail widens outward from the center hub (dW/dr > 0).
+        // If slope is negative (narrowing outward), it behaves like a pointer tip, not a tail!
+        double slopeScore = 0.0;
+        if (slope >= 0.05) {
+            slopeScore = std::min(1.0, 0.40 + slope * 3.0); // Distinct outward widening
+        } else if (slope >= -0.02) {
+            slopeScore = 0.40; // Relatively flat / slightly widening
+        } else {
+            // Negative slope: getting narrower outward -> heavily penalize
+            slopeScore = std::max(0.0, 0.20 + slope * 5.0);
+        }
+        prof.wideningScore = 0.40 * monoRatio + 0.60 * slopeScore;
+
+        // Compare inner-region average width vs outer-region and peak width
+        double innerW = validSections.front().width;
+        double outerW = validSections.back().width;
+        if (validSections.size() >= 4) {
+            innerW = (validSections[0].width + validSections[1].width) * 0.5;
+            outerW = (validSections[validSections.size() - 1].width + validSections[validSections.size() - 2].width) * 0.5;
+        }
+
+        double maxW_found = 0.0;
+        for (const auto& s : validSections) {
+            if (s.width > maxW_found) maxW_found = s.width;
+        }
+
+        // Geometric criterion: normal needle tail expands outward from the hub in its main body
+        // (either overall positive slope, outer width >= inner width, or peak width clearly exceeds base width)
+        bool isOutwardWidening = ((outerW >= innerW - 2.0) || (maxW_found >= innerW * 1.12)) && (slope >= -0.06);
+
+        double tailLen = prof.reach - validSections.front().radius;
+        if (tailLen >= 8.0 && prof.meanWidth >= minW && isOutwardWidening) {
+            if (m_config.requireDarkPointer && (prof.meanInsideGray > m_config.maxPointerInsideGray || prof.meanContrast < 4.0)) {
+                prof.tailScore = 0.0;
+                prof.valid = false;
+            } else {
+                double widthBonus = std::min(1.5, prof.medianWidth / 18.0);
+                double spanNorm = std::min(1.0, static_cast<double>(prof.validSectionCount) / 25.0);
+                prof.tailScore = (spanNorm * 1.5) * prof.symmetryScore * prof.contrastScore * widthBonus * (0.4 + 0.8 * prof.wideningScore);
+                prof.valid = (prof.tailScore > 0.35 && prof.wideningScore >= 0.30);
+            }
+        } else {
+            prof.tailScore = 0.0;
+            prof.valid = false;
+        }
+    }
+
+    return prof;
+}
+
+// -------------------------------------------------------------------------
 // Step 4 & 5: Evaluate Non-Directional Candidate Axis in [0, 180°)
 // -------------------------------------------------------------------------
 PointerAxisCandidate PointerDetector::evaluateCandidateAxis(
@@ -1402,10 +1904,16 @@ PointerAxisCandidate PointerDetector::evaluateCandidateAxis(
     RadialDirectionProfile profA = evaluateRadialDirectionProfile(gray, features, effectivePivot, cand.theta);
     RadialDirectionProfile profB = evaluateRadialDirectionProfile(gray, features, effectivePivot, cand.theta + 180.0);
 
-    cand.totalScore = profA.bodyScore + profB.bodyScore;
+    TailDirectionProfile tailA = evaluateTailProfile(gray, features, effectivePivot, cand.theta);
+    TailDirectionProfile tailB = evaluateTailProfile(gray, features, effectivePivot, cand.theta + 180.0);
+
+    double scoreAB = profA.bodyScore + (tailB.valid ? m_config.wTailScore * tailB.tailScore : 0.0);
+    double scoreBA = profB.bodyScore + (tailA.valid ? m_config.wTailScore * tailA.tailScore : 0.0);
+
+    cand.totalScore = std::max(scoreAB, scoreBA);
     cand.bodyScore = cand.totalScore;
 
-    bool aIsPrimary = (profA.bodyScore >= profB.bodyScore);
+    bool aIsPrimary = (scoreAB >= scoreBA);
     const auto& primary = aIsPrimary ? profA : profB;
 
     cand.sections = primary.sections;
@@ -1547,7 +2055,11 @@ PointerDetectionResult PointerDetector::detect(const cv::Mat& gray, const cv::Po
     PointerDetectionResult res;
     res.success = false;
 
-    if (gray.empty()) return res;
+    if (gray.empty()) {
+        res.failureReason = "输入图像为空 (Input grayscale image is empty)";
+        res.detailedDebugText = "❌ [PointerDetector] 失败原因: 输入灰度图像为空 (cv::Mat::empty)";
+        return res;
+    }
 
     cv::Mat grayImg;
     if (gray.channels() == 3) {
@@ -1564,78 +2076,98 @@ PointerDetectionResult PointerDetector::detect(const cv::Mat& gray, const cv::Po
     GradientFeatureMap features = computeGradientFeatures(grayImg);
 
     // Step 5: Phase 1 Non-directional axis search theta in [0, 180°)
-    double angleStep = std::max(0.2, m_config.angleStep);
+    double angleStep = std::max(0.5, m_config.angleStep > 0.0 ? m_config.angleStep : 1.0);
     int numSteps = static_cast<int>(std::round(180.0 / angleStep));
 
-    std::vector<PointerAxisCandidate> allCandidates;
-    allCandidates.reserve(numSteps);
+    std::vector<PointerAxisCandidate> allCandidates(numSteps);
+
+    // Parallel multi-threaded coarse search across angles
+    cv::parallel_for_(cv::Range(0, numSteps), [&](const cv::Range& range) {
+        for (int i = range.start; i < range.end; ++i) {
+            double theta = i * angleStep;
+            RadialDirectionProfile profA = evaluateRadialDirectionProfile(grayImg, features, effectivePivot, theta);
+            RadialDirectionProfile profB = evaluateRadialDirectionProfile(grayImg, features, effectivePivot, theta + 180.0);
+
+            TailDirectionProfile tailA = evaluateTailProfile(grayImg, features, effectivePivot, theta);
+            TailDirectionProfile tailB = evaluateTailProfile(grayImg, features, effectivePivot, theta + 180.0);
+
+            double scoreAB = 0.0;
+            if (profA.validSectionCount >= 3) {
+                scoreAB = profA.bodyScore + (tailB.valid ? m_config.wTailScore * tailB.tailScore : 0.0);
+            }
+            double scoreBA = 0.0;
+            if (profB.validSectionCount >= 3) {
+                scoreBA = profB.bodyScore + (tailA.valid ? m_config.wTailScore * tailA.tailScore : 0.0);
+            }
+            if (profA.validSectionCount < 3 && profB.validSectionCount < 3) {
+                scoreAB = profA.bodyScore;
+                scoreBA = profB.bodyScore;
+            }
+
+            double axisScore = std::max(scoreAB, scoreBA);
+
+            bool aIsPrimary = (scoreAB >= scoreBA);
+            const auto& primary = aIsPrimary ? profA : profB;
+
+            PointerAxisCandidate cand;
+            cand.theta = theta;
+            cand.sections = primary.sections;
+            cand.reach = primary.reach;
+            cand.coverageLength = primary.validLength;
+            cand.meanWidth = primary.meanWidth;
+            cand.medianWidth = primary.medianWidth;
+            cand.slenderness = primary.slenderness;
+            cand.edgeStrength = primary.meanEdgeStrength;
+            cand.edgePersistence = primary.bilateralPersistence;
+            cand.bilateralPersistence = primary.bilateralPersistence;
+            cand.widthSlope = primary.widthSlope;
+            cand.widthContinuity = primary.widthContinuity;
+            cand.centerStability = primary.centerStability;
+            cand.leftEdgeStability = primary.centerStability;
+            cand.rightEdgeStability = primary.centerStability;
+            cand.bodyScore = axisScore;
+            cand.totalScore = axisScore;
+
+            cand.validSectionCount = primary.validSectionCount;
+            cand.maxGapLength = primary.maxGap;
+            cand.startRadius = primary.startRadius;
+            cand.endRadius = primary.endRadius;
+            cand.tangentialOffset = primary.tangentialOffset;
+
+            cand.leftLength = primary.leftLength;
+            cand.rightLength = primary.rightLength;
+            cand.commonLength = primary.commonLength;
+            cand.leftStraightness = primary.leftStraightness;
+            cand.rightStraightness = primary.rightStraightness;
+            cand.parallelism = primary.parallelism;
+            cand.baseProximity = primary.baseProximity;
+            cand.leftSupportDensity = primary.leftSupportDensity;
+            cand.rightSupportDensity = primary.rightSupportDensity;
+            cand.edgeSupportDensity = primary.edgeSupportDensity;
+            cand.geometryScore = primary.geometryScore;
+            cand.geometryValid = primary.geometryValid;
+
+            cand.leftContinuity = primary.leftContinuity;
+            cand.rightContinuity = primary.rightContinuity;
+            cand.pairMotionConsistency = primary.pairMotionConsistency;
+            cand.axisCenterConsistency = primary.axisCenterConsistency;
+            cand.orientationConsistency = primary.orientationConsistency;
+            cand.trackingJumpPenalty = primary.trackingJumpPenalty;
+            cand.edgePairCoherence = primary.edgePairCoherence;
+
+            allCandidates[i] = cand;
+        }
+    });
 
     double bestCoarseTheta = 0.0;
     double maxCoarseScore = -1.0;
     PointerAxisCandidate bestCoarseCandidate;
 
     for (int i = 0; i < numSteps; ++i) {
-        double theta = i * angleStep;
-        RadialDirectionProfile profA = evaluateRadialDirectionProfile(grayImg, features, effectivePivot, theta);
-        RadialDirectionProfile profB = evaluateRadialDirectionProfile(grayImg, features, effectivePivot, theta + 180.0);
-
-        double axisScore = profA.bodyScore + profB.bodyScore;
-
-        bool aIsPrimary = (profA.bodyScore >= profB.bodyScore);
-        const auto& primary = aIsPrimary ? profA : profB;
-
-        PointerAxisCandidate cand;
-        cand.theta = theta;
-        cand.sections = primary.sections;
-        cand.reach = primary.reach;
-        cand.coverageLength = primary.validLength;
-        cand.meanWidth = primary.meanWidth;
-        cand.medianWidth = primary.medianWidth;
-        cand.slenderness = primary.slenderness;
-        cand.edgeStrength = primary.meanEdgeStrength;
-        cand.edgePersistence = primary.bilateralPersistence;
-        cand.bilateralPersistence = primary.bilateralPersistence;
-        cand.widthSlope = primary.widthSlope;
-        cand.widthContinuity = primary.widthContinuity;
-        cand.centerStability = primary.centerStability;
-        cand.leftEdgeStability = primary.centerStability;
-        cand.rightEdgeStability = primary.centerStability;
-        cand.bodyScore = axisScore;
-        cand.totalScore = axisScore;
-
-        cand.validSectionCount = primary.validSectionCount;
-        cand.maxGapLength = primary.maxGap;
-        cand.startRadius = primary.startRadius;
-        cand.endRadius = primary.endRadius;
-        cand.tangentialOffset = primary.tangentialOffset;
-
-        cand.leftLength = primary.leftLength;
-        cand.rightLength = primary.rightLength;
-        cand.commonLength = primary.commonLength;
-        cand.leftStraightness = primary.leftStraightness;
-        cand.rightStraightness = primary.rightStraightness;
-        cand.parallelism = primary.parallelism;
-        cand.baseProximity = primary.baseProximity;
-        cand.leftSupportDensity = primary.leftSupportDensity;
-        cand.rightSupportDensity = primary.rightSupportDensity;
-        cand.edgeSupportDensity = primary.edgeSupportDensity;
-        cand.geometryScore = primary.geometryScore;
-        cand.geometryValid = primary.geometryValid;
-
-        cand.leftContinuity = primary.leftContinuity;
-        cand.rightContinuity = primary.rightContinuity;
-        cand.pairMotionConsistency = primary.pairMotionConsistency;
-        cand.axisCenterConsistency = primary.axisCenterConsistency;
-        cand.orientationConsistency = primary.orientationConsistency;
-        cand.trackingJumpPenalty = primary.trackingJumpPenalty;
-        cand.edgePairCoherence = primary.edgePairCoherence;
-
-        allCandidates.push_back(cand);
-
-        if (axisScore > maxCoarseScore) {
-            maxCoarseScore = axisScore;
-            bestCoarseTheta = theta;
-            bestCoarseCandidate = cand;
+        if (allCandidates[i].totalScore > maxCoarseScore) {
+            maxCoarseScore = allCandidates[i].totalScore;
+            bestCoarseTheta = allCandidates[i].theta;
+            bestCoarseCandidate = allCandidates[i];
         }
     }
 
@@ -1683,62 +2215,90 @@ PointerDetectionResult PointerDetector::detect(const cv::Mat& gray, const cv::Po
     PointerAxisCandidate bestFineCandidate = bestCoarseCandidate;
 
     int numFineSteps = static_cast<int>(std::round((fineRange * 2.0) / fineStep));
-    for (int i = 0; i <= numFineSteps; ++i) {
-        double theta = (bestCoarseTheta - fineRange) + i * fineStep;
-        if (theta < 0.0) theta += 180.0;
-        if (theta >= 180.0) theta -= 180.0;
+    std::vector<PointerAxisCandidate> fineCandidates(numFineSteps + 1);
 
-        RadialDirectionProfile profA = evaluateRadialDirectionProfile(grayImg, features, effectivePivot, theta);
-        RadialDirectionProfile profB = evaluateRadialDirectionProfile(grayImg, features, effectivePivot, theta + 180.0);
-        double combScore = profA.bodyScore + profB.bodyScore;
+    // Parallel multi-threaded fine search around best candidate
+    cv::parallel_for_(cv::Range(0, numFineSteps + 1), [&](const cv::Range& range) {
+        for (int i = range.start; i < range.end; ++i) {
+            double theta = (bestCoarseTheta - fineRange) + i * fineStep;
+            if (theta < 0.0) theta += 180.0;
+            if (theta >= 180.0) theta -= 180.0;
 
-        if (combScore > maxFineScore) {
-            maxFineScore = combScore;
-            bestFineTheta = theta;
-            bool aIsPrimary = (profA.bodyScore >= profB.bodyScore);
+            RadialDirectionProfile profA = evaluateRadialDirectionProfile(grayImg, features, effectivePivot, theta);
+            RadialDirectionProfile profB = evaluateRadialDirectionProfile(grayImg, features, effectivePivot, theta + 180.0);
+
+            TailDirectionProfile tailA = evaluateTailProfile(grayImg, features, effectivePivot, theta);
+            TailDirectionProfile tailB = evaluateTailProfile(grayImg, features, effectivePivot, theta + 180.0);
+
+            double scoreAB = 0.0;
+            if (profA.validSectionCount >= 3) {
+                scoreAB = profA.bodyScore + (tailB.valid ? m_config.wTailScore * tailB.tailScore : 0.0);
+            }
+            double scoreBA = 0.0;
+            if (profB.validSectionCount >= 3) {
+                scoreBA = profB.bodyScore + (tailA.valid ? m_config.wTailScore * tailA.tailScore : 0.0);
+            }
+            if (profA.validSectionCount < 3 && profB.validSectionCount < 3) {
+                scoreAB = profA.bodyScore;
+                scoreBA = profB.bodyScore;
+            }
+            double combScore = std::max(scoreAB, scoreBA);
+
+            bool aIsPrimary = (scoreAB >= scoreBA);
             const auto& primary = aIsPrimary ? profA : profB;
 
-            bestFineCandidate.theta = theta;
-            bestFineCandidate.sections = primary.sections;
-            bestFineCandidate.reach = primary.reach;
-            bestFineCandidate.coverageLength = primary.validLength;
-            bestFineCandidate.meanWidth = primary.meanWidth;
-            bestFineCandidate.medianWidth = primary.medianWidth;
-            bestFineCandidate.slenderness = primary.slenderness;
-            bestFineCandidate.edgeStrength = primary.meanEdgeStrength;
-            bestFineCandidate.edgePersistence = primary.bilateralPersistence;
-            bestFineCandidate.bilateralPersistence = primary.bilateralPersistence;
-            bestFineCandidate.widthSlope = primary.widthSlope;
-            bestFineCandidate.widthContinuity = primary.widthContinuity;
-            bestFineCandidate.centerStability = primary.centerStability;
-            bestFineCandidate.leftEdgeStability = primary.centerStability;
-            bestFineCandidate.rightEdgeStability = primary.centerStability;
-            bestFineCandidate.bodyScore = combScore;
-            bestFineCandidate.totalScore = combScore;
-            bestFineCandidate.validSectionCount = primary.validSectionCount;
-            bestFineCandidate.startRadius = primary.startRadius;
-            bestFineCandidate.endRadius = primary.endRadius;
+            PointerAxisCandidate cand;
+            cand.theta = theta;
+            cand.sections = primary.sections;
+            cand.reach = primary.reach;
+            cand.coverageLength = primary.validLength;
+            cand.meanWidth = primary.meanWidth;
+            cand.medianWidth = primary.medianWidth;
+            cand.slenderness = primary.slenderness;
+            cand.edgeStrength = primary.meanEdgeStrength;
+            cand.edgePersistence = primary.bilateralPersistence;
+            cand.bilateralPersistence = primary.bilateralPersistence;
+            cand.widthSlope = primary.widthSlope;
+            cand.widthContinuity = primary.widthContinuity;
+            cand.centerStability = primary.centerStability;
+            cand.leftEdgeStability = primary.centerStability;
+            cand.rightEdgeStability = primary.centerStability;
+            cand.bodyScore = combScore;
+            cand.totalScore = combScore;
+            cand.validSectionCount = primary.validSectionCount;
+            cand.startRadius = primary.startRadius;
+            cand.endRadius = primary.endRadius;
 
-            bestFineCandidate.leftLength = primary.leftLength;
-            bestFineCandidate.rightLength = primary.rightLength;
-            bestFineCandidate.commonLength = primary.commonLength;
-            bestFineCandidate.leftStraightness = primary.leftStraightness;
-            bestFineCandidate.rightStraightness = primary.rightStraightness;
-            bestFineCandidate.parallelism = primary.parallelism;
-            bestFineCandidate.baseProximity = primary.baseProximity;
-            bestFineCandidate.leftSupportDensity = primary.leftSupportDensity;
-            bestFineCandidate.rightSupportDensity = primary.rightSupportDensity;
-            bestFineCandidate.edgeSupportDensity = primary.edgeSupportDensity;
-            bestFineCandidate.geometryScore = primary.geometryScore;
-            bestFineCandidate.geometryValid = primary.geometryValid;
+            cand.leftLength = primary.leftLength;
+            cand.rightLength = primary.rightLength;
+            cand.commonLength = primary.commonLength;
+            cand.leftStraightness = primary.leftStraightness;
+            cand.rightStraightness = primary.rightStraightness;
+            cand.parallelism = primary.parallelism;
+            cand.baseProximity = primary.baseProximity;
+            cand.leftSupportDensity = primary.leftSupportDensity;
+            cand.rightSupportDensity = primary.rightSupportDensity;
+            cand.edgeSupportDensity = primary.edgeSupportDensity;
+            cand.geometryScore = primary.geometryScore;
+            cand.geometryValid = primary.geometryValid;
 
-            bestFineCandidate.leftContinuity = primary.leftContinuity;
-            bestFineCandidate.rightContinuity = primary.rightContinuity;
-            bestFineCandidate.pairMotionConsistency = primary.pairMotionConsistency;
-            bestFineCandidate.axisCenterConsistency = primary.axisCenterConsistency;
-            bestFineCandidate.orientationConsistency = primary.orientationConsistency;
-            bestFineCandidate.trackingJumpPenalty = primary.trackingJumpPenalty;
-            bestFineCandidate.edgePairCoherence = primary.edgePairCoherence;
+            cand.leftContinuity = primary.leftContinuity;
+            cand.rightContinuity = primary.rightContinuity;
+            cand.pairMotionConsistency = primary.pairMotionConsistency;
+            cand.axisCenterConsistency = primary.axisCenterConsistency;
+            cand.orientationConsistency = primary.orientationConsistency;
+            cand.trackingJumpPenalty = primary.trackingJumpPenalty;
+            cand.edgePairCoherence = primary.edgePairCoherence;
+
+            fineCandidates[i] = cand;
+        }
+    });
+
+    for (int i = 0; i <= numFineSteps; ++i) {
+        if (fineCandidates[i].totalScore > maxFineScore) {
+            maxFineScore = fineCandidates[i].totalScore;
+            bestFineTheta = fineCandidates[i].theta;
+            bestFineCandidate = fineCandidates[i];
         }
     }
 
@@ -1748,22 +2308,59 @@ PointerDetectionResult PointerDetector::detect(const cv::Mat& gray, const cv::Po
     RadialDirectionProfile profA = evaluateRadialDirectionProfile(grayImg, features, effectivePivot, bestFineTheta);
     RadialDirectionProfile profB = evaluateRadialDirectionProfile(grayImg, features, effectivePivot, bestFineTheta + 180.0);
 
+    TailDirectionProfile tailA = evaluateTailProfile(grayImg, features, effectivePivot, bestFineTheta);
+    TailDirectionProfile tailB = evaluateTailProfile(grayImg, features, effectivePivot, bestFineTheta + 180.0);
+
     res.directionA = profA;
     res.directionB = profB;
+    res.tailA = tailA;
+    res.tailB = tailB;
     res.reachForward = profA.reach;
     res.reachBackward = profB.reach;
 
-    res.tipLikelihoodA = profA.bodyScore;
-    res.tipLikelihoodB = profB.bodyScore;
-    res.tipLikelihoodMargin = std::abs(profA.bodyScore - profB.bodyScore);
+    double scoreAB = 0.0;
+    if (profA.validSectionCount >= 3) {
+        scoreAB = profA.bodyScore + (tailB.valid ? m_config.wTailScore * tailB.tailScore : 0.0);
+    }
+    double scoreBA = 0.0;
+    if (profB.validSectionCount >= 3) {
+        scoreBA = profB.bodyScore + (tailA.valid ? m_config.wTailScore * tailA.tailScore : 0.0);
+    }
+    if (profA.validSectionCount < 3 && profB.validSectionCount < 3) {
+        scoreAB = profA.bodyScore;
+        scoreBA = profB.bodyScore;
+    }
 
-    if (profA.bodyScore >= profB.bodyScore) {
+    // Non-symmetric geometry polarity confirmation:
+    // If A is Body and B is Tail: profA.reach should be substantially longer than tailB.reach
+    double polarityBonusA = 0.0;
+    double polarityBonusB = 0.0;
+    if (profA.validSectionCount >= 3 && tailB.valid && profA.reach > tailB.reach * 1.3) {
+        polarityBonusA += m_config.wTailPolarityBoost;
+        if (tailB.medianWidth > profA.medianWidth * 1.05) {
+            polarityBonusA += 1.5; // Wide tail vs slender tip confirmation
+        }
+    }
+    if (profB.validSectionCount >= 3 && tailA.valid && profB.reach > tailA.reach * 1.3) {
+        polarityBonusB += m_config.wTailPolarityBoost;
+        if (tailA.medianWidth > profB.medianWidth * 1.05) {
+            polarityBonusB += 1.5; // Wide tail vs slender tip confirmation
+        }
+    }
+
+    res.tipLikelihoodA = scoreAB + polarityBonusA;
+    res.tipLikelihoodB = scoreBA + polarityBonusB;
+    res.tipLikelihoodMargin = std::abs(res.tipLikelihoodA - res.tipLikelihoodB);
+
+    if (res.tipLikelihoodA >= res.tipLikelihoodB) {
         res.headEnd = 'A';
         res.tailEnd = 'B';
         res.pointerAngle = normalizeAngle(bestFineTheta);
         res.sections = profA.sections;
         res.startRadius = profA.startRadius;
         res.endRadius = profA.endRadius;
+        res.tailProfile = tailB;
+        res.tailDetected = tailB.valid;
     } else {
         res.headEnd = 'B';
         res.tailEnd = 'A';
@@ -1771,9 +2368,13 @@ PointerDetectionResult PointerDetector::detect(const cv::Mat& gray, const cv::Po
         res.sections = profB.sections;
         res.startRadius = profB.startRadius;
         res.endRadius = profB.endRadius;
+        res.tailProfile = tailA;
+        res.tailDetected = tailA.valid;
     }
 
-    if (res.tipLikelihoodMargin < 1.2) {
+    if (res.tailDetected) {
+        res.polarityConfidence = (res.tipLikelihoodMargin >= 1.5) ? "HIGH" : "MEDIUM";
+    } else if (res.tipLikelihoodMargin < 1.2) {
         res.polarityConfidence = "LOW";
     } else if (res.tipLikelihoodMargin < 3.0) {
         res.polarityConfidence = "MEDIUM";
@@ -1807,6 +2408,8 @@ PointerDetectionResult PointerDetector::detect(const cv::Mat& gray, const cv::Po
     std::cout << "    WidthSlope:         " << std::setprecision(4) << profA.widthSlope << std::endl;
     std::cout << "    WidthContinuity:    " << std::setprecision(3) << profA.widthContinuity << std::endl;
     std::cout << "    MeanEdgeStrength:   " << std::setprecision(1) << profA.meanEdgeStrength << std::endl;
+    std::cout << "    MeanInsideGray:     " << std::setprecision(1) << profA.meanInsideGray << std::endl;
+    std::cout << "    EntityContrast:     " << std::setprecision(1) << profA.entityContrast << std::endl;
     std::cout << "    BodyScore:          " << std::setprecision(3) << profA.bodyScore << "\n" << std::endl;
 
     std::cout << "Direction B (phi = " << std::setprecision(2) << normalizeAngle(bestFineTheta + 180.0) << " deg):" << std::endl;
@@ -1830,6 +2433,8 @@ PointerDetectionResult PointerDetector::detect(const cv::Mat& gray, const cv::Po
     std::cout << "    WidthSlope:         " << std::setprecision(4) << profB.widthSlope << std::endl;
     std::cout << "    WidthContinuity:    " << std::setprecision(3) << profB.widthContinuity << std::endl;
     std::cout << "    MeanEdgeStrength:   " << std::setprecision(1) << profB.meanEdgeStrength << std::endl;
+    std::cout << "    MeanInsideGray:     " << std::setprecision(1) << profB.meanInsideGray << std::endl;
+    std::cout << "    EntityContrast:     " << std::setprecision(1) << profB.entityContrast << std::endl;
     std::cout << "    BodyScore:          " << std::setprecision(3) << profB.bodyScore << "\n" << std::endl;
 
     std::cout << "Selected Direction:     Direction " << res.headEnd << std::endl;
@@ -1844,11 +2449,48 @@ PointerDetectionResult PointerDetector::detect(const cv::Mat& gray, const cv::Po
 
     res.tipRadius = static_cast<float>(res.endRadius > 0.0 ? res.endRadius : m_config.maxSearchRadius * 0.8);
     res.tipPoint = effectivePivot + ptrDir * res.tipRadius;
-    res.tailPoint = effectivePivot - ptrDir * (m_config.pointerBaseRadius * 0.8);
+    if (res.tailDetected && res.tailProfile.reach > 5.0) {
+        res.tailPoint = effectivePivot - ptrDir * res.tailProfile.reach;
+    } else {
+        res.tailPoint = effectivePivot - ptrDir * (m_config.pointerBaseRadius * 0.8);
+    }
 
     const auto& winningProf = (res.headEnd == 'A') ? profA : profB;
-    res.confidence = std::min(1.0, (winningProf.bodyScore / 12.0));
+    double cDiv = (m_config.confidenceDivisor > 0.0) ? m_config.confidenceDivisor : 12.0;
+    res.confidence = std::min(1.0, (winningProf.bodyScore / cDiv));
     res.success = (winningProf.validSectionCount >= 3 && winningProf.bodyScore > 2.0);
+
+    // Compile comprehensive diagnostic debug text and failure reason
+    std::stringstream dbgStream;
+    dbgStream << "=== [PointerDetector 算法检测日志] ===\n";
+    dbgStream << "• 主轴方向: " << std::fixed << std::setprecision(2) << res.axisAngle << "°\n";
+    dbgStream << "• 指针判定朝向: " << res.pointerAngle << "° (针尖端: " << res.headEnd << ", 针尾端: " << res.tailEnd << ")\n";
+    dbgStream << "• 针身截面: 有效截面数=" << winningProf.validSectionCount << " (要求>=3), 覆盖长度=" << (res.endRadius - res.startRadius) << "px, 中值宽度=" << winningProf.medianWidth << "px\n";
+    dbgStream << "• 几何特征: 细长比=" << winningProf.slenderness << ", 边缘互相关度=" << winningProf.edgePairCoherence << ", 轴心偏移稳定性=" << winningProf.centerStability << "\n";
+    dbgStream << "• 综合身部得分(BodyScore): " << winningProf.bodyScore << " (门限: > 2.0)\n";
+    if (res.tailDetected) {
+        char tailDbg[160];
+        snprintf(tailDbg, sizeof(tailDbg), "• 配重针尾(Tail): 已识别 (延伸=%.1fpx, 宽度=%.1fpx, 展宽斜率=%.4f, 展宽得分=%.2f, 得分=%.2f)\n",
+                 res.tailProfile.reach, res.tailProfile.medianWidth, res.tailProfile.widthSlope, res.tailProfile.wideningScore, res.tailProfile.tailScore);
+        dbgStream << tailDbg;
+    } else {
+        dbgStream << "• 配重针尾(Tail): 未识别到向外展宽的独立针尾\n";
+    }
+    dbgStream << "• 双向极性裕度: " << res.tipLikelihoodMargin << " [" << res.polarityConfidence << "]\n";
+
+    if (winningProf.validSectionCount < 3) {
+        res.failureReason = "指针径向剖面有效截面数不足 (当前仅找到 " + std::to_string(winningProf.validSectionCount) + " 个有效截面，算法至少需 >= 3 个)";
+        dbgStream << "❌ 判定失败: " << res.failureReason << "\n";
+    } else if (winningProf.bodyScore <= 2.0) {
+        char sBuf[64];
+        snprintf(sBuf, sizeof(sBuf), "%.2f", winningProf.bodyScore);
+        res.failureReason = "指针结构综合置信度得分过低 (当前 bodyScore=" + std::string(sBuf) + " <= 门限 2.0，边缘反差不足或被高光遮挡)";
+        dbgStream << "❌ 判定失败: " << res.failureReason << "\n";
+    } else {
+        res.failureReason.clear();
+        dbgStream << "✅ 判定状态: 指针检测成功\n";
+    }
+    res.detailedDebugText = dbgStream.str();
 
     // Backward compatibility aliases
     res.angle = static_cast<float>(res.pointerAngle);
@@ -2017,6 +2659,18 @@ void PointerDetector::renderDebugVisualization(
         }
     }
 
+    // Draw Tail Cross Sections (Orange / Coral, 1 px)
+    if (res.tailDetected) {
+        for (const auto& sec : res.tailProfile.sections) {
+            if (sec.valid) {
+                cv::line(canvas, sec.leftPoint, sec.rightPoint, cv::Scalar(0, 140, 255), 1, cv::LINE_AA);
+                cv::circle(canvas, sec.leftPoint, 1, cv::Scalar(0, 200, 255), -1, cv::LINE_AA);
+                cv::circle(canvas, sec.rightPoint, 1, cv::Scalar(0, 200, 255), -1, cv::LINE_AA);
+            }
+        }
+        cv::circle(canvas, res.tailPoint, 3, cv::Scalar(0, 140, 255), -1, cv::LINE_AA);
+    }
+
     // 4. Draw Final Directed Pointer Vector - Thin Crisp Lines (1 px)
     cv::line(canvas, res.tailPoint, res.tipPoint, cv::Scalar(0, 0, 255), 1, cv::LINE_AA);
     cv::circle(canvas, res.tipPoint, 4, cv::Scalar(0, 255, 0), -1, cv::LINE_AA);
@@ -2028,7 +2682,7 @@ void PointerDetector::renderDebugVisualization(
 
     // 5. Section XX: Output HUD to a Dedicated Separate Window Image (DO NOT draw over canvas to avoid obstructing image)
     int hudW = 560;
-    int hudH = 420;
+    int hudH = 445;
     cv::Mat hudMat = cv::Mat::zeros(cv::Size(hudW, hudH), CV_8UC3);
     hudMat.setTo(cv::Scalar(18, 20, 28)); // Dark slate background
     cv::rectangle(hudMat, cv::Rect(4, 4, hudW - 8, hudH - 8), cv::Scalar(0, 229, 255), 1);
@@ -2106,7 +2760,17 @@ void PointerDetector::renderDebugVisualization(
     hudStream << buf << "\n";
     lineY += lineStep;
 
-    snprintf(buf, sizeof(buf), "Tracks: Cyan=L | Magenta=R | GreenDot=RawSupp | RedDot=NoSupp");
+    snprintf(buf, sizeof(buf), "Tail Detection:      %s (Reach: %.0f px, Width: %.1f px, Score: %.2f)",
+             res.tailDetected ? "DETECTED" : "NONE",
+             res.tailDetected ? res.tailProfile.reach : 0.0,
+             res.tailDetected ? res.tailProfile.meanWidth : 0.0,
+             res.tailDetected ? res.tailProfile.tailScore : 0.0);
+    cv::putText(hudMat, buf, cv::Point(16, lineY), cv::FONT_HERSHEY_SIMPLEX, 0.40,
+                res.tailDetected ? cv::Scalar(0, 165, 255) : cv::Scalar(180, 180, 180), 1, cv::LINE_AA);
+    hudStream << buf << "\n";
+    lineY += lineStep;
+
+    snprintf(buf, sizeof(buf), "Tracks: Cyan=L | Magenta=R | Orange=Tail | GreenDot=RawSupp");
     cv::putText(hudMat, buf, cv::Point(16, lineY), cv::FONT_HERSHEY_SIMPLEX, 0.36, cv::Scalar(0, 229, 255), 1, cv::LINE_AA);
     hudStream << buf << "\n";
 

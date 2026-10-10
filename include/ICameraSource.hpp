@@ -54,6 +54,21 @@ public:
     virtual bool grabFrame(cv::Mat& frame) = 0;
 
     /**
+     * @brief Capture a standalone snapshot frame without maintaining continuous stream.
+     * @param frame Output OpenCV matrix.
+     * @return true if snapshot acquired successfully.
+     */
+    virtual bool captureSingleSnapshot(cv::Mat& frame) {
+        if (!isOpened()) {
+            if (!open()) return false;
+            bool ok = grabFrame(frame);
+            close();
+            return ok;
+        }
+        return grabFrame(frame);
+    }
+
+    /**
      * @brief Release and close device resources.
      */
     virtual void close() = 0;

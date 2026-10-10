@@ -63,12 +63,19 @@ void AutoCameraDiscoveryService::executeDiscoveryProcess() {
     for (const auto& dev : onvifList) {
         DiscoveredCameraItem item;
         item.cameraId = QString("CAM_ONVIF_%1").arg(QString::fromStdString(dev.ipAddress).replace('.', '_'));
+        item.customName = QString("ONVIF 网络相机 (%1)").arg(QString::fromStdString(dev.ipAddress));
         item.ipOrSn = QString::fromStdString(dev.ipAddress);
         item.protocolType = CameraProtocolType::ONVIF_RTSP_STREAM;
         item.protocolName = "ONVIF (RTSP)";
         item.modelName = QString::fromStdString(dev.manufacturer + " " + dev.model);
+        item.port = dev.port > 0 ? dev.port : 80;
+        item.rtspPort = 554;
+        item.rtspUrl = QString::fromStdString(dev.rtspUri);
+        item.username = "";
+        item.password = "";
         item.isOnline = true;
         item.defaultProfileId = "PRESSURE_GAUGE_1.6MPA";
+        item.lastSeenTime = QDateTime::currentDateTime().toString("yyyy-MM-dd HH:mm:ss");
 
         emit cameraDiscovered(item);
         emit logGenerated(tr("[AUTO-DISCOVERY] Found Real ONVIF Device: %1 (%2) -> Auto-Registered.").arg(item.cameraId).arg(item.modelName));
@@ -146,12 +153,19 @@ void AutoCameraDiscoveryService::executeDiscoveryProcess() {
         if (isReachable) {
             DiscoveredCameraItem item;
             item.cameraId = QString("CAM_IP_%1").arg(QString(candIp).replace('.', '_'));
+            item.customName = QString("%1 网络相机 (%2)").arg(hitPort == 34567 ? "雄迈" : "标准").arg(candIp);
             item.ipOrSn = candIp;
             item.protocolType = (hitPort == 34567 ? CameraProtocolType::SDK_JLINK : CameraProtocolType::ONVIF_RTSP_STREAM);
             item.protocolName = (hitPort == 34567 ? "Xiongmai JLink Camera" : "IP Camera (RTSP)");
             item.modelName = (hitPort == 34567 ? "JFTech Xiongmai Camera" : "Network Camera");
+            item.port = hitPort;
+            item.rtspPort = (hitPort == 554 ? 554 : 554);
+            item.rtspUrl = QString("rtsp://admin:@%1:554/h264/ch1/main/av_stream").arg(candIp);
+            item.username = "";
+            item.password = "";
             item.isOnline = true;
             item.defaultProfileId = "PRESSURE_GAUGE_1.6MPA";
+            item.lastSeenTime = QDateTime::currentDateTime().toString("yyyy-MM-dd HH:mm:ss");
 
             emit cameraDiscovered(item);
             emit logGenerated(tr("[AUTO-DISCOVERY] Found Active Camera at %1 (TCP Port %2 Open) -> Auto-Registered.").arg(candIp).arg(hitPort));

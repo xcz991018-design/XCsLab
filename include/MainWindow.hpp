@@ -15,8 +15,12 @@
 #include <QListWidget>
 #include <QSplitter>
 #include <QTimer>
+#include <QCheckBox>
 
 #include <QTabWidget>
+#include <QTableWidget>
+#include <QHeaderView>
+#include <QProgressBar>
 #include <QDialog>
 #include <QCloseEvent>
 #include <QFutureWatcher>
@@ -27,6 +31,30 @@
 #include "GB28181StreamManager.hpp"
 #include "ONVIFDeviceManager.hpp"
 #include "AutoCameraDiscoveryService.hpp"
+#include "DeviceConfigManager.hpp"
+
+/**
+ * @brief Standalone Inspection & Reading Record Descriptor.
+ */
+struct InspectionRecord {
+    QString cameraId;
+    QString customName;
+    QString locationInfo;
+    double readingValue{0.0};
+    std::string unit{"MPa"};
+    double pointerAngle{0.0};
+    double confidence{0.0};
+    QString status{"未巡视"}; // "🟢 正常", "⚠️ 待复核", "🔴 离线", "❌ 失败"
+    QString timestamp;
+
+    // Stored pipeline images for inspection review
+    cv::Mat step1_original;
+    cv::Mat step2_rectified;
+    cv::Mat step4_recognition;
+    QString step2Path;
+    QString step4Path;
+    QString diagnosticText;
+};
 
 class MainWindow : public QMainWindow {
     Q_OBJECT
@@ -52,6 +80,10 @@ private slots:
     void onDiscoveredCameraAdded(const DiscoveredCameraItem& item);
     void onFilterDeviceList(const QString& filterText);
     void onLogReceived(const QString& logMsg);
+    void onAddNewDevice();
+    void onRemoveSelectedDevice();
+    void onSetDeviceAsDefaultAutoConnect();
+    void onDeviceCustomContextMenu(const QPoint& pos);
 
     // Intermediate Processing Steps Slots
     void onExportAllSteps();
@@ -61,9 +93,18 @@ private slots:
     // Stage 0: Live Stream & Capture Slots
     void onToggleLiveStream();
     void onCaptureCameraSnapshot();
+    void onSaveSnapshotImage();
     void onUseSnapshotForRecognition();
     void onUpdateLiveStreamFrame();
     void onTabChanged(int index);
+
+    // Inspection & Patrol Slots
+    void onCaptureAndRecognizeCurrent();
+    void onStartAllDevicesInspection();
+    void onStopAllDevicesInspection();
+    void onPatrolNextDevice();
+    void onExportPatrolReport();
+    void onInspectionTableItemDoubleClicked(int row, int column);
 
 private:
     void setupUi();
@@ -71,14 +112,20 @@ private:
     QWidget* createLeftSidebar(QWidget *parent);
     QWidget* createCenterVisionArea(QWidget *parent);
     QWidget* createLiveStreamStageArea(QWidget *parent);
+    QWidget* createInspectionStageArea(QWidget *parent);
     QWidget* createBottomLogConsole(QWidget *parent);
+    void showInspectionPhotosDialog(int row);
 
     void applyDarkStyle();
     void updateCameraListFromConfig(const QString& configPath);
+    void loadAndRestoreSavedDevices();
+    void updateDeviceListItemWidget(QListWidgetItem* item, const DiscoveredCameraItem& data);
+    QListWidgetItem* findListItemByCameraId(const QString& camId);
     QStringList loadCameraIdsFromConfig(const QString& configPath);
     void updateImageCard(QLabel* label, const cv::Mat& mat, const QString& title);
     static QImage cvMatToQImage(const cv::Mat& mat);
     void switchActiveCameraSource(const QString& camId);
+    void applyCameraCalibrationAndProfile(const QString& camId);
     void renderIntermediateStepsUI(const std::vector<ProcessingStepImage>& steps);
 
     // Top Status Bar Badges
@@ -89,6 +136,8 @@ private:
 
     // Left Sidebar Widgets
     QPushButton *m_autoDiscoverBtn{nullptr};
+    QPushButton *m_addDeviceBtn{nullptr};
+    QPushButton *m_removeDeviceBtn{nullptr};
     QLineEdit *m_deviceFilterEdit{nullptr};
     QListWidget *m_deviceListWidget{nullptr};
     QLineEdit *m_imagePathEdit{nullptr};
@@ -96,6 +145,9 @@ private:
     QLineEdit *m_configPathEdit{nullptr};
     QPushButton *m_browseCfgBtn{nullptr};
     QPushButton *m_calibrateBtn{nullptr};
+    QPushButton *m_snapAndRunBtn{nullptr};
+    QPushButton *m_batchPatrolBtn{nullptr};
+    QCheckBox *m_enableSteps4To9Check{nullptr};
     QPushButton *m_runBtn{nullptr};
     QPushButton *m_exportStepsBtn{nullptr};
 
@@ -123,6 +175,7 @@ private:
     QLabel *m_capturedSnapshotLabel{nullptr};
     QPushButton *m_toggleLiveBtn{nullptr};
     QPushButton *m_captureBtn{nullptr};
+    QPushButton *m_saveSnapshotBtn{nullptr};
     QPushButton *m_useSnapshotForRunBtn{nullptr};
     QLabel *m_liveCamInfoBadge{nullptr};
     QLabel *m_snapshotInfoLabel{nullptr};
@@ -169,6 +222,20 @@ private:
     // Active Camera Source
     CameraSourcePtr m_activeCameraSource{nullptr};
     QMap<QString, DiscoveredCameraItem> m_discoveredItemsMap;
+
+    // Stage 6: 全站设备巡检读数总览 (Batch Patrol Inspection Matrix)
+    QTableWidget *m_inspectionTable{nullptr};
+    QProgressBar *m_inspectionProgressBar{nullptr};
+    QLabel *m_inspectionSummaryLabel{nullptr};
+    QPushButton *m_startPatrolBtn{nullptr};
+    QPushButton *m_stopPatrolBtn{nullptr};
+    QPushButton *m_exportReportBtn{nullptr};
+    QCheckBox *m_autoPatrolCheck{nullptr};
+    QTimer *m_autoPatrolTimer{nullptr};
+    bool m_isPatrolRunning{false};
+    int m_patrolCurrentIndex{0};
+    QStringList m_patrolCameraIdQueue;
+    QList<InspectionRecord> m_inspectionRecords;
 };
 
 #endif // MAIN_WINDOW_HPP

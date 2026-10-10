@@ -7,6 +7,7 @@
 #include <memory>
 #include <string>
 #include <chrono>
+#include <filesystem>
 
 void printBanner() {
     std::cout << "=====================================================\n";
@@ -19,8 +20,8 @@ void printHelp(const char* progName) {
     std::cout << "Usage: " << progName << " [options]\n\n"
               << "Options:\n"
               << "  --image <path>       Path to gauge input image or directory\n"
-              << "  --config <path>      Path to centralized cameras.json or profile JSON\n"
-              << "  --camera-id <id>     Target Camera ID inside central cameras.json registry\n"
+              << "  --config <path>      Path to centralized devices.json or gauge_profile.json\n"
+              << "  --camera-id <id>     Target Camera ID inside central devices.json registry\n"
               << "  --output <path>      Path to save overlay result image (default: result.png)\n"
               << "  --sdk-stub           Run in reserved Camera SDK Stub mode\n"
               << "  --help               Display this help message\n\n";
@@ -30,7 +31,22 @@ int main(int argc, char** argv) {
     printBanner();
 
     std::string imagePath = "";
-    std::string configPath = "C:/Users/95254/code/GaugeReaderTest/config/cameras.json";
+    std::string configPath = "config/devices.json";
+    try {
+        std::filesystem::path exeDir = std::filesystem::absolute(argv[0]).parent_path();
+        std::filesystem::path localConfig = exeDir / "config" / "devices.json";
+        if (std::filesystem::exists(localConfig)) {
+            configPath = localConfig.string();
+        } else if (std::filesystem::exists("config/devices.json")) {
+            configPath = "config/devices.json";
+        } else if (std::filesystem::exists("../config/devices.json")) {
+            configPath = "../config/devices.json";
+        } else if (std::filesystem::exists("config/gauge_profile.json")) {
+            configPath = "config/gauge_profile.json";
+        }
+    } catch (...) {
+        // Fallback to relative default
+    }
     std::string cameraId = "CAM_5-3-1";
     std::string outputPath = "result.png";
     bool runSdkStub = false;
@@ -125,7 +141,21 @@ int main(int argc, char** argv) {
             }
         }
     } else {
-        std::cerr << "[Main] Recognition failed: " << result.errorMessage << std::endl;
+        std::cerr << " Status         : FAILED\n";
+        std::cerr << " Error Step     : " << (result.errorStep.empty() ? "Unknown" : result.errorStep) << "\n";
+        std::cerr << " Failure Reason : " << result.errorMessage << "\n";
+        if (!result.detailedDebugInfo.empty()) {
+            std::cerr << " Debug Details  :\n" << result.detailedDebugInfo << "\n";
+        }
+        std::cerr << " Processing Time: " << elapsedMs << " ms\n";
+        std::cerr << "--------------------------------------------------------\n\n";
+
+        if (!result.overlayImage.empty()) {
+            if (cv::imwrite(outputPath, result.overlayImage)) {
+                std::cout << "[Main] Diagnostic error overlay saved to: " << outputPath << std::endl;
+            }
+        }
+        cameraSource->close();
         return -1;
     }
 

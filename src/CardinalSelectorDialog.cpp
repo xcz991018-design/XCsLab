@@ -1,5 +1,6 @@
 #include "CardinalSelectorDialog.hpp"
 #include "GaugeReaderEngine.hpp"
+#include "DeviceConfigManager.hpp"
 #include <QPainter>
 #include <QMessageBox>
 #include <QDebug>
@@ -291,7 +292,7 @@ void CardinalSelectorDialog::setupUi() {
     QHBoxLayout *btnLayout = new QHBoxLayout();
     m_autoBtn = new QPushButton(tr("⚡ 自动检测切点"), this);
     m_resetBtn = new QPushButton(tr("🔄 重置切点"), this);
-    m_saveBtn = new QPushButton(tr("💾 确认并保存到 cameras.json"), this);
+    m_saveBtn = new QPushButton(tr("💾 确认并保存到 devices.json"), this);
     m_cancelBtn = new QPushButton(tr("取消"), this);
 
     m_saveBtn->setStyleSheet("background-color: #00897b; color: white; font-weight: bold; padding: 8px 16px; border-radius: 4px;");
@@ -398,11 +399,30 @@ void CardinalSelectorDialog::onSaveAndApply() {
         m_profile.calibrated_height = m_frame.rows;
     }
 
-    std::string targetCam = !m_cameraId.isEmpty() ? m_cameraId.toStdString() : m_profile.gauge_id;
-    if (m_profile.saveToFile(m_configPath.toStdString(), targetCam)) {
-        QMessageBox::information(this, tr("保存成功"), tr("已成功更新 4 切点、表盘中心点及轴帽死区避让半径(pointerBaseRadius)并保存到配置 JSON 文件！"));
+    if (!m_cameraId.isEmpty()) {
+        double p0x = m_currentPts.size() > 0 ? m_currentPts[0].x : 0;
+        double p0y = m_currentPts.size() > 0 ? m_currentPts[0].y : 0;
+        double p1x = m_currentPts.size() > 1 ? m_currentPts[1].x : 0;
+        double p1y = m_currentPts.size() > 1 ? m_currentPts[1].y : 0;
+        double p2x = m_currentPts.size() > 2 ? m_currentPts[2].x : 0;
+        double p2y = m_currentPts.size() > 2 ? m_currentPts[2].y : 0;
+        double p3x = m_currentPts.size() > 3 ? m_currentPts[3].x : 0;
+        double p3y = m_currentPts.size() > 3 ? m_currentPts[3].y : 0;
+        cv::Point2f cp = m_interactiveLabel->getCenterPoint();
+
+        DeviceConfigManager::instance().updateDeviceCalibration(
+            m_cameraId,
+            true,
+            !m_frame.empty() ? m_frame.cols : 800,
+            !m_frame.empty() ? m_frame.rows : 448,
+            p0x, p0y, p1x, p1y, p2x, p2y, p3x, p3y,
+            cp.x, cp.y,
+            m_interactiveLabel->getPointerBaseRadius(),
+            true
+        );
+        QMessageBox::information(this, tr("保存成功"), tr("已成功更新摄像头 [%1] 的 4 切点与透视标定数据并保存到 devices.json！").arg(m_cameraId));
     } else {
-        QMessageBox::warning(this, tr("保存警告"), tr("配置已在内存中生效，但保存到 JSON 文件失败。"));
+        QMessageBox::information(this, tr("设置成功"), tr("已在当前内存会话中应用标定参数！"));
     }
     accept();
 }

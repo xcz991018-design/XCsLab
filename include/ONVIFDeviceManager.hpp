@@ -6,6 +6,8 @@
 #include <vector>
 #include <memory>
 #include <functional>
+#include <atomic>
+#include <chrono>
 
 /**
  * @brief ONVIF Standard Device Metadata & Service Parameters.
@@ -19,9 +21,9 @@ struct ONVIFDeviceInfo {
     std::string serialNumber{"HKV-2026-ONVIF-991"};
     std::string firmwareVersion{"V5.7.10"};
     std::string profileToken{"Profile_1_MainStream"};
-    std::string rtspUri{"rtsp://admin:admin123@192.168.1.101:554/h264/ch1/main/av_stream"};
-    std::string username{"admin"};
-    std::string password{"admin123"};
+    std::string rtspUri{"rtsp://192.168.1.101:554/h264/ch1/main/av_stream"};
+    std::string username{""};
+    std::string password{""};
 };
 
 /**
@@ -38,6 +40,7 @@ public:
     // --- ICameraSource Interface Implementation ---
     bool open() override;
     bool grabFrame(cv::Mat& frame) override;
+    bool captureSingleSnapshot(cv::Mat& frame) override;
     void close() override;
     bool isOpened() const override;
     std::string getSourceName() const override;
@@ -58,7 +61,7 @@ public:
     void setDeviceIp(const std::string& ip) {
         m_info.ipAddress = ip;
         m_info.xaddr = "http://" + ip + ":80/onvif/device_service";
-        m_info.rtspUri = "rtsp://admin:admin123@" + ip + ":554/h264/ch1/main/av_stream";
+        m_info.rtspUri = "rtsp://" + ip + ":554/h264/ch1/main/av_stream";
     }
 
     using LogCallback = std::function<void(const std::string&)>;
@@ -66,14 +69,20 @@ public:
 
 private:
     void logMessage(const std::string& msg);
-    void tryOpenRealStreamAsync();
+    void workerLoop();
+    static bool checkTcpPort(const std::string& ip, int port, int timeoutMs = 300);
 
     ONVIFDeviceInfo m_info;
     bool m_isOpen{false};
     bool m_capAttempted{false};
     bool m_isRealStreamActive{false};
+    std::atomic<bool> m_workerRunning{false};
+    std::atomic<int> m_consecutiveFailures{0};
+    std::atomic<int> m_reconnectAttempts{0};
+    std::chrono::steady_clock::time_point m_lastFrameTime;
+    std::thread m_workerThread;
     std::string m_connectedUrl;
-    cv::Mat m_currentFrame;
+    cv::Mat m_latestFrame;
     cv::Mat m_sampleFrame;
     cv::VideoCapture m_cap;
     std::mutex m_mutex;

@@ -68,6 +68,7 @@ set(GUI_SOURCES
     "${CMAKE_CURRENT_SOURCE_DIR}/include/GB28181StreamManager.hpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/include/ONVIFDeviceManager.hpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/include/AutoCameraDiscoveryService.hpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/include/DeviceConfigManager.hpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/main_gui.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/MainWindow.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/CardinalSelectorDialog.cpp"
@@ -79,15 +80,16 @@ set(GUI_SOURCES
     "${CMAKE_CURRENT_SOURCE_DIR}/src/GB28181StreamManager.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/ONVIFDeviceManager.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/AutoCameraDiscoveryService.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/DeviceConfigManager.cpp"
 )
 
 add_executable(gauge_reader_test ${CLI_SOURCES})
-target_link_libraries(gauge_reader_test PRIVATE ${OpenCV_LIBS} ${QT_LIBS})
+target_link_libraries(gauge_reader_test PRIVATE ${OpenCV_LIBS} ${QT_LIBS} ws2_32)
 
 add_executable(gauge_reader_gui WIN32 ${GUI_SOURCES})
-target_link_libraries(gauge_reader_gui PRIVATE ${OpenCV_LIBS} ${QT_LIBS})
+target_link_libraries(gauge_reader_gui PRIVATE ${OpenCV_LIBS} ${QT_LIBS} ws2_32)
 
-# Copy DLLs to target binary directory on Windows
+# Copy DLLs and config files to target binary directory
 if(WIN32)
     if(MSVC)
         add_custom_command(TARGET gauge_reader_gui POST_BUILD
@@ -102,4 +104,21 @@ if(WIN32)
         )
     endif()
 endif()
+
+# Automatically deploy config folder (devices.json, gauge_profile.json) to output directories on build
+add_custom_command(TARGET gauge_reader_gui POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E make_directory "$<TARGET_FILE_DIR:gauge_reader_gui>/config"
+    COMMAND ${CMAKE_COMMAND} -E copy_directory
+        "${CMAKE_CURRENT_SOURCE_DIR}/config"
+        "$<TARGET_FILE_DIR:gauge_reader_gui>/config"
+    COMMENT "Deploying config directory to gauge_reader_gui output directory"
+)
+
+add_custom_command(TARGET gauge_reader_test POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E make_directory "$<TARGET_FILE_DIR:gauge_reader_test>/config"
+    COMMAND ${CMAKE_COMMAND} -E copy_directory
+        "${CMAKE_CURRENT_SOURCE_DIR}/config"
+        "$<TARGET_FILE_DIR:gauge_reader_test>/config"
+    COMMENT "Deploying config directory to gauge_reader_test output directory"
+)
 

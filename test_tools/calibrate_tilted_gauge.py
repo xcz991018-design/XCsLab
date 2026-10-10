@@ -48,7 +48,7 @@ def main():
 
     img_path = sys.argv[1]
     camera_id = sys.argv[2] if len(sys.argv) > 2 else "CAM_192.168.1.101"
-    registry_file = "config/cameras.json"
+    registry_file = "config/devices.json"
 
     img_orig = cv2.imread(img_path)
     if img_orig is None:

@@ -5,22 +5,6 @@
 #include <vector>
 #include <string>
 
-// -------------------------------------------------------------------------
-// Legacy compatibility structures (preserved for existing dialogs and profiles)
-// -------------------------------------------------------------------------
-enum class RegionType {
-    Tip = 0,
-    Body = 1,
-    Tail = 2
-};
-
-struct TemplatePoint {
-    cv::Point2f localPt;
-    cv::Point2f normal;
-    float weight{1.0f};
-    RegionType regionType{RegionType::Body};
-};
-
 struct PointerShapeModel {
     cv::Point2f center{400.0f, 400.0f};
     float radius{360.0f};
@@ -87,6 +71,51 @@ struct GaugeConfig {
     double maxAllowedWidthStep{6.0};
     double maxCenterlineOffset{8.0};
     double maxOcclusionGapPx{20.0};
+
+    // Anti-Interference / Occlusion Bridging Parameters (Tolerate text & scale marks)
+    int maxConsecutiveGapSamples{16};
+    double minEdgeSupportDensity{0.45};
+    double rawGradientThreshold{45.0};
+    double minGradientNormalAlignment{0.72};
+    double minLocalStepContrast{12.0};
+    double maxStartBaseGapPx{16.0};
+    double maxParallelAngleDiffDeg{15.0};
+    double minCommonLengthPx{35.0};
+    double maxLineFitResidualPx{2.2};
+    int maxOcclusionGap{12};
+    double corridorHalfWidthPx{22.0};
+
+    // Joint Needle Tail (Counterweight) Detection Parameters
+    bool enableTailDetection{true};
+    double tailMaxRadius{130.0};
+    double tailMinWidth{4.0};
+    double tailMaxWidth{65.0};
+    double tailCorridorHalfWidth{45.0};
+    double tailMinGradientNormalAlignment{0.50}; // Normal alignment threshold for widening tail edge (relaxed vs slender body)
+
+    // Optical polarity & dark entity constraints
+    bool requireDarkPointer{true};
+    double minPointerDarkContrast{10.0};
+    double maxPointerInsideGray{165.0};
+
+    // Pointer Structure & Confidence Scoring Weights
+    double geomWeight{4.0};
+    double wEdgePairCoherence{3.5};
+    double wCenterStability{3.0};
+    double wAxisCenter{2.5};
+    double wOrientation{2.0};
+    double wReach{2.5};
+    double wValidLength{2.5};
+    double wSlenderness{3.0};
+    double wPersistence{3.0};
+    double wWidthTrend{1.5};
+    double wWidthContinuity{1.5};
+    double wEdgeStrength{0.3};
+    double wGapPenalty{1.5};
+    double wTrackingJumpPenalty{2.5};
+    double wTailScore{1.8};
+    double wTailPolarityBoost{2.5};
+    double confidenceDivisor{12.0};
 
     double widthTrendWeight{1.5};
     double lengthWeight{2.0};
@@ -239,6 +268,12 @@ struct PointerCandidateRegion {
     double geometryScore{0.0};      // Phase 1 Geometric gate score
     double bodyScore{0.0};          // Phase 2 Width & body score
 
+    // Optical polarity & dark entity metrics
+    double meanInsideGray{0.0};     // Average intensity inside pointer candidate region
+    double meanOutsideGray{0.0};    // Average intensity outside candidate region edges
+    double entityContrast{0.0};     // meanOutsideGray - meanInsideGray (positive for dark entity)
+    bool darkEntityValid{false};    // Meets dark entity contrast & interior gray threshold
+
     bool geometryValid{false};      // Passes long parallel geometry gate
 };
 
@@ -320,41 +355,43 @@ struct PointerDetectorConfig {
     double maxSearchRadius{350.0};  // Maximum radial reach to search (px)
 
     // Section III: Search corridor bounds
-    double corridorHalfWidthPx{15.0}; // Limited transverse corridor half-width [-15, +15] px
-    double maxHalfWidth{26.0};      // Transverse profile half-width t in [-maxHalfWidth, +maxHalfWidth]
+    double corridorHalfWidthPx{22.0}; // Transverse corridor half-width
+    double maxHalfWidth{35.0};      // Transverse profile half-width t in [-maxHalfWidth, +maxHalfWidth]
     double minPointerWidth{1.5};    // Minimum valid needle width (px)
-    double maxPointerWidth{26.0};   // Maximum valid needle width (px)
+    double maxPointerWidth{35.0};   // Maximum valid needle width (px)
 
-    double maxCenterOffset{12.0};   // Maximum allowed lateral shift |centerT|
-    double maxWidthChange{4.5};     // Maximum allowed adjacent section width step (px)
-    double maxCenterChange{4.0};    // Maximum allowed adjacent section center step (px)
-    double maxEdgeChange{4.5};      // Maximum allowed adjacent individual edge step (px)
+    double maxCenterOffset{15.0};   // Maximum allowed lateral shift |centerT|
+    double maxWidthChange{6.0};     // Maximum allowed adjacent section width step (px)
+    double maxCenterChange{5.0};    // Maximum allowed adjacent section center step (px)
+    double maxEdgeChange{5.5};      // Maximum allowed adjacent individual edge step (px)
 
     // Edge Tracking parameters
-    double trackingWindowPx{3.0};   // Local lateral tracking search window around prior edge (px)
-    double trackingWindow{3.0};     // Alias for trackingWindowPx
-    double maxTrackingJumpPx{3.5};  // Maximum allowed single-step edge jump (px)
+    double trackingWindowPx{3.5};   // Local lateral tracking search window around prior edge (px)
+    double trackingWindow{3.5};     // Alias for trackingWindowPx
+    double maxTrackingJumpPx{4.0};  // Maximum allowed single-step edge jump (px)
 
     // Section IX, X, XI, XII: Geometric constraints
-    double minCommonLengthPx{50.0};       // Minimum required common radial overlap length (px)
-    double maxParallelAngleDiffDeg{5.0};  // Maximum allowed angle difference between left & right tracks (deg)
-    double maxBaseDistancePx{20.0};       // Maximum allowed start distance from pointerBaseRadius (px)
-    double maxLineFitResidualPx{1.8};     // Maximum orthogonal residual to straight line (px) - hard straightness gate
+    double minCommonLengthPx{35.0};       // Minimum required common radial overlap length (px)
+    double maxParallelAngleDiffDeg{15.0}; // Maximum allowed angle difference between left & right tracks (deg, accommodates tapered needles)
+    double maxBaseDistancePx{25.0};       // Maximum allowed start distance from pointerBaseRadius (px)
+    double maxLineFitResidualPx{2.2};     // Maximum orthogonal residual to straight line (px) - hard straightness gate
 
     // Section II, III, V, VI: Raw Edge Support Verification & Hard Gates
-    double minEdgeSupportDensity{0.75};   // Minimum ratio of verified raw edge points along EdgeTrack (HARD GATE)
-    int maxConsecutiveGapSamples{2};      // Maximum consecutive samples without raw edge support before track is TERMINATED
-    double rawGradientThreshold{55.0};    // Minimum absolute raw Scharr gradient magnitude for genuine edge support
-    double minGradientNormalAlignment{0.85}; // Minimum |dot(gradUnit, normal)| to count as edge perpendicular to axis
-    double minLocalStepContrast{16.0};    // Minimum peak-to-peak intensity contrast in transverse slice (px)
-    double maxStartBaseGapPx{8.0};        // Maximum radial distance from pointerBaseRadius to start finding edge
+    double minEdgeSupportDensity{0.45};   // Minimum ratio of verified raw edge points along EdgeTrack (HARD GATE, relaxed for text/scale occlusion)
+    int maxConsecutiveGapSamples{16};     // Maximum consecutive samples without raw edge support before track is TERMINATED (allows bridging ~32px characters)
+    double rawGradientThreshold{45.0};    // Minimum absolute raw Scharr gradient magnitude for genuine edge support
+    double minGradientNormalAlignment{0.72}; // Minimum |dot(gradUnit, normal)| to count as edge perpendicular to axis
+    double tailMinGradientNormalAlignment{0.50}; // Minimum normal alignment for widening needle tail edge
+    double minLocalStepContrast{12.0};    // Minimum peak-to-peak intensity contrast in transverse slice (px)
+    double maxStartBaseGapPx{16.0};       // Maximum radial distance from pointerBaseRadius to start finding edge
 
-    int maxOcclusionGap{2};         // Maximum consecutive invalid sections to bridge across occlusions (capped at 2)
-    double maxInvalidGapPx{6.0};    // Maximum invalid gap in pixels (6.0 px)
+    int maxOcclusionGap{12};        // Maximum consecutive invalid sections to bridge across occlusions (e.g. text/scale)
+    double maxInvalidGapPx{25.0};   // Maximum invalid gap in pixels
 
-    double gradientThreshold{55.0}; // Minimum Scharr magnitude to count as candidate edge
+    double gradientThreshold{45.0}; // Minimum Scharr magnitude to count as candidate edge
 
     // Weights for Body Score & Edge Pair Coherence
+    double geomWeight{4.0};         // First layer geometry score weight
     double wEdgePairCoherence{3.5}; // High weight for mutual edge coherence
     double wCenterStability{3.0};   // High weight to penalize lateral drift
     double wAxisCenter{2.5};        // High weight to penalize centerT offset from axis
@@ -368,6 +405,24 @@ struct PointerDetectorConfig {
     double wEdgeStrength{0.3};      // Auxiliary only! Never dominates candidate ranking
     double wTrackingJumpPenalty{2.5};
     double wGapPenalty{1.5};
+    double confidenceDivisor{12.0}; // Divisor to normalize bodyScore into confidence [0, 1]
+
+    // Joint Needle Tail / Counterweight Detection parameters
+    bool enableTailDetection{true};         // Enable joint needle tail detection
+    double tailMinRadius{12.0};             // Hub exclusion radius for tail (px)
+    double tailMaxRadius{130.0};            // Max radial reach to search for tail (px)
+    double tailMinWidth{4.0};               // Min allowed tail width (px)
+    double tailMaxWidth{65.0};              // Max allowed tail width (px, wider than body)
+    double tailCorridorHalfWidth{45.0};     // Corridor half-width for tail search (px)
+    double tailRadialStepPx{2.0};           // Radial sampling step for tail
+    double wTailScore{1.8};                 // Weight of tail score in joint axis evaluation
+    double wTailPolarityBoost{2.5};         // Weight for polarity resolution
+
+    // Optical polarity & dark entity constraints
+    bool requireDarkPointer{true};          // Enforce needle body and tail are dark entities on a lighter dial
+    double minPointerDarkContrast{10.0};    // Minimum (meanOutsideGray - meanInsideGray)
+    double maxPointerInsideGray{165.0};     // Maximum average gray level inside pointer entity
+    double wEntityContrast{1.5};            // Weight for dark entity contrast in body score
 
     // Backward compatibility aliases
     double slendernessWeight{3.5};
@@ -381,6 +436,27 @@ struct PointerDetectorConfig {
     double tipTerminalWeight{0.5};
     double tipContinuityWeight{0.5};
     double wJumpPenalty{1.5};
+};
+
+/**
+ * @brief Evaluation profile for needle tail (counterweight) along opposite direction.
+ */
+struct TailDirectionProfile {
+    double angle{0.0};                  // Emission direction angle (deg)
+    bool valid{false};                  // Whether a valid tail structure was detected
+    double reach{0.0};                  // Detected radial length / reach of tail (px)
+    double meanWidth{0.0};              // Average width across tail sections (px)
+    double medianWidth{0.0};            // Median width across tail sections (px)
+    double symmetryScore{0.0};          // Bilateral symmetry score around axis
+    double contrastScore{0.0};          // Edge contrast / gradient magnitude score
+    double widthSlope{0.0};             // Linear regression slope dW/dr (> 0 indicates outward widening)
+    double wideningScore{0.0};          // Outward widening score [0, 1]
+    double tailScore{0.0};              // Comprehensive tail score
+    int validSectionCount{0};           // Number of valid tail cross-sections
+    double meanInsideGray{0.0};         // Average intensity inside tail entity
+    double meanOutsideGray{0.0};        // Average intensity outside tail entity
+    double meanContrast{0.0};           // Contrast (outside - inside)
+    std::vector<RadialSection> sections;// Extracted tail cross sections
 };
 
 /**
@@ -442,6 +518,9 @@ struct RadialDirectionProfile {
 
     PointerCandidateRegion candidateRegion;
 
+    double meanInsideGray{0.0};     // Average intensity inside pointer body
+    double entityContrast{0.0};     // Interior-to-exterior contrast
+
     double meanEdgeStrength{0.0};   // Auxiliary edge strength
     double densityScore{0.0};       // Section density score
     double bodyScore{0.0};          // Comprehensive body score
@@ -471,6 +550,8 @@ using DirectionProfile = RadialDirectionProfile;
  */
 struct PointerDetectionResult {
     bool success{false};
+    std::string failureReason;          // Detailed explanation of detection failure
+    std::string detailedDebugText;      // Comprehensive multi-line diagnostic log
 
     double axisAngle{0.0};          // Non-directional principal axis angle in [0, 180°)
     double pointerAngle{0.0};       // Directed needle tip angle in [0, 360°)
@@ -493,6 +574,10 @@ struct PointerDetectionResult {
     // Bidirectional profiles for Direction A (+axis) and Direction B (-axis)
     DirectionProfile directionA;
     DirectionProfile directionB;
+    TailDirectionProfile tailA;
+    TailDirectionProfile tailB;
+    TailDirectionProfile tailProfile;
+    bool tailDetected{false};
     double reachForward{0.0};       // Maximum reach along Direction A (px)
     double reachBackward{0.0};      // Maximum reach along Direction B (px)
 
@@ -560,9 +645,12 @@ public:
     static double normalizeAngle(double angleDeg);
 
     /**
-     * @brief Compatibility helper for dialog template visualization.
+     * @brief Render full debug visualization (left/right edges, centerline, HUD) onto canvas.
      */
-    static std::vector<TemplatePoint> buildUnifiedTemplate(const PointerShapeModel& model);
+    void renderDebugVisualization(
+        cv::Mat& canvas,
+        const cv::Point2d& effectivePivot,
+        PointerDetectionResult& res);
 
 private:
     // Step 2: Compute single-pass Scharr gradient magnitude and unit orientation
@@ -615,6 +703,13 @@ private:
         const cv::Point2d& effectivePivot,
         double thetaDeg);
 
+    // Evaluate wide counterweight needle tail profile along ray phi in [0, 360)
+    TailDirectionProfile evaluateTailProfile(
+        const cv::Mat& gray,
+        const GradientFeatureMap& features,
+        const cv::Point2d& effectivePivot,
+        double thetaDeg);
+
     // Step 9: Evaluate TipLikelihood for forward (+u) vs backward (-u) directions
     double evaluateTipLikelihood(
         const std::vector<PointerCrossSection>& sections,
@@ -623,11 +718,6 @@ private:
         double& outTerminalScore,
         double& outContinuityScore);
 
-    // Step 12: Render full debug visualization (left/right edges, centerline, HUD)
-    void renderDebugVisualization(
-        cv::Mat& canvas,
-        const cv::Point2d& effectivePivot,
-        PointerDetectionResult& res);
 
     PointerDetectorConfig m_config;
     PointerShapeModel m_model;
