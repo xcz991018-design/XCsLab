@@ -41,6 +41,8 @@ public:
     bool open() override;
     bool grabFrame(cv::Mat& frame) override;
     bool captureSingleSnapshot(cv::Mat& frame) override;
+    FrameCaptureResult readFrame() override;
+    FrameCaptureResult captureSnapshot() override;
     void close() override;
     bool isOpened() const override;
     std::string getSourceName() const override;
@@ -73,13 +75,14 @@ private:
     static bool checkTcpPort(const std::string& ip, int port, int timeoutMs = 300);
 
     ONVIFDeviceInfo m_info;
-    bool m_isOpen{false};
+    std::atomic<bool> m_isOpen{false};
     bool m_capAttempted{false};
-    bool m_isRealStreamActive{false};
+    std::atomic<bool> m_isRealStreamActive{false};
     std::atomic<bool> m_workerRunning{false};
     std::atomic<int> m_consecutiveFailures{0};
     std::atomic<int> m_reconnectAttempts{0};
     std::chrono::steady_clock::time_point m_lastFrameTime;
+    std::chrono::system_clock::time_point m_lastCaptureTime;
     std::thread m_workerThread;
     std::string m_connectedUrl;
     cv::Mat m_latestFrame;

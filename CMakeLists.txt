@@ -41,6 +41,13 @@ else()
     set(QT_LIBS Qt6::Widgets Qt6::Core Qt6::Gui Qt6::Concurrent Qt6::Network)
 endif()
 
+set(MYSQL_ROOT "C:/Program Files/MySQL/MySQL Server 8.0" CACHE PATH "MySQL client development installation")
+find_path(MYSQL_INCLUDE_DIR mysql.h HINTS "${MYSQL_ROOT}/include" REQUIRED)
+find_library(MYSQL_CLIENT_LIBRARY NAMES libmysql mysqlclient HINTS "${MYSQL_ROOT}/lib" REQUIRED)
+add_library(gauge_mysql_client INTERFACE)
+target_include_directories(gauge_mysql_client INTERFACE "${MYSQL_INCLUDE_DIR}")
+target_link_libraries(gauge_mysql_client INTERFACE "${MYSQL_CLIENT_LIBRARY}")
+
 include_directories(
     ${CMAKE_CURRENT_SOURCE_DIR}/include
     ${OpenCV_INCLUDE_DIRS}
@@ -61,6 +68,16 @@ set(CLI_SOURCES
 
 # GUI Target Sources
 set(GUI_SOURCES
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/MySqlErrorText.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/DatabaseSettingsStore.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/DatabaseConnectionDialog.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/MySqlRepository.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/DeviceCodec.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/DatabaseHistoryDialog.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/include/CameraPreviewService.hpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/CameraPreviewService.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/include/InspectionService.hpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/InspectionService.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/include/MainWindow.hpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/include/CardinalSelectorDialog.hpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/include/CameraInfoEditDialog.hpp"
@@ -87,7 +104,7 @@ add_executable(gauge_reader_test ${CLI_SOURCES})
 target_link_libraries(gauge_reader_test PRIVATE ${OpenCV_LIBS} ${QT_LIBS} ws2_32)
 
 add_executable(gauge_reader_gui WIN32 ${GUI_SOURCES})
-target_link_libraries(gauge_reader_gui PRIVATE ${OpenCV_LIBS} ${QT_LIBS} ws2_32)
+target_link_libraries(gauge_reader_gui PRIVATE ${OpenCV_LIBS} ${QT_LIBS} gauge_mysql_client ws2_32 crypt32)
 
 # Copy DLLs and config files to target binary directory
 if(WIN32)
@@ -122,3 +139,56 @@ add_custom_command(TARGET gauge_reader_test POST_BUILD
     COMMENT "Deploying config directory to gauge_reader_test output directory"
 )
 
+
+# Headless runtime: same inspection pipeline, no MainWindow dependency.
+add_library(gauge_inspection_runtime STATIC
+    src/MySqlErrorText.cpp
+    src/DatabaseSettingsStore.cpp
+    src/MySqlRepository.cpp src/DeviceCodec.cpp include/DeviceConfigManager.hpp
+    src/CameraPreviewService.cpp include/CameraPreviewService.hpp
+    src/InspectionService.cpp include/InspectionService.hpp
+    src/DeviceConfigManager.cpp src/FileCameraSource.cpp src/GaugeProfile.cpp
+    src/GaugeReaderEngine.cpp src/PointerDetector.cpp src/ONVIFDeviceManager.cpp)
+target_link_libraries(gauge_inspection_runtime PUBLIC ${OpenCV_LIBS} ${QT_LIBS} gauge_mysql_client ws2_32 crypt32)
+add_executable(gauge_reader_service src/main_service.cpp)
+target_link_libraries(gauge_reader_service PRIVATE gauge_inspection_runtime)
+include(CTest)
+if(BUILD_TESTING)
+    file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/tests-disabled-mysql.json" "{\"version\":1,\"enabled\":false}")
+    add_executable(inspection_service_tests tests/InspectionServiceTest.cpp)
+    target_link_libraries(inspection_service_tests PRIVATE gauge_inspection_runtime)
+    add_test(NAME inspection_service_pipeline COMMAND inspection_service_tests)
+    add_executable(gauge_run_mode_tests tests/GaugeRunModeTest.cpp)
+    target_link_libraries(gauge_run_mode_tests PRIVATE gauge_inspection_runtime)
+    add_test(NAME gauge_run_modes COMMAND gauge_run_mode_tests)
+    add_executable(input_acquisition_tests tests/InputAcquisitionTest.cpp)
+    target_link_libraries(input_acquisition_tests PRIVATE gauge_inspection_runtime)
+    add_test(NAME explicit_input_acquisition COMMAND input_acquisition_tests)
+    add_executable(mysql_integration_tests tests/MySqlIntegrationTest.cpp src/DatabaseHistoryDialog.cpp src/DatabaseConnectionDialog.cpp)
+    target_link_libraries(mysql_integration_tests PRIVATE gauge_inspection_runtime)
+    target_compile_definitions(mysql_integration_tests PRIVATE REPO_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}")
+    add_test(NAME mysql_storage_and_review COMMAND mysql_integration_tests)
+    set_tests_properties(mysql_storage_and_review PROPERTIES SKIP_RETURN_CODE 77 ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
+    add_executable(database_configuration_tests tests/DatabaseConfigurationTest.cpp src/DatabaseConnectionDialog.cpp)
+    target_link_libraries(database_configuration_tests PRIVATE gauge_inspection_runtime)
+    add_test(NAME mysql_connection_configuration COMMAND database_configuration_tests)
+    add_executable(mysql_error_text_tests tests/MySqlErrorTextTest.cpp src/MySqlErrorText.cpp)
+    target_link_libraries(mysql_error_text_tests PRIVATE ${QT_LIBS})
+    add_test(NAME mysql_error_message_encoding COMMAND mysql_error_text_tests)
+    set_tests_properties(mysql_connection_configuration PROPERTIES ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
+    set_tests_properties(inspection_service_pipeline gauge_run_modes explicit_input_acquisition mysql_storage_and_review
+        PROPERTIES ENVIRONMENT "QT_QPA_PLATFORM=offscreen;GAUGE_MYSQL_DATABASE=;GAUGE_MYSQL_CONFIG_PATH=${CMAKE_CURRENT_BINARY_DIR}/tests-disabled-mysql.json")
+endif()
+
+if(WIN32)
+    foreach(runtime_target gauge_reader_gui gauge_reader_service inspection_service_tests gauge_run_mode_tests input_acquisition_tests mysql_integration_tests database_configuration_tests)
+        if(TARGET ${runtime_target})
+            foreach(client_dll "${MYSQL_ROOT}/lib/libmysql.dll" "${MYSQL_ROOT}/bin/libssl-3-x64.dll" "${MYSQL_ROOT}/bin/libcrypto-3-x64.dll")
+                if(EXISTS "${client_dll}")
+                    add_custom_command(TARGET ${runtime_target} POST_BUILD
+                        COMMAND ${CMAKE_COMMAND} -E copy_if_different "${client_dll}" "$<TARGET_FILE_DIR:${runtime_target}>")
+                endif()
+            endforeach()
+        endif()
+    endforeach()
+endif()

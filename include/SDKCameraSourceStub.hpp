@@ -139,67 +139,15 @@ public:
         return true;
     }
 
-    bool grabFrame(cv::Mat& frame) override {
-        if (!m_isOpen) return false;
-
-        m_frameCount++;
-
-        // 1. Read latest frame from background streaming worker (zero-delay)
-        if (m_isRealStreamActive) {
-            std::lock_guard<std::mutex> lock(m_mutex);
-            if (!m_latestFrame.empty()) {
-                auto now = std::chrono::steady_clock::now();
-                auto ageMs = std::chrono::duration_cast<std::chrono::milliseconds>(now - m_lastFrameTime).count();
-                if (ageMs < 2000) {
-                    frame = m_latestFrame.clone();
-                    std::stringstream ss;
-                    ss << "JFTech Xiongmai Camera (LIVE STREAM) | IP: " << m_sn 
-                       << " | URL: " << m_connectedUrl << " | Frm: " << m_frameCount;
-                    cv::putText(frame, ss.str(), cv::Point(20, 30),
-                                cv::FONT_HERSHEY_SIMPLEX, 0.55, cv::Scalar(0, 255, 0), 2);
-                    return true;
-                }
-            }
-        }
-
-        // 2. Read from custom user-loaded image sample frame if explicitly set
-        {
-            std::lock_guard<std::mutex> lock(m_mutex);
-            if (!m_sampleFrame.empty()) {
-                frame = m_sampleFrame.clone();
-                std::stringstream ss;
-                ss << "JFTech Xiongmai Camera (User Image) | IP: " << m_sn << " | Frm: " << m_frameCount;
-                cv::putText(frame, ss.str(), cv::Point(20, 30),
-                            cv::FONT_HERSHEY_SIMPLEX, 0.65, cv::Scalar(0, 229, 255), 2);
-                return true;
-            }
-        }
-
-        // 3. Dynamic Real-Time Diagnostic Connection Screen (ASCII only, prevents ????)
-        int w = 1280, h = 720;
-        frame = cv::Mat::zeros(h, w, CV_8UC3);
-
-        int scanY = (m_frameCount * 12) % h;
-        cv::line(frame, cv::Point(0, scanY), cv::Point(w, scanY), cv::Scalar(40, 80, 120), 2);
-
-        std::stringstream ss1, ss2, ss3, ss4;
-        ss1 << "JFTech Xiongmai Camera Live Stream";
-        ss2 << "IP Address: " << m_sn;
-        if (m_reconnectAttempts.load() > 0 || !m_isRealStreamActive) {
-            ss3 << "Status: Video stream interrupted. Auto-reconnecting... (Attempt #" << m_reconnectAttempts.load() << ")";
-            ss4 << "Tip: Re-plugging network cable will restore feed automatically in 1-2s.";
-        } else {
-            ss3 << "Status: Connecting to JLink / RTSP Video Stream...";
-            ss4 << "Probing camera network ports 34567 / 554 / 80...";
-        }
-
-        cv::putText(frame, ss1.str(), cv::Point(50, 200), cv::FONT_HERSHEY_SIMPLEX, 1.1, cv::Scalar(0, 229, 255), 2);
-        cv::putText(frame, ss2.str(), cv::Point(50, 270), cv::FONT_HERSHEY_SIMPLEX, 0.85, cv::Scalar(255, 255, 255), 2);
-        cv::putText(frame, ss3.str(), cv::Point(50, 340), cv::FONT_HERSHEY_SIMPLEX, 0.85, cv::Scalar(0, 215, 255), 2);
-        cv::putText(frame, ss4.str(), cv::Point(50, 410), cv::FONT_HERSHEY_SIMPLEX, 0.75, cv::Scalar(150, 160, 180), 2);
-
-        return true;
+    bool grabFrame(cv::Mat& frame) override { frame.release(); return false; }
+    FrameCaptureResult readFrame() override {
+        FrameCaptureResult result;
+        result.failure = CaptureFailure::UnsupportedProtocol;
+        result.message = "SDK adapter is a demonstration implementation";
+        return result;
     }
+    FrameCaptureResult captureSnapshot() override { return readFrame(); }
+    bool captureSingleSnapshot(cv::Mat& frame) override { frame.release(); return false; }
 
     void close() override {
         if (m_isOpen || m_workerRunning) {

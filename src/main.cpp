@@ -23,6 +23,7 @@ void printHelp(const char* progName) {
               << "  --config <path>      Path to centralized devices.json or gauge_profile.json\n"
               << "  --camera-id <id>     Target Camera ID inside central devices.json registry\n"
               << "  --output <path>      Path to save overlay result image (default: result.png)\n"
+              << "  --mode <mode>        production, evidence, debug (default: debug)\n"
               << "  --sdk-stub           Run in reserved Camera SDK Stub mode\n"
               << "  --help               Display this help message\n\n";
 }
@@ -50,6 +51,7 @@ int main(int argc, char** argv) {
     std::string cameraId = "CAM_5-3-1";
     std::string outputPath = "result.png";
     bool runSdkStub = false;
+    GaugeRunMode runMode = GaugeRunMode::Debug;
 
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
@@ -61,6 +63,12 @@ int main(int argc, char** argv) {
             cameraId = argv[++i];
         } else if (arg == "--output" && i + 1 < argc) {
             outputPath = argv[++i];
+        } else if (arg == "--mode" && i + 1 < argc) {
+            const std::string mode = argv[++i];
+            if (mode == "production") runMode = GaugeRunMode::Production;
+            else if (mode == "evidence") runMode = GaugeRunMode::Evidence;
+            else if (mode == "debug") runMode = GaugeRunMode::Debug;
+            else { std::cerr << "Invalid run mode: " << mode << std::endl; return 2; }
         } else if (arg == "--sdk-stub") {
             runSdkStub = true;
         } else if (arg == "--help" || arg == "-h") {
@@ -83,23 +91,19 @@ int main(int argc, char** argv) {
         cameraSource = std::make_shared<SDKCameraSourceStub>("CAM_SN_8839210", 0);
     } else {
         if (imagePath.empty()) {
-            imagePath = "test_images/222.png"; // Default test image (large perspective tilt)
+            std::cerr << "INVALID_INPUT: Local analysis requires an explicit --image path" << std::endl;
+            return 2;
         }
         std::cout << "[Main] Initializing File Camera Source from: " << imagePath << std::endl;
         cameraSource = std::make_shared<FileCameraSource>(imagePath);
     }
 
-    if (!cameraSource->open()) {
-        std::cerr << "[Main] Error: Could not open camera source: " << cameraSource->getSourceName() << std::endl;
-        std::cerr << "Hint: Provide a valid image via '--image <path_to_image>'" << std::endl;
+    const auto acquired = cameraSource->captureSnapshot();
+    if (!acquired.ok()) {
+        std::cerr << "[Main] Capture error: " << captureFailureName(acquired.failure) << std::endl;
         return -1;
     }
-
-    cv::Mat frame;
-    if (!cameraSource->grabFrame(frame)) {
-        std::cerr << "[Main] Error: Failed to acquire frame from " << cameraSource->getSourceName() << std::endl;
-        return -1;
-    }
+    const cv::Mat frame = acquired.frame;
 
     std::cout << "[Main] Frame acquired. Resolution: " << frame.cols << "x" << frame.rows 
               << " (" << frame.channels() << " channels)" << std::endl;
@@ -108,7 +112,8 @@ int main(int argc, char** argv) {
     GaugeReaderEngine engine;
 
     auto tStart = std::chrono::high_resolution_clock::now();
-    GaugeResult result = engine.process(frame, profile);
+    GaugeResult result = engine.process(frame, profile, runMode);
+    if (runMode == GaugeRunMode::Evidence) result.overlayImage = result.step4_recognition;
     auto tEnd = std::chrono::high_resolution_clock::now();
 
     double elapsedMs = std::chrono::duration<double, std::milli>(tEnd - tStart).count();

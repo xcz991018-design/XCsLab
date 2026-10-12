@@ -1,0 +1,475 @@
+#include "MySqlRepository.hpp"
+#include "DeviceCodec.hpp"
+#include "DatabaseSettingsStore.hpp"
+#include "MySqlErrorText.hpp"
+#include "MySqlBootstrapSchema.hpp"
+#include <mysql.h>
+#include <QCryptographicHash>
+#include <QJsonDocument>
+#include <QJsonArray>
+#include <QFile>
+#include <QSaveFile>
+#include <QDir>
+#include <QStandardPaths>
+#include <QUuid>
+#include <QUrl>
+#include <QSet>
+#include <QFileInfo>
+#include <QBuffer>
+#include <QImageReader>
+#include <QLockFile>
+#include <optional>
+#include <vector>
+#include <memory>
+#include <stdexcept>
+#include <cmath>
+
+namespace {
+using Cell = std::optional<QByteArray>;
+using Row = std::vector<Cell>;
+using Rows = std::vector<Row>;
+[[noreturn]] void fail(const QString& message) { throw std::runtime_error(message.toUtf8().constData()); }
+QByteArray json(const QJsonObject& value) { return QJsonDocument(value).toJson(QJsonDocument::Compact); }
+QByteArray number(qulonglong n) { return QByteArray::number(n); }
+QByteArray hash(const QByteArray& data) { return QCryptographicHash::hash(data, QCryptographicHash::Sha256).toHex(); }
+QByteArray time(const QDateTime& t) { return t.toUTC().toString("yyyy-MM-dd HH:mm:ss.zzz").toUtf8(); }
+Cell nullable(const QString& s) { return s.isEmpty() ? Cell{} : Cell{s.toUtf8()}; }
+QString str(const Cell& c) { return c ? QString::fromUtf8(*c) : QString(); }
+QDateTime date(const Cell& c) {
+    auto result = QDateTime::fromString(str(c), "yyyy-MM-dd HH:mm:ss.zzz");
+    if (!result.isValid()) result = QDateTime::fromString(str(c), "yyyy-MM-dd HH:mm:ss");
+    result.setTimeSpec(Qt::UTC); return result;
+}
+struct Library {
+    Library() { if (mysql_library_init(0, nullptr, nullptr)) fail("MYSQL_LIBRARY_INIT_FAILED"); }
+    ~Library() { mysql_library_end(); }
+};
+class Connection {
+public:
+    MYSQL* handle{nullptr};
+    int maxBytes;
+    explicit Connection(const DatabaseSettings& settings) : maxBytes(settings.maxImageBytes) {
+        static Library library;
+        if (!settings.enabled || settings.database.isEmpty() || settings.user.isEmpty() || settings.port == 0) fail("MYSQL_NOT_CONFIGURED");
+        if (mysql_thread_init()) fail("MYSQL_THREAD_INIT_FAILED");
+        handle = mysql_init(nullptr);
+        if (!handle) { mysql_thread_end(); fail("MYSQL_INIT_FAILED"); }
+        unsigned int timeout = 3, readTimeout = 15;
+        mysql_options(handle, MYSQL_OPT_CONNECT_TIMEOUT, &timeout);
+        mysql_options(handle, MYSQL_OPT_READ_TIMEOUT, &readTimeout);
+        mysql_options(handle, MYSQL_OPT_WRITE_TIMEOUT, &readTimeout);
+        mysql_options(handle, MYSQL_SET_CHARSET_NAME, "utf8mb4");
+        mysql_ssl_mode mode = SSL_MODE_REQUIRED;
+        if (settings.tlsMode == "disabled") mode = SSL_MODE_DISABLED;
+        else if (settings.tlsMode == "verify_identity") mode = SSL_MODE_VERIFY_IDENTITY;
+        else if (settings.tlsMode != "required") {
+            mysql_close(handle); handle = nullptr; mysql_thread_end(); fail("INVALID_MYSQL_TLS_MODE");
+        }
+        mysql_options(handle, MYSQL_OPT_SSL_MODE, &mode);
+        if (!settings.caFile.isEmpty()) mysql_options(handle, MYSQL_OPT_SSL_CA, settings.caFile.toUtf8().constData());
+        const auto connect = [&](const char* database) {
+            return mysql_real_connect(handle, settings.host.toUtf8().constData(), settings.user.toUtf8().constData(),
+                settings.password.toUtf8().constData(), database, settings.port, nullptr, 0);
+        };
+        try {
+            bool initialize = false;
+            if (!connect(settings.database.toUtf8().constData())) {
+                if (mysql_errno(handle) != 1049 || !connect(nullptr))
+                    fail(QString("MYSQL_CONNECT_FAILED (%1): %2").arg(mysql_errno(handle))
+                        .arg(decodeMySqlError(QByteArray(mysql_error(handle)))));
+                auto name = settings.database.toUtf8(); name.replace("`", "``");
+                const auto sql = "CREATE DATABASE IF NOT EXISTS `" + name + "` CHARACTER SET utf8mb4";
+                if (mysql_real_query(handle, sql.constData(), static_cast<unsigned long>(sql.size())) ||
+                    mysql_select_db(handle, settings.database.toUtf8().constData()))
+                    fail(QString("MYSQL_DATABASE_CREATE_FAILED (%1): %2").arg(mysql_errno(handle))
+                        .arg(decodeMySqlError(QByteArray(mysql_error(handle)))));
+                initialize = true;
+            }
+            // Resume interrupted initialization only in databases with no runtime marker.
+            if (!initialize) {
+                if (mysql_query(handle, "SELECT 1 FROM runtime_settings LIMIT 0")) {
+                    if (mysql_errno(handle) == 1146) initialize = true;
+                    else fail(QString("MYSQL_SCHEMA_CHECK_FAILED: %1").arg(decodeMySqlError(QByteArray(mysql_error(handle)))));
+                } else if (auto* result = mysql_store_result(handle)) mysql_free_result(result);
+            }
+            if (initialize) {
+                for (const auto& statement : QByteArray(MySqlBootstrapSchema).split(';')) {
+                    const auto sql = statement.trimmed();
+                    if (!sql.isEmpty() && mysql_real_query(handle, sql.constData(), static_cast<unsigned long>(sql.size())))
+                        fail(QString("MYSQL_SCHEMA_INIT_FAILED (%1): %2").arg(mysql_errno(handle))
+                            .arg(decodeMySqlError(QByteArray(mysql_error(handle)))));
+                }
+            }
+            if (mysql_query(handle, "SET time_zone = '+00:00'")) fail("MYSQL_SESSION_SETUP_FAILED");
+        }
+        catch (...) { mysql_close(handle); handle = nullptr; mysql_thread_end(); throw; }
+    }
+    ~Connection() { if (handle) { mysql_close(handle); mysql_thread_end(); } }
+    Rows exec(const QByteArray& sql, const Row& values = {}, int binaryIndex = -1) {
+        std::unique_ptr<MYSQL_STMT, decltype(&mysql_stmt_close)> stmt(mysql_stmt_init(handle), mysql_stmt_close);
+        if (!stmt) fail("MYSQL_STATEMENT_INIT_FAILED");
+        auto check = [&](int code) {
+            if (code) fail(QString("MYSQL_QUERY_FAILED (%1): %2").arg(mysql_stmt_errno(stmt.get()))
+                .arg(decodeMySqlError(QByteArray(mysql_stmt_error(stmt.get())))));
+        };
+        check(mysql_stmt_prepare(stmt.get(), sql.constData(), static_cast<unsigned long>(sql.size())));
+        std::vector<MYSQL_BIND> params(values.size());
+        std::vector<unsigned long> lengths(values.size());
+        std::unique_ptr<bool[]> nulls(new bool[values.size()]{});
+        for (size_t i = 0; i < values.size(); ++i) {
+            nulls[i] = !values[i];
+            lengths[i] = values[i] ? static_cast<unsigned long>(values[i]->size()) : 0;
+            params[i].buffer_type = static_cast<int>(i) == binaryIndex ? MYSQL_TYPE_BLOB : MYSQL_TYPE_STRING;
+            params[i].buffer = values[i] ? const_cast<char*>(values[i]->constData()) : nullptr;
+            params[i].buffer_length = lengths[i]; params[i].length = &lengths[i]; params[i].is_null = &nulls[i];
+        }
+        if (!values.empty()) check(mysql_stmt_bind_param(stmt.get(), params.data()));
+        bool updateLengths = true;
+        check(mysql_stmt_attr_set(stmt.get(), STMT_ATTR_UPDATE_MAX_LENGTH, &updateLengths));
+        check(mysql_stmt_execute(stmt.get()));
+        if (!mysql_stmt_field_count(stmt.get())) return {};
+        check(mysql_stmt_store_result(stmt.get()));
+        std::unique_ptr<MYSQL_RES, decltype(&mysql_free_result)> meta(mysql_stmt_result_metadata(stmt.get()), mysql_free_result);
+        const unsigned count = mysql_num_fields(meta.get());
+        MYSQL_FIELD* fields = mysql_fetch_fields(meta.get());
+        std::vector<QByteArray> buffers(count);
+        std::vector<MYSQL_BIND> outputs(count);
+        std::vector<unsigned long> sizes(count);
+        std::unique_ptr<bool[]> outputNulls(new bool[count]{}), truncated(new bool[count]{});
+        for (unsigned i = 0; i < count; ++i) {
+            if (fields[i].max_length > static_cast<unsigned long>(maxBytes)) fail("MYSQL_RESULT_TOO_LARGE");
+            buffers[i].resize(static_cast<int>(fields[i].max_length) + 1);
+            outputs[i].buffer_type = MYSQL_TYPE_BLOB; outputs[i].buffer = buffers[i].data();
+            outputs[i].buffer_length = static_cast<unsigned long>(buffers[i].size());
+            outputs[i].length = &sizes[i]; outputs[i].is_null = &outputNulls[i]; outputs[i].error = &truncated[i];
+        }
+        check(mysql_stmt_bind_result(stmt.get(), outputs.data()));
+        Rows rows;
+        for (;;) {
+            int status = mysql_stmt_fetch(stmt.get());
+            if (status == MYSQL_NO_DATA) break;
+            check(status);
+            Row row;
+            for (unsigned i = 0; i < count; ++i)
+                row.push_back(outputNulls[i] ? Cell{} : Cell{buffers[i].left(static_cast<int>(sizes[i]))});
+            rows.push_back(std::move(row));
+        }
+        return rows;
+    }
+};
+class Transaction {
+    Connection& c;
+    bool committed{false};
+public:
+    explicit Transaction(Connection& connection) : c(connection) {
+        if (mysql_autocommit(c.handle, false)) fail("MYSQL_TRANSACTION_BEGIN_FAILED");
+    }
+    ~Transaction() { if (!committed) mysql_rollback(c.handle); }
+    void commit() {
+        if (mysql_commit(c.handle)) fail("MYSQL_TRANSACTION_COMMIT_FAILED");
+        committed = true;
+    }
+};
+QJsonObject cleanDevice(QJsonObject d) {
+    d.remove("password");
+    QUrl url(d["rtsp_url"].toString()); url.setUserName(QString()); url.setPassword(QString());
+    d["rtsp_url"] = url.toString(); return d;
+}
+void saveCamera(Connection& c, const QJsonObject& raw, bool update) {
+    auto d = cleanDevice(raw);
+    if (d["camera_id"].toString().isEmpty()) fail("CAMERA_ID_REQUIRED");
+    QByteArray statement = "INSERT INTO camera_archives (camera_id, display_name, protocol, endpoint, credential_ref,"
+        " substation, area, installation_location, device_tag, gauge_type, manufacturer, accuracy_class,"
+        " enabled, created_at, updated_at, archive_json) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,1,?,?,?)";
+    if (update) statement += " ON DUPLICATE KEY UPDATE display_name=VALUES(display_name), protocol=VALUES(protocol),"
+        " endpoint=VALUES(endpoint), credential_ref=VALUES(credential_ref), substation=VALUES(substation),"
+        " area=VALUES(area), installation_location=VALUES(installation_location), device_tag=VALUES(device_tag),"
+        " gauge_type=VALUES(gauge_type), manufacturer=VALUES(manufacturer), accuracy_class=VALUES(accuracy_class),"
+        " archive_json=VALUES(archive_json), enabled=1, deleted_at=NULL, updated_at=VALUES(updated_at)";
+    else statement += " ON DUPLICATE KEY UPDATE camera_id=camera_id";
+    auto now = time(QDateTime::currentDateTimeUtc());
+    c.exec(statement, {d["camera_id"].toString().toUtf8(), d["custom_name"].toString().toUtf8(),
+        d["protocol_type"].toString().toUtf8(), (d["rtsp_url"].toString().isEmpty() ? d["ip_or_sn"].toString() : d["rtsp_url"].toString()).toUtf8(),
+        ("local-camera:" + d["camera_id"].toString()).toUtf8(), nullable(d["substation"].toString()),
+        nullable(d["area"].toString()), nullable(d["installation_location"].toString()),
+        nullable(d["device_tag"].toString()), nullable(d["gauge_type"].toString()),
+        nullable(d["manufacturer"].toString()), nullable(d["accuracy_class"].toString()), now, now, json(d)});
+}
+StoredInspection toInspection(const Row& r) {
+    StoredInspection out;
+    out.taskId = str(r[0]); out.cameraId = str(r[1]); out.parentTaskId = str(r[2]);
+    out.capturedAt = date(r[3]); out.processedAt = date(r[4]); out.value = str(r[5]).toDouble();
+    out.unit = str(r[6]); out.confidence = str(r[7]).toDouble(); out.success = str(r[8]) == "1";
+    out.recognitionPerformed = str(r[9]) == "1"; out.errorCode = str(r[10]); out.errorMessage = str(r[11]);
+    out.inputKind = str(r[12]); out.qualityStatus = str(r[13]); out.processStatus = str(r[14]);
+    out.device = deviceFromJson(QJsonDocument::fromJson(r[15].value_or(QByteArray())).object());
+    out.profile = QJsonDocument::fromJson(r[16].value_or(QByteArray())).object();
+    out.hasOriginal = str(r[17]) == "1";
+    out.latestReview = QJsonDocument::fromJson(r[18].value_or(QByteArray())).object();
+    return out;
+}
+const QByteArray historySelect = "SELECT h.task_id,h.camera_id,h.parent_task_id,h.captured_at,h.processed_at,"
+    "h.reading_value,h.unit,h.confidence,h.recognition_success,h.recognition_performed,h.error_code,h.error_message,"
+    "h.input_kind,h.quality_status,h.process_status,v.archive_snapshot,v.recognition_profile,"
+    "EXISTS(SELECT 1 FROM inspection_evidence e WHERE e.task_id=h.task_id AND e.evidence_kind='original'"
+    " AND e.sequence_number=0 AND e.storage_backend='mysql' AND e.availability='available'),"
+    "(SELECT JSON_OBJECT('decision',r.decision,'reviewer',r.reviewer_id,'value',r.corrected_value,'comment',r.comment,'time',r.reviewed_at)"
+    " FROM reading_reviews r WHERE r.task_id=h.task_id ORDER BY r.reviewed_at DESC,r.review_id DESC LIMIT 1)"
+    " FROM inspection_history h JOIN camera_config_versions v ON v.config_id=h.config_id";
+void writeAtomic(const QString& path, const QJsonObject& object) {
+    QSaveFile file(path); const auto bytes = json(object);
+    if (!file.open(QIODevice::WriteOnly) || file.write(bytes) != bytes.size() || !file.commit()) fail("OUTBOX_WRITE_FAILED");
+}
+}
+
+DatabaseSettings DatabaseSettings::fromEnvironment() {
+    // Saved settings are frozen for this process. Saving in the GUI takes effect on restart.
+    if (qEnvironmentVariable("GAUGE_MYSQL_DATABASE").isEmpty()) {
+        static const auto saved = DatabaseSettingsStore::load();
+        return saved;
+    }
+    DatabaseSettings s;
+    s.database = qEnvironmentVariable("GAUGE_MYSQL_DATABASE"); s.enabled = !s.database.isEmpty();
+    s.host = qEnvironmentVariable("GAUGE_MYSQL_HOST", "127.0.0.1");
+    s.user = qEnvironmentVariable("GAUGE_MYSQL_USER"); s.password = qEnvironmentVariable("GAUGE_MYSQL_PASSWORD");
+    bool ok = false; auto port = qEnvironmentVariable("GAUGE_MYSQL_PORT", "3306").toUInt(&ok);
+    s.port = ok && port > 0 && port <= 65535 ? port : 0;
+    s.tlsMode = qEnvironmentVariable("GAUGE_MYSQL_TLS_MODE", "required");
+    s.caFile = qEnvironmentVariable("GAUGE_MYSQL_CA_FILE"); return s;
+}
+MySqlRepository::MySqlRepository(DatabaseSettings settings) : m_settings(std::move(settings)) {}
+void MySqlRepository::checkConnection() const { Connection c(m_settings); c.exec("SELECT 1 FROM runtime_settings LIMIT 1"); }
+QString MySqlRepository::testConnection() const {
+    Connection c(m_settings);
+    const auto result=c.exec("SELECT COUNT(*) FROM information_schema.tables WHERE table_schema=?"
+        " AND table_name IN ('camera_archives','camera_config_versions','inspection_history','inspection_evidence',"
+        "'reading_reviews','image_blobs','runtime_settings')", {m_settings.database.toUtf8()});
+    return str(result[0][0]).toInt()==7 ? QStringLiteral("连接成功，数据库所需表已存在。")
+        : QStringLiteral("连接成功，但数据库表结构尚未准备齐全。请先执行 database/mysql 中的三份迁移脚本。");
+}
+QJsonObject MySqlRepository::sanitizedRegistry(QJsonObject registry) {
+    QJsonArray devices;
+    for (const auto& value : registry["devices"].toArray()) devices.append(cleanDevice(value.toObject()));
+    registry["devices"] = devices; return registry;
+}
+QJsonObject MySqlRepository::loadRegistry() const {
+    Connection c(m_settings); QJsonArray devices;
+    for (const auto& row : c.exec("SELECT archive_json FROM camera_archives WHERE deleted_at IS NULL ORDER BY camera_id"))
+        devices.append(QJsonDocument::fromJson(row[0].value_or(QByteArray())).object());
+    QJsonObject result; result["devices"] = devices;
+    auto sys = c.exec("SELECT setting_json FROM runtime_settings WHERE setting_key='system'");
+    if (!sys.empty()) result["system"] = QJsonDocument::fromJson(sys[0][0].value_or(QByteArray())).object();
+    return result;
+}
+void MySqlRepository::saveRegistry(const QJsonObject& registry) const {
+    Connection c(m_settings); Transaction tx(c); QSet<QString> ids;
+    // This desktop registry is a complete snapshot; only its serialized writer submits it.
+    c.exec("SELECT camera_id FROM camera_archives FOR UPDATE");
+    for (const auto& value : registry["devices"].toArray()) {
+        auto device = value.toObject(); ids.insert(device["camera_id"].toString()); saveCamera(c, device, true);
+    }
+    for (const auto& row : c.exec("SELECT camera_id FROM camera_archives WHERE deleted_at IS NULL"))
+        if (!ids.contains(str(row[0]))) c.exec("UPDATE camera_archives SET enabled=0,deleted_at=?,updated_at=? WHERE camera_id=?",
+            {time(QDateTime::currentDateTimeUtc()), time(QDateTime::currentDateTimeUtc()), row[0]});
+    c.exec("INSERT INTO runtime_settings(setting_key,setting_json) VALUES('system',?)"
+        " ON DUPLICATE KEY UPDATE setting_json=VALUES(setting_json)", {json(registry["system"].toObject())});
+    tx.commit();
+}
+QJsonObject MySqlRepository::inspectionEnvelope(const InspectionTask& task, const InspectionOutcome& out) {
+    QJsonObject record;
+    record["task_id"] = out.taskId; record["camera_id"] = out.cameraId;
+    record["device"] = out.deviceSnapshot.isEmpty() ? deviceToJson(task.device) : out.deviceSnapshot;
+    record["profile"] = out.profileSnapshot;
+    // A failed historical identity check must not create a false cross-camera link.
+    record["parent_task_id"] = out.capturedFrame.empty() ? QString() : task.parentTaskId;
+    record["input_kind"] = inspectionInputName(task.inputKind); record["mode"] = gaugeRunModeName(task.runMode);
+    record["captured_at"] = out.capturedAt.isValid() ? out.capturedAt.toUTC().toString(Qt::ISODateWithMs) : QString();
+    record["processed_at"] = QDateTime::currentDateTimeUtc().toString(Qt::ISODateWithMs);
+    record["recognition_performed"] = out.recognitionPerformed;
+    record["success"] = out.errorCode.isEmpty() && out.result.success;
+    record["value"] = out.result.success ? QJsonValue(out.result.value) : QJsonValue(QJsonValue::Null);
+    record["unit"] = QString::fromStdString(out.result.unit); record["confidence"] = out.result.confidence;
+    record["error_code"] = out.errorCode;
+    record["error_message"] = out.errorMessage;
+    record["original_path"] = QFileInfo(out.originalPath).absoluteFilePath();
+    if (out.originalPath.isEmpty()) record["original_path"] = QString();
+    record["rectified_path"] = out.rectifiedPath.isEmpty() ? QString() : QFileInfo(out.rectifiedPath).absoluteFilePath();
+    record["recognition_path"] = out.recognitionPath.isEmpty() ? QString() : QFileInfo(out.recognitionPath).absoluteFilePath();
+    record["reuse_original_task_id"] = out.capturedFrame.empty() ? QString() : task.databaseOriginalTaskId;
+    return record;
+}
+void MySqlRepository::saveInspection(const QJsonObject& r) const {
+    Connection c(m_settings); Transaction tx(c);
+    const auto id = r["task_id"].toString().toUtf8(); auto device = r["device"].toObject();
+    const auto camera = r["camera_id"].toString().toUtf8();
+    if (device["camera_id"].toString().toUtf8() != camera || QUuid(QString::fromUtf8(id)).isNull()) fail("INVALID_HISTORY_IDENTITY");
+    if (!c.exec("SELECT task_id FROM inspection_history WHERE task_id=?", {id}).empty()) { tx.commit(); return; }
+    saveCamera(c, device, false);
+    c.exec("SELECT camera_id FROM camera_archives WHERE camera_id=? FOR UPDATE", {camera});
+    // Another storage worker may have committed this task while we waited on the camera row.
+    if (!c.exec("SELECT task_id FROM inspection_history WHERE task_id=? FOR UPDATE", {id}).empty()) { tx.commit(); return; }
+    auto profile = r["profile"].toObject(); auto cleaned = cleanDevice(device);
+    auto versionedDevice = cleaned;
+    for (const auto& key : {"is_online", "last_seen_time", "is_auto_connect"}) versionedDevice.remove(key);
+    auto snapshotHash = hash(json(versionedDevice) + '\n' + json(profile));
+    auto versions = c.exec("SELECT config_id FROM camera_config_versions WHERE camera_id=? AND snapshot_sha256=?", {camera,snapshotHash});
+    Cell config;
+    if (versions.empty()) {
+        auto next = c.exec("SELECT COALESCE(MAX(version_number),0)+1 FROM camera_config_versions WHERE camera_id=?", {camera});
+        c.exec("INSERT INTO camera_config_versions(camera_id,version_number,calibration,recognition_profile,archive_snapshot,created_at,snapshot_sha256)"
+            " VALUES(?,?,?,?,?,?,?)", {camera,next[0][0],json(cleaned["calibration"].toObject()),json(profile),json(cleaned),
+             time(QDateTime::currentDateTimeUtc()),snapshotHash});
+        config = number(mysql_insert_id(c.handle));
+    } else config = versions[0][0];
+    const auto acquired = QDateTime::fromString(r["captured_at"].toString(), Qt::ISODateWithMs);
+    const auto processed = QDateTime::fromString(r["processed_at"].toString(), Qt::ISODateWithMs);
+    if (!processed.isValid()) fail("INVALID_PROCESSING_TIME");
+    const bool successful = r["success"].toBool();
+    const QString quality = !r["recognition_performed"].toBool() ? "not_evaluated" :
+        successful ? (r["confidence"].toDouble() < 0.4 ? "review_required" : "accepted") : "failed";
+    c.exec("INSERT INTO inspection_history(task_id,camera_id,config_id,parent_task_id,input_kind,run_mode,captured_at,processed_at,"
+        "recognition_performed,recognition_success,reading_value,unit,confidence,quality_status,process_status,error_code,error_message)"
+        " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", {id,camera,config,nullable(r["parent_task_id"].toString()),
+        r["input_kind"].toString().toUtf8(),r["mode"].toString().toUtf8(),acquired.isValid()?Cell{time(acquired)}:Cell{},time(processed),
+        r["recognition_performed"].toBool()?QByteArray("1"):QByteArray("0"),successful?QByteArray("1"):QByteArray("0"),
+        r["value"].isDouble()?Cell{QByteArray::number(r["value"].toDouble(),'g',17)}:Cell{},nullable(r["unit"].toString()),
+        QByteArray::number(r["confidence"].toDouble(),'g',17),quality.toUtf8(),QByteArray("not_evaluated"),
+        nullable(r["error_code"].toString()),nullable(r["error_message"].toString())});
+    for (const auto& kind : {QString("original"),QString("rectified"),QString("recognition")}) {
+        Cell imageId; QByteArray digest, byteSize;
+        if (kind == "original" && !r["reuse_original_task_id"].toString().isEmpty()) {
+            const auto parent = r["reuse_original_task_id"].toString();
+            if (parent != r["parent_task_id"].toString()) fail("HISTORICAL_IDENTITY_MISMATCH");
+            auto original = c.exec("SELECT e.image_id,e.sha256,e.byte_size,h.captured_at FROM inspection_evidence e"
+                " JOIN inspection_history h ON h.task_id=e.task_id WHERE e.task_id=? AND h.camera_id=?"
+                " AND e.evidence_kind='original' AND e.sequence_number=0 AND e.storage_backend='mysql' AND e.availability='available'",
+                {parent.toUtf8(),camera});
+            if (original.empty() || date(original[0][3]) != acquired) fail("HISTORICAL_IDENTITY_MISMATCH");
+            imageId=original[0][0]; digest=original[0][1].value(); byteSize=original[0][2].value();
+        } else {
+            const auto path = r[kind+"_path"].toString(); if (path.isEmpty()) continue;
+            QFile file(path);
+            if (!file.open(QIODevice::ReadOnly) || file.size() > m_settings.maxImageBytes) fail("EVIDENCE_UNAVAILABLE_OR_TOO_LARGE");
+            auto bytes = file.readAll(); if (bytes.isEmpty()) fail("EMPTY_EVIDENCE");
+            std::vector<uchar> buffer(bytes.begin(),bytes.end()); auto image = cv::imdecode(buffer,cv::IMREAD_UNCHANGED);
+            if (image.empty()) fail("INVALID_EVIDENCE_IMAGE");
+            digest=hash(bytes); byteSize=number(bytes.size());
+            c.exec("INSERT INTO image_blobs(mime_type,pixel_width,pixel_height,sha256,byte_size,image_bytes,created_at)"
+                " VALUES('image/png',?,?,?,?,?,?) ON DUPLICATE KEY UPDATE image_id=LAST_INSERT_ID(image_id)",
+                {number(image.cols),number(image.rows),digest,byteSize,bytes,time(QDateTime::currentDateTimeUtc())},4);
+            imageId=number(mysql_insert_id(c.handle));
+        }
+        c.exec("INSERT INTO inspection_evidence(task_id,evidence_kind,sequence_number,storage_key,sha256,byte_size,availability,created_at,storage_backend,image_id)"
+            " VALUES(?,?,0,NULL,?,?,'available',?,'mysql',?)", {id,kind.toUtf8(),digest,byteSize,time(processed),imageId});
+    }
+    tx.commit();
+}
+QList<StoredInspection> MySqlRepository::history(const QString& camera, const QDateTime& from,
+        const QDateTime& until, int page, int size) const {
+    if (page < 0 || page > 1000000 || size < 1 || size > 100 || !from.isValid() || !until.isValid() || from >= until)
+        fail("INVALID_HISTORY_QUERY");
+    Connection c(m_settings); Row params{time(from),time(until)};
+    auto sql = historySelect + " WHERE h.processed_at>=? AND h.processed_at<?";
+    if (!camera.trimmed().isEmpty()) { sql += " AND h.camera_id=?"; params.push_back(camera.trimmed().toUtf8()); }
+    sql += " ORDER BY h.processed_at DESC,h.task_id DESC LIMIT " + QByteArray::number(size)
+        + " OFFSET " + QByteArray::number(page * size);
+    QList<StoredInspection> result;
+    for (const auto& row : c.exec(sql,params)) result.append(toInspection(row));
+    return result;
+}
+StoredImage MySqlRepository::original(const QString& taskId) const {
+    Connection c(m_settings); Transaction tx(c);
+    auto record = c.exec(historySelect + " WHERE h.task_id=?",{taskId.toUtf8()});
+    if (record.empty()) fail("HISTORY_NOT_FOUND");
+    StoredImage result; result.inspection=toInspection(record[0]);
+    auto image = c.exec("SELECT b.image_bytes,b.sha256,b.pixel_width,b.pixel_height,b.byte_size,e.sha256,e.byte_size"
+        " FROM inspection_evidence e JOIN image_blobs b ON b.image_id=e.image_id WHERE e.task_id=?"
+        " AND e.evidence_kind='original' AND e.sequence_number=0 AND e.storage_backend='mysql' AND e.availability='available'",{taskId.toUtf8()});
+    if (image.empty()) fail("ORIGINAL_NOT_AVAILABLE");
+    result.bytes=image[0][0].value(); result.sha256=str(image[0][1]);
+    result.width=str(image[0][2]).toInt(); result.height=str(image[0][3]).toInt();
+    if (result.bytes.size()>m_settings.maxImageBytes || hash(result.bytes)!=image[0][1].value() ||
+        str(image[0][4]).toLongLong()!=result.bytes.size() || image[0][1]!=image[0][5] || image[0][4]!=image[0][6])
+        fail("ORIGINAL_INTEGRITY_FAILED");
+    QBuffer buffer(&result.bytes); buffer.open(QIODevice::ReadOnly); QImageReader reader(&buffer);
+    const auto dimensions = reader.size();
+    if (dimensions.width()!=result.width || dimensions.height()!=result.height || result.width<=0 || result.height<=0 ||
+        qint64(result.width)*result.height>50000000) fail("ORIGINAL_DIMENSIONS_INVALID");
+    tx.commit(); return result;
+}
+void MySqlRepository::addReview(const QString& task, const QString& reviewer, const QString& decision,
+        const QString& corrected, const QString& comment) const {
+    bool valid=false; double value=corrected.toDouble(&valid);
+    if (reviewer.trimmed().isEmpty() || reviewer.size()>128 || comment.size()>4096 ||
+        (decision!="confirmed" && decision!="corrected" && decision!="unreadable") ||
+        (decision=="corrected" && (!valid || !std::isfinite(value)))) fail("INVALID_REVIEW");
+    Connection c(m_settings);
+    c.exec("INSERT INTO reading_reviews(task_id,reviewer_id,decision,corrected_value,comment,reviewed_at) VALUES(?,?,?,?,?,?)",
+        {task.toUtf8(),reviewer.trimmed().toUtf8(),decision.toUtf8(),decision=="corrected"?Cell{QByteArray::number(value,'g',17)}:Cell{},
+         nullable(comment),time(QDateTime::currentDateTimeUtc())});
+}
+QString MySqlRepository::queueInspection(const QJsonObject& envelope,const QString& directory) {
+    const auto folder=QDir(directory).filePath(".mysql_pending");
+    if (!QDir().mkpath(folder)) fail("OUTBOX_DIRECTORY_FAILED");
+    const auto id=envelope["task_id"].toString(); if (QUuid(id).isNull()) fail("INVALID_TASK_ID");
+    const auto path=QDir(folder).filePath(envelope["processed_at"].toString().remove(':')+"_"+id+".json");
+    writeAtomic(path,envelope); return path;
+}
+QString MySqlRepository::registryQueueDirectory() {
+    return qEnvironmentVariable("GAUGE_MYSQL_OUTBOX",QStandardPaths::writableLocation(QStandardPaths::AppLocalDataLocation)+"/mysql_registry_outbox");
+}
+QString MySqlRepository::queueRegistry(const QJsonObject& registry) {
+    const auto folder=registryQueueDirectory(); if (!QDir().mkpath(folder)) fail("OUTBOX_DIRECTORY_FAILED");
+    const auto path=QDir(folder).filePath("latest.json");
+    QLockFile lock(folder+"/registry.lock"); if (!lock.tryLock(1000)) fail("REGISTRY_OUTBOX_BUSY");
+    writeAtomic(path,sanitizedRegistry(registry)); return path;
+}
+QString MySqlRepository::retryPending(const QString& directory,int limit) {
+    try {
+        if (!DatabaseSettings::fromEnvironment().enabled) return {};
+        MySqlRepository repository;
+        QString registryStatus;
+        auto registryFolder=registryQueueDirectory(); QDir().mkpath(registryFolder);
+        QLockFile registrySyncLock(registryFolder+"/sync.lock");
+        if (registrySyncLock.tryLock(0)) {
+            QFile file(QDir(registryFolder).filePath("latest.json"));
+            QByteArray bytes;
+            {
+                QLockFile lock(registryFolder+"/registry.lock");
+                if (!lock.tryLock(1000)) fail("REGISTRY_OUTBOX_BUSY");
+                if (file.exists()) {
+                    if (!file.open(QIODevice::ReadOnly)) fail("REGISTRY_OUTBOX_READ_FAILED");
+                    bytes=file.readAll(); file.close();
+                }
+            }
+            if (!bytes.isEmpty()) {
+                auto doc=QJsonDocument::fromJson(bytes);
+                if (!doc.isObject()) fail("INVALID_REGISTRY_OUTBOX");
+                repository.saveRegistry(doc.object());
+                QLockFile lock(registryFolder+"/registry.lock");
+                if (!lock.tryLock(1000)) fail("REGISTRY_OUTBOX_BUSY");
+                if (!file.open(QIODevice::ReadOnly)) fail("REGISTRY_OUTBOX_READ_FAILED");
+                const auto latest=file.readAll(); file.close();
+                if (latest==bytes) {
+                    if (!file.remove()) fail("OUTBOX_REMOVE_FAILED");
+                } else registryStatus="REGISTRY_NEWER_SNAPSHOT_PENDING";
+            }
+        } else if (QFile::exists(QDir(registryFolder).filePath("latest.json"))) registryStatus="REGISTRY_SYNC_IN_PROGRESS";
+        if (directory.isEmpty()) return registryStatus;
+        QDir folder(QDir(directory).filePath(".mysql_pending"));
+        if (!folder.exists()) return registryStatus;
+        QLockFile lock(folder.filePath("sync.lock")); if (!lock.tryLock(0)) return registryStatus;
+        int count=0; QString firstError;
+        for (const auto& name:folder.entryList({"*.json"},QDir::Files,QDir::Name)) {
+            if (++count>limit) break;
+            QFile file(folder.filePath(name)); if (!file.open(QIODevice::ReadOnly)) fail("OUTBOX_READ_FAILED");
+            auto doc=QJsonDocument::fromJson(file.readAll()); file.close(); if (!doc.isObject()) fail("INVALID_OUTBOX");
+            try {
+                repository.saveInspection(doc.object()); if (!file.remove()) fail("OUTBOX_REMOVE_FAILED");
+            } catch (const std::exception& e) {
+                if (firstError.isEmpty()) firstError=QString::fromUtf8(e.what());
+            }
+        }
+        return firstError.isEmpty() ? registryStatus : firstError;
+    } catch (const std::exception& e) { return QString::fromUtf8(e.what()); }
+}

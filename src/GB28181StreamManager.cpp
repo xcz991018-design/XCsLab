@@ -84,26 +84,15 @@ void GB28181StreamManager::setSampleFrame(const cv::Mat& sample) {
 }
 
 bool GB28181StreamManager::grabFrame(cv::Mat& frame) {
-    if (!m_isStreaming) {
-        return false;
-    }
-
-    m_frameCount++;
-    m_packetCount += 45; // Simulated PS RTP packet increment
-
-    if (!m_sampleFrame.empty()) {
-        frame = m_sampleFrame.clone();
-        
-        // Overlay GB28181 Stream Watermark / Stamp for Demonstration
-        std::stringstream ss;
-        ss << "GB28181-2016 PS Stream | ID: " << m_config.deviceId
-           << " | Frm: " << m_frameCount;
-        cv::putText(frame, ss.str(), cv::Point(20, 30),
-                    cv::FONT_HERSHEY_SIMPLEX, 0.65, cv::Scalar(0, 255, 255), 2);
-        return true;
-    }
-
+    frame.release();
     return false;
+}
+
+FrameCaptureResult GB28181StreamManager::readFrame() {
+    FrameCaptureResult result;
+    result.failure = CaptureFailure::UnsupportedProtocol;
+    result.message = "GB28181 adapter is a demonstration implementation";
+    return result;
 }
 
 void GB28181StreamManager::close() {

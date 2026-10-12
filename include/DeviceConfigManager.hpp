@@ -5,6 +5,9 @@
 #include <QList>
 #include <QMap>
 #include <QMutex>
+#include <QObject>
+#include <QThreadPool>
+#include <QFuture>
 #include "AutoCameraDiscoveryService.hpp"
 
 /**
@@ -13,7 +16,8 @@
  * Manages device persistence (config/devices.json), auto-connection state machine,
  * network parameters, and device life-cycle management.
  */
-class DeviceConfigManager {
+class DeviceConfigManager : public QObject {
+    Q_OBJECT
 public:
     static DeviceConfigManager& instance();
 
@@ -49,10 +53,15 @@ public:
 
     QString getConfigPath() const { return m_currentFilePath; }
     static QString resolveConfigPath(const QString& preferredPath = "");
+    QString lastError() const;
+    void retryDatabaseSync();
+    void waitForDatabaseWrites();
+signals:
+    void databaseStatus(const QString& error);
 
 private:
     DeviceConfigManager();
-    ~DeviceConfigManager() = default;
+    ~DeviceConfigManager() override;
     DeviceConfigManager(const DeviceConfigManager&) = delete;
     DeviceConfigManager& operator=(const DeviceConfigManager&) = delete;
 
@@ -63,6 +72,9 @@ private:
     QString m_lastActiveDeviceId;
     bool m_autoConnectOnStartup{true};
     QString m_currentFilePath;
+    QString m_lastError;
+    QThreadPool m_databasePool;
+    QFuture<void> m_databaseFuture;
 };
 
 #endif // DEVICE_CONFIG_MANAGER_HPP

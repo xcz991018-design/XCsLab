@@ -50,6 +50,9 @@ public:
     // --- ICameraSource Interface Implementation ---
     bool open() override;
     bool grabFrame(cv::Mat& frame) override;
+    FrameCaptureResult readFrame() override;
+    FrameCaptureResult captureSnapshot() override { return readFrame(); }
+    bool captureSingleSnapshot(cv::Mat& frame) override { frame.release(); return false; }
     void close() override;
     bool isOpened() const override;
     std::string getSourceName() const override;

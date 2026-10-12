@@ -257,8 +257,11 @@ cv::Mat GaugeReaderEngine::rectifyPerspective(const cv::Mat& src, const std::vec
     return rectified;
 }
 
-GaugeResult GaugeReaderEngine::process(const cv::Mat& frame, GaugeProfile& profile) {
+GaugeResult GaugeReaderEngine::process(const cv::Mat& frame, GaugeProfile& profile, GaugeRunMode mode) {
     GaugeResult res;
+    res.runMode = mode;
+    const bool debug = mode == GaugeRunMode::Debug;
+    const bool evidence = mode != GaugeRunMode::Production;
     res.unit = profile.unit;
 
     if (frame.empty()) {
@@ -269,8 +272,8 @@ GaugeResult GaugeReaderEngine::process(const cv::Mat& frame, GaugeProfile& profi
     }
 
     // Step 1: 原图 (Original Frame)
-    res.step1_original = frame.clone();
-    res.originalImage = res.step1_original;
+    if (evidence) res.step1_original = frame.clone();
+    if (debug) res.originalImage = res.step1_original;
 
     // Step 2: 视场矫正 (FOV Perspective Correction)
     cv::Mat workFrame = frame;
@@ -314,23 +317,25 @@ GaugeResult GaugeReaderEngine::process(const cv::Mat& frame, GaugeProfile& profi
         if (pts.size() == 4) {
             workFrame = rectifyPerspective(frame, pts, invH, profile.rectified_size, profile.rectified_margin);
         } else {
-            workFrame = frame.clone();
+            workFrame = frame;
         }
     } else {
-        workFrame = frame.clone();
+        workFrame = frame;
     }
 
-    res.step2_rectified = workFrame.clone();
-    res.rectifiedImage = res.step2_rectified;
+    if (evidence) res.step2_rectified = workFrame.clone();
+    if (debug) res.rectifiedImage = workFrame;
 
     // Step 3: 图像预处理 (Multi-Stage Anti-Glare & Pointer Recovery Preprocessing Pipeline)
     cv::Mat gray;
     if (workFrame.channels() == 3) {
         cv::cvtColor(workFrame, gray, cv::COLOR_BGR2GRAY);
     } else {
-        gray = workFrame.clone();
+        gray = workFrame;
     }
-    res.grayImage = gray.clone();
+    if (debug) res.grayImage = gray;
+    // The core stages also need the actual detector input in evidence mode.
+    if (evidence) cv::cvtColor(gray, res.step3_preprocessed, cv::COLOR_GRAY2BGR);
 
     cv::Mat claheGray;
     cv::Mat blurred;
@@ -339,7 +344,7 @@ GaugeResult GaugeReaderEngine::process(const cv::Mat& frame, GaugeProfile& profi
     cv::Mat adaptMask;
     cv::Mat threshCombined;
 
-    if (profile.enable_steps_4_to_9) {
+    if (debug && profile.enable_steps_4_to_9) {
         // 1. CLAHE (Contrast Limited Adaptive Histogram Equalization for Glare & Reflection Balancing)
         double clipLimit = profile.clahe_clip_limit > 0 ? profile.clahe_clip_limit : 2.5;
         int gridS = profile.clahe_grid_size > 0 ? profile.clahe_grid_size : 8;
@@ -399,7 +404,7 @@ GaugeResult GaugeReaderEngine::process(const cv::Mat& frame, GaugeProfile& profi
         cv::Mat threshBgr;
         cv::cvtColor(threshCombined, threshBgr, cv::COLOR_GRAY2BGR);
         res.step3_preprocessed = threshBgr;
-    } else {
+    } else if (debug) {
         // Fast path: skip heavy morphological filtering (Steps 4-9) to save execution time
         cv::cvtColor(gray, res.blurredImage, cv::COLOR_GRAY2BGR);
         res.step3_preprocessed = res.blurredImage.clone();
@@ -500,18 +505,18 @@ GaugeResult GaugeReaderEngine::process(const cv::Mat& frame, GaugeProfile& profi
 
     PointerDetector detector(cfg);
 
-    // Single-pass detection: perform detection directly and overlay markers onto rectified image canvas
-    cv::Mat rectOverlay = res.rectifiedImage.clone();
-    res.pointerDetectorResult = detector.detect(gray, cv::Point2d(res.center.x, res.center.y), &rectOverlay);
-    res.diagnosticHudImage = res.pointerDetectorResult.hudImage.clone();
-    res.diagnosticText = res.pointerDetectorResult.hudText;
-
-    // Fast diagnostic visualization for Step 3 & Step 11 using existing detection result (no redundant detect call!)
-    cv::Mat binaryVis;
-    detector.renderDebugVisualization(binaryVis, cv::Point2d(res.center.x, res.center.y), res.pointerDetectorResult);
-    res.needleBinaryImage = binaryVis.clone();
-    if (!binaryVis.empty()) {
-        res.step3_preprocessed = binaryVis;
+    // Detection is identical across modes. Visualizations are optional outputs.
+    cv::Mat rectOverlay;
+    if (evidence) rectOverlay = workFrame.clone();
+    res.pointerDetectorResult = detector.detect(gray, cv::Point2d(res.center.x, res.center.y),
+                                                debug ? &rectOverlay : nullptr);
+    if (debug) {
+        res.diagnosticHudImage = res.pointerDetectorResult.hudImage;
+        res.diagnosticText = res.pointerDetectorResult.hudText;
+        cv::Mat binaryVis;
+        detector.renderDebugVisualization(binaryVis, cv::Point2d(res.center.x, res.center.y), res.pointerDetectorResult);
+        res.needleBinaryImage = binaryVis;
+        if (!binaryVis.empty()) res.step3_preprocessed = binaryVis;
     }
 
     res.pointer_angle_deg = res.pointerDetectorResult.angle;
@@ -558,103 +563,107 @@ GaugeResult GaugeReaderEngine::process(const cv::Mat& frame, GaugeProfile& profi
     res.pointer_tip = cv::Point2f(res.center.x + tipR * static_cast<float>(std::cos(tipRad)),
                                   res.center.y + tipR * static_cast<float>(std::sin(tipRad)));
 
-    res.overlayImage = frame.clone();
-    drawOverlay(res.overlayImage, profile, res, invH);
-
-    cv::Mat emptyInvH;
-    drawOverlay(rectOverlay, profile, res, emptyInvH); // Draws reading result badge
-    res.step4_recognition = rectOverlay; // Step 4 contains clean thin diagnostic markers without HUD blocking the dial
-
-    // Build complete 12 intermediate steps container for inspection & tuning
-    res.intermediateSteps.clear();
+    if (debug) {
+        res.overlayImage = frame.clone();
+        drawOverlay(res.overlayImage, profile, res, invH);
+    }
+    if (evidence) {
+        cv::Mat emptyInvH;
+        drawOverlay(rectOverlay, profile, res, emptyInvH);
+        res.step4_recognition = rectOverlay;
+    }
 
     auto toBgrMat = [](const cv::Mat& m) -> cv::Mat {
         if (m.empty()) return cv::Mat();
-        if (m.channels() == 3) return m.clone();
+        if (m.channels() == 3) return m;
         cv::Mat out;
         cv::cvtColor(m, out, cv::COLOR_GRAY2BGR);
         return out;
     };
 
-    // 1. Step 1: 原始采集图像
-    res.intermediateSteps.push_back({
-        1,
-        "步骤 1: 原始采集图像 (Original Stream Frame)",
-        "摄像头/图像源采集到的未经任何处理的原始图像帧",
-        toBgrMat(res.step1_original)
-    });
-
-    // 2. Step 2: 4切点透视校正图
-    res.intermediateSteps.push_back({
-        2,
-        "步骤 2: 4切点视场透视矫正图 (FOV Rectified Image)",
-        "基于12点/3点/6点/9点4个切点透视变换提取正视圆形表盘",
-        toBgrMat(res.step2_rectified)
-    });
-
-    // 3. Step 3: 灰度化图像
-    res.intermediateSteps.push_back({
-        3,
-        "步骤 3: 灰度化图像 (Grayscale Image)",
-        "透视矫正图转8位单通道灰度图像",
-        toBgrMat(gray)
-    });
-
-    if (profile.enable_steps_4_to_9) {
-        // 4. Step 4: CLAHE 自适应对比度增强图
+    if (debug) {
+        // Build intermediate output only when requested.
+        // 1. Step 1: 原始采集图像
         res.intermediateSteps.push_back({
-            4,
-            "步骤 4: CLAHE 对比度增强图 (CLAHE Balanced)",
-            "限制对比度自适应直方图均衡化，消除局部阴影与光照不均",
-            toBgrMat(claheGray)
+            1,
+            "步骤 1: 原始采集图像 (Original Stream Frame)",
+            "摄像头/图像源采集到的未经任何处理的原始图像帧",
+            toBgrMat(res.step1_original)
         });
 
-        // 5. Step 5: 高斯平滑降噪图
+        // 2. Step 2: 4切点透视校正图
         res.intermediateSteps.push_back({
-            5,
-            "步骤 5: 高斯平滑降噪图 (Gaussian Blur)",
-            "7x7高斯核低通滤波，滤除高频高光噪点与噪波",
-            toBgrMat(blurred)
+            2,
+            "步骤 2: 4切点视场透视矫正图 (FOV Rectified Image)",
+            "基于12点/3点/6点/9点4个切点透视变换提取正视圆形表盘",
+            toBgrMat(res.step2_rectified)
         });
 
-        // 6. Step 6: 通道 A - Otsu 二值化图
+        // 3. Step 3: 灰度化图像
         res.intermediateSteps.push_back({
-            6,
-            "步骤 6: 通道 A - Otsu 二值化图 (Channel A: Otsu Threshold)",
-            "全局自适应 Otsu 阈值分割得到初步指针与刻度二值掩码",
-            toBgrMat(threshOtsu)
+            3,
+            "步骤 3: 灰度化图像 (Grayscale Image)",
+            "透视矫正图转8位单通道灰度图像",
+            toBgrMat(gray)
         });
 
-        // 7. Step 7: 通道 B - 黑帽形态学滤波图
-        res.intermediateSteps.push_back({
-            7,
-            "步骤 7: 通道 B - 黑帽形态学滤波图 (Channel B: Black-Hat Filter)",
-            "21x21椭圆核黑帽滤波提取细微深色指针特征，有效抑制反光",
-            toBgrMat(threshBlackHat)
-        });
+        if (profile.enable_steps_4_to_9) {
+            // 4. Step 4: CLAHE 自适应对比度增强图
+            res.intermediateSteps.push_back({
+                4,
+                "步骤 4: CLAHE 对比度增强图 (CLAHE Balanced)",
+                "限制对比度自适应直方图均衡化，消除局部阴影与光照不均",
+                toBgrMat(claheGray)
+            });
 
-        // 8. Step 8: 通道 C - 高梯度阴影鉴别掩码
-        res.intermediateSteps.push_back({
-            8,
-            "步骤 8: 通道 C - 阴影鉴别掩码 (Channel C: High-Gradient Mask)",
-            "Sobel梯度与局部背景差分掩码，精准区分物理指针边缘与漫反射软阴影",
-            toBgrMat(adaptMask)
-        });
+            // 5. Step 5: 高斯平滑降噪图
+            res.intermediateSteps.push_back({
+                5,
+                "步骤 5: 高斯平滑降噪图 (Gaussian Blur)",
+                "7x7高斯核低通滤波，滤除高频高光噪点与噪波",
+                toBgrMat(blurred)
+            });
 
-        // 9. Step 9: 多通道二值融合与微闭合二值图
-        res.intermediateSteps.push_back({
-            9,
-            "步骤 9: 多通道二值融合与微闭合二值图 (Multi-Channel Fused)",
-            "Otsu & 黑帽 & 梯度掩码与运算，配合3x3椭圆核微闭合修复小空洞",
-            toBgrMat(threshCombined)
-        });
-    }
+            // 6. Step 6: 通道 A - Otsu 二值化图
+            res.intermediateSteps.push_back({
+                6,
+                "步骤 6: 通道 A - Otsu 二值化图 (Channel A: Otsu Threshold)",
+                "全局自适应 Otsu 阈值分割得到初步指针与刻度二值掩码",
+                toBgrMat(threshOtsu)
+            });
+
+            // 7. Step 7: 通道 B - 黑帽形态学滤波图
+            res.intermediateSteps.push_back({
+                7,
+                "步骤 7: 通道 B - 黑帽形态学滤波图 (Channel B: Black-Hat Filter)",
+                "21x21椭圆核黑帽滤波提取细微深色指针特征，有效抑制反光",
+                toBgrMat(threshBlackHat)
+            });
+
+            // 8. Step 8: 通道 C - 高梯度阴影鉴别掩码
+            res.intermediateSteps.push_back({
+                8,
+                "步骤 8: 通道 C - 阴影鉴别掩码 (Channel C: High-Gradient Mask)",
+                "Sobel梯度与局部背景差分掩码，精准区分物理指针边缘与漫反射软阴影",
+                toBgrMat(adaptMask)
+            });
+
+            // 9. Step 9: 多通道二值融合与微闭合二值图
+            res.intermediateSteps.push_back({
+                9,
+                "步骤 9: 多通道二值融合与微闭合二值图 (Multi-Channel Fused)",
+                "Otsu & 黑帽 & 梯度掩码与运算，配合3x3椭圆核微闭合修复小空洞",
+                toBgrMat(threshCombined)
+            });
+        }
+
+    } // Debug-only intermediate steps 1-9.
 
     // 10. Step 10: 表盘圆心与旋转轴心定位图与二次防错校验
     cv::Mat hubVis;
     cv::Point2f autoCenter;
     float autoRadius{0.0f};
-    locateDialCircle(gray, autoCenter, autoRadius, &hubVis);
+    locateDialCircle(gray, autoCenter, autoRadius, debug ? &hubVis : nullptr);
 
     cv::Point2f expectedCenter(gray.cols * 0.5f, gray.rows * 0.5f);
     if (!profile.auto_detect_roi && profile.center.x > 0 && profile.center.y > 0 && !invH.empty()) {
@@ -684,38 +693,41 @@ GaugeResult GaugeReaderEngine::process(const cv::Mat& frame, GaugeProfile& profi
         }
     }
 
-    res.hubRoiImage = hubVis.clone();
+    if (debug) {
+        res.hubRoiImage = hubVis;
 
-    std::string step10Desc = "霍夫圆检测表盘外圈轮廓，并在中心 ROI 精准定位指针旋转轴心";
-    if (res.centerInconsistent) {
-        step10Desc += " 【⚠️ 防错提示：与标定中心偏差 " + std::to_string(static_cast<int>(centerOffsetDist)) + "px，高于阈值】";
-    }
+        std::string step10Desc = "霍夫圆检测表盘外圈轮廓，并在中心 ROI 精准定位指针旋转轴心";
+        if (res.centerInconsistent) {
+            step10Desc += " 【⚠️ 防错提示：与标定中心偏差 " + std::to_string(static_cast<int>(centerOffsetDist)) + "px，高于阈值】";
+        }
 
-    res.intermediateSteps.push_back({
-        10,
-        "步骤 10: 表盘圆心与旋转轴心定位图 (Dial & Hub Pin Location)",
-        step10Desc,
-        toBgrMat(hubVis)
-    });
+        res.intermediateSteps.push_back({
+            10,
+            "步骤 10: 表盘圆心与旋转轴心定位图 (Dial & Hub Pin Location)",
+            step10Desc,
+            toBgrMat(hubVis)
+        });
 
-    // 11. Step 11: 径向截面与轨迹指针检测二值图
-    res.intermediateSteps.push_back({
-        11,
-        "步骤 11: 径向截面与轨迹指针检测 (Radial Trajectory Visual)",
-        "PointerDetector 算法提取指针截面宽度、连续性与中心线轨迹",
-        toBgrMat(res.needleBinaryImage)
-    });
+        // 11. Step 11: 径向截面与轨迹指针检测二值图
+        res.intermediateSteps.push_back({
+            11,
+            "步骤 11: 径向截面与轨迹指针检测 (Radial Trajectory Visual)",
+            "PointerDetector 算法提取指针截面宽度、连续性与中心线轨迹",
+            toBgrMat(res.needleBinaryImage)
+        });
 
-    // 12. Step 12: 最终仪表读数识别叠加图
-    res.intermediateSteps.push_back({
-        12,
-        "步骤 12: 最终识别读数叠加图 (Final Recognition Overlay)",
-        "绘制指针轴线、终点、刻度射线、截面分布图与 Top-Right 读数面板",
-        toBgrMat(res.step4_recognition)
-    });
+        // 12. Step 12: 最终仪表读数识别叠加图
+        res.intermediateSteps.push_back({
+            12,
+            "步骤 12: 最终识别读数叠加图 (Final Recognition Overlay)",
+            "绘制指针轴线、终点、刻度射线、截面分布图与 Top-Right 读数面板",
+            toBgrMat(res.step4_recognition)
+        });
+
+    } // Debug-only intermediate steps 10-12.
 
     // Save step photo outputs to files only if explicitly enabled in profile (avoids ~1000ms disk I/O lag)
-    if (profile.save_debug_images) {
+    if (debug && profile.save_debug_images) {
         std::filesystem::create_directories("debug_steps");
 
         if (!res.step1_original.empty()) cv::imwrite("step1_original.png", res.step1_original);
@@ -810,6 +822,56 @@ void GaugeReaderEngine::drawOverlay(cv::Mat& canvas, const GaugeProfile& profile
     cv::circle(canvas, drawCenter, 4, cv::Scalar(0, 0, 255), -1);
     cv::line(canvas, drawCenter, drawTip, cv::Scalar(0, 0, 255), 1, cv::LINE_AA);
     cv::circle(canvas, drawTip, 4, cv::Scalar(0, 255, 255), -1, cv::LINE_AA);
+
+    // Use measured edge coordinates, transforming them with the overlay when
+    // drawing on the original frame. Do not connect across invalid sections.
+    auto overlayPoint = [&](const cv::Point2d& point) {
+        std::vector<cv::Point2f> points = {cv::Point2f(static_cast<float>(point.x), static_cast<float>(point.y))};
+        if (!invH.empty()) cv::perspectiveTransform(points, points, invH);
+        return cv::Point(cvRound(points[0].x), cvRound(points[0].y));
+    };
+    auto drawMeasuredSections = [&](const std::vector<RadialSection>& sections, const char* labelPrefix) {
+        cv::Point previousLeft, previousRight;
+        bool previousValid = false;
+        double lastWidthRadius = -1e6;
+        for (const auto& section : sections) {
+            if (!section.valid) {
+                previousValid = false;
+                continue;
+            }
+            const cv::Point left = overlayPoint(section.leftPoint);
+            const cv::Point right = overlayPoint(section.rightPoint);
+            if (previousValid) {
+                cv::line(canvas, previousLeft, left, cv::Scalar(255, 255, 0), 1, cv::LINE_AA);
+                cv::line(canvas, previousRight, right, cv::Scalar(255, 0, 255), 1, cv::LINE_AA);
+            }
+            if (section.radius - lastWidthRadius >= 12.0) {
+                cv::line(canvas, left, right, cv::Scalar(0, 255, 0), 1, cv::LINE_AA);
+                lastWidthRadius = section.radius;
+            }
+            cv::circle(canvas, left, 1, cv::Scalar(255, 255, 0), -1, cv::LINE_AA);
+            cv::circle(canvas, right, 1, cv::Scalar(255, 0, 255), -1, cv::LINE_AA);
+            previousLeft = left;
+            previousRight = right;
+            previousValid = true;
+        }
+        double lastLabelRadius = -1e6;
+        for (const auto& section : sections) {
+            if (!section.valid || section.radius - lastLabelRadius < 60.0) continue;
+            char widthText[48];
+            snprintf(widthText, sizeof(widthText), "%sw=%.1f px", labelPrefix, section.width);
+            const cv::Point label = overlayPoint(section.rightPoint) + cv::Point(8, -5);
+            cv::putText(canvas, widthText, label, cv::FONT_HERSHEY_SIMPLEX, 0.35,
+                        cv::Scalar(0, 0, 0), 3, cv::LINE_AA);
+            cv::putText(canvas, widthText, label, cv::FONT_HERSHEY_SIMPLEX, 0.35,
+                        cv::Scalar(0, 255, 0), 1, cv::LINE_AA);
+            lastLabelRadius = section.radius;
+        }
+        };
+    drawMeasuredSections(res.pointerDetectorResult.sections, "");
+    if (res.pointerDetectorResult.tailDetected) {
+        drawMeasuredSections(res.pointerDetectorResult.tailProfile.sections, "tail ");
+    }
 
     // 2. Draw Zero & Max Scale Rays - Thin Lines (1 px)
     double minRad = profile.min_angle_deg * M_PI / 180.0;

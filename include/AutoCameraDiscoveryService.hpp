@@ -8,6 +8,7 @@
 #include <QString>
 #include <QList>
 #include <memory>
+#include <QFuture>
 #include "ICameraSource.hpp"
 #include "GB28181StreamManager.hpp"
 #include "ONVIFDeviceManager.hpp"
@@ -96,6 +97,7 @@ private:
     QMutex m_mutex;
     bool m_isScanning{false};
     QList<DiscoveredCameraItem> m_knownCameras;
+    QFuture<void> m_scanFuture;
 };
 
 #endif // AUTO_CAMERA_DISCOVERY_SERVICE_HPP

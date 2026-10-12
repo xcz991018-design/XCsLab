@@ -4,6 +4,29 @@
 #include <opencv2/opencv.hpp>
 #include <string>
 #include <memory>
+#include <chrono>
+
+enum class CaptureFailure { None, NotOpen, OpenFailed, ReadFailed, NoFrame, StaleFrame, UnsupportedProtocol, InvalidInput };
+inline const char* captureFailureName(CaptureFailure error) {
+    switch (error) {
+    case CaptureFailure::None: return "OK";
+    case CaptureFailure::NotOpen: return "NOT_OPEN";
+    case CaptureFailure::OpenFailed: return "OPEN_FAILED";
+    case CaptureFailure::ReadFailed: return "READ_FAILED";
+    case CaptureFailure::NoFrame: return "NO_FRAME";
+    case CaptureFailure::StaleFrame: return "STALE_FRAME";
+    case CaptureFailure::UnsupportedProtocol: return "UNSUPPORTED_PROTOCOL";
+    case CaptureFailure::InvalidInput: return "INVALID_INPUT";
+    }
+    return "INVALID_INPUT";
+}
+struct FrameCaptureResult {
+    cv::Mat frame;
+    CaptureFailure failure{CaptureFailure::None};
+    std::string message;
+    std::chrono::system_clock::time_point capturedAt;
+    bool ok() const { return failure == CaptureFailure::None && !frame.empty(); }
+};
 
 /**
  * @brief Camera Protocol Classification Enum.
@@ -59,6 +82,7 @@ public:
      * @return true if snapshot acquired successfully.
      */
     virtual bool captureSingleSnapshot(cv::Mat& frame) {
+        frame.release();
         if (!isOpened()) {
             if (!open()) return false;
             bool ok = grabFrame(frame);
@@ -66,6 +90,24 @@ public:
             return ok;
         }
         return grabFrame(frame);
+    }
+
+    // Typed acquisition returns only real image data; diagnostic text belongs to UI.
+    virtual FrameCaptureResult readFrame() {
+        FrameCaptureResult result;
+        if (!isOpened()) { result.failure = CaptureFailure::NotOpen; return result; }
+        if (!grabFrame(result.frame)) { result.frame.release(); result.failure = CaptureFailure::ReadFailed; }
+        else if (result.frame.empty()) result.failure = CaptureFailure::NoFrame;
+        else result.capturedAt = std::chrono::system_clock::now();
+        return result;
+    }
+    virtual FrameCaptureResult captureSnapshot() {
+        FrameCaptureResult result;
+        const bool alreadyOpen = isOpened();
+        if (!alreadyOpen && !open()) { result.failure = CaptureFailure::OpenFailed; return result; }
+        result = readFrame();
+        if (!alreadyOpen) close();
+        return result;
     }
 
     /**

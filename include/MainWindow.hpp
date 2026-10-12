@@ -27,6 +27,8 @@
 #include <QtConcurrent/QtConcurrent>
 #include <opencv2/opencv.hpp>
 #include "GaugeReaderEngine.hpp"
+#include "InspectionService.hpp"
+#include "CameraPreviewService.hpp"
 #include "GaugeProfile.hpp"
 #include "GB28181StreamManager.hpp"
 #include "ONVIFDeviceManager.hpp"
@@ -37,6 +39,9 @@
  * @brief Standalone Inspection & Reading Record Descriptor.
  */
 struct InspectionRecord {
+    QString taskId;
+    DiscoveredCameraItem device;
+    QDateTime capturedAt;
     QString cameraId;
     QString customName;
     QString locationInfo;
@@ -52,6 +57,7 @@ struct InspectionRecord {
     cv::Mat step2_rectified;
     cv::Mat step4_recognition;
     QString step2Path;
+    QString originalPath;
     QString step4Path;
     QString diagnosticText;
 };
@@ -61,7 +67,7 @@ class MainWindow : public QMainWindow {
 
 public:
     explicit MainWindow(QWidget *parent = nullptr);
-    ~MainWindow() override = default;
+    ~MainWindow() override;
 
 protected:
     void closeEvent(QCloseEvent *event) override;
@@ -102,11 +108,13 @@ private slots:
     void onCaptureAndRecognizeCurrent();
     void onStartAllDevicesInspection();
     void onStopAllDevicesInspection();
-    void onPatrolNextDevice();
+    void onInspectionOutcome(const InspectionOutcome& outcome);
     void onExportPatrolReport();
     void onInspectionTableItemDoubleClicked(int row, int column);
 
 private:
+    InspectionTask makeSingleTask() const;
+    void submitSingleTask(InspectionTask task);
     void setupUi();
     void createTopBanner(QVBoxLayout *rootLayout);
     QWidget* createLeftSidebar(QWidget *parent);
@@ -148,6 +156,7 @@ private:
     QPushButton *m_snapAndRunBtn{nullptr};
     QPushButton *m_batchPatrolBtn{nullptr};
     QCheckBox *m_enableSteps4To9Check{nullptr};
+    QComboBox *m_runModeCombo{nullptr};
     QPushButton *m_runBtn{nullptr};
     QPushButton *m_exportStepsBtn{nullptr};
 
@@ -205,22 +214,28 @@ private:
     QTextEdit *m_diagnosticTextEdit{nullptr};
 
     // Core Managers & Engines (GB28181 & ONVIF encapsulated in backend)
-    GaugeReaderEngine m_engine;
     GaugeProfile m_profile;
     GaugeResult m_latestResult;
     cv::Mat m_currentFrame;
     QString m_currentImagePath;
     QString m_currentConfigPath;
-    QFutureWatcher<GaugeResult> m_watcher;
+    InspectionService* m_singleService{nullptr};
+    CameraPreviewService* m_previewService{nullptr};
+    InspectionTask m_singleSubmittedTask;
+    InspectionTask m_analysisInput;
+    InspectionTask m_snapshotInput;
+    bool m_hasAnalysisInput{false};
+    bool m_hasSnapshotInput{false};
+    bool m_registryLoaded{false};
+    QFutureWatcher<bool>* m_registryWatcher{nullptr};
+    QTimer* m_databaseSyncTimer{nullptr};
+    QLabel* m_databaseStatusLabel{nullptr};
     std::chrono::high_resolution_clock::time_point m_startTime;
 
     // Backend Services
-    GB28181StreamManagerPtr m_gbManager;
-    ONVIFDeviceManagerPtr m_onvifManager;
     AutoCameraDiscoveryService *m_discoveryService{nullptr};
     
     // Active Camera Source
-    CameraSourcePtr m_activeCameraSource{nullptr};
     QMap<QString, DiscoveredCameraItem> m_discoveredItemsMap;
 
     // Stage 6: 全站设备巡检读数总览 (Batch Patrol Inspection Matrix)
@@ -232,6 +247,7 @@ private:
     QPushButton *m_exportReportBtn{nullptr};
     QCheckBox *m_autoPatrolCheck{nullptr};
     QTimer *m_autoPatrolTimer{nullptr};
+    InspectionService* m_inspectionService{nullptr};
     bool m_isPatrolRunning{false};
     int m_patrolCurrentIndex{0};
     QStringList m_patrolCameraIdQueue;

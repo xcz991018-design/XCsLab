@@ -1,4 +1,8 @@
 #include "DeviceConfigManager.hpp"
+#include "DeviceCodec.hpp"
+#include "MySqlRepository.hpp"
+#include <QtConcurrent/QtConcurrent>
+#include <QSaveFile>
 #include <QFile>
 #include <QFileInfo>
 #include <QDir>
@@ -8,26 +12,7 @@
 #include <QDateTime>
 #include <QCoreApplication>
 #include <QDebug>
-
-static QString protocolToString(CameraProtocolType type) {
-    switch (type) {
-        case CameraProtocolType::LOCAL_FILE: return "LOCAL_FILE";
-        case CameraProtocolType::ONVIF_RTSP_STREAM: return "ONVIF_RTSP_STREAM";
-        case CameraProtocolType::SDK_JLINK: return "SDK_JLINK";
-        case CameraProtocolType::GB28181_PS_STREAM: return "GB28181_PS_STREAM";
-        case CameraProtocolType::CUSTOM_SDK: return "CUSTOM_SDK";
-        default: return "LOCAL_FILE";
-    }
-}
-
-static CameraProtocolType stringToProtocol(const QString& str) {
-    QString s = str.trimmed().toUpper();
-    if (s == "ONVIF_RTSP_STREAM" || s == "ONVIF") return CameraProtocolType::ONVIF_RTSP_STREAM;
-    if (s == "SDK_JLINK" || s == "JLINK" || s == "XIONGMAI") return CameraProtocolType::SDK_JLINK;
-    if (s == "GB28181_PS_STREAM" || s == "GB28181") return CameraProtocolType::GB28181_PS_STREAM;
-    if (s == "CUSTOM_SDK") return CameraProtocolType::CUSTOM_SDK;
-    return CameraProtocolType::LOCAL_FILE;
-}
+#include <QUrl>
 
 DeviceConfigManager& DeviceConfigManager::instance() {
     static DeviceConfigManager inst;
@@ -35,7 +20,20 @@ DeviceConfigManager& DeviceConfigManager::instance() {
 }
 
 DeviceConfigManager::DeviceConfigManager() {
+    m_databasePool.setMaxThreadCount(1);
     m_currentFilePath = resolveConfigPath();
+}
+
+DeviceConfigManager::~DeviceConfigManager() { waitForDatabaseWrites(); }
+void DeviceConfigManager::waitForDatabaseWrites() { m_databasePool.waitForDone(); }
+QString DeviceConfigManager::lastError() const { QMutexLocker lock(&m_mutex); return m_lastError; }
+void DeviceConfigManager::retryDatabaseSync() {
+    if (!DatabaseSettings::fromEnvironment().enabled || m_databaseFuture.isRunning()) return;
+    m_databaseFuture = QtConcurrent::run(&m_databasePool, [this]() {
+        const auto error = MySqlRepository::retryPending(QString());
+        { QMutexLocker lock(&m_mutex); m_lastError = error; }
+        emit databaseStatus(error);
+    });
 }
 
 QString DeviceConfigManager::resolveConfigPath(const QString& preferredPath) {
@@ -121,15 +119,51 @@ bool DeviceConfigManager::load(const QString& configPath) {
     m_currentFilePath = path;
 
     QFile file(path);
-    if (!file.open(QIODevice::ReadOnly)) {
+    const bool hasLocal = file.open(QIODevice::ReadOnly);
+    const auto localData = hasLocal ? file.readAll() : QByteArray();
+    file.close();
+    QByteArray data = localData;
+    if (DatabaseSettings::fromEnvironment().enabled) {
+        try {
+            // Do not overwrite a newer local pending archive with an older DB snapshot.
+            const auto syncError = MySqlRepository::retryPending(QString());
+            if (!syncError.isEmpty()) throw std::runtime_error(syncError.toUtf8().constData());
+            MySqlRepository repository;
+            auto root = repository.loadRegistry();
+            const bool neverInitialized = !root.contains("system");
+            if (neverInitialized) {
+                auto local = QJsonDocument::fromJson(localData);
+                if (!local.isObject()) throw std::runtime_error("MYSQL_EMPTY_REGISTRY_REQUIRES_EXPLICIT_LOCAL_IMPORT");
+                repository.saveRegistry(MySqlRepository::sanitizedRegistry(local.object()));
+                root = repository.loadRegistry();
+            }
+            // Passwords stay in the existing local credential file, matched by camera ID.
+            QMap<QString, QJsonObject> credentials;
+            for (const auto& value : QJsonDocument::fromJson(localData).object()["devices"].toArray()) {
+                auto device = value.toObject(); credentials.insert(device["camera_id"].toString(), device);
+            }
+            QJsonArray devices;
+            for (const auto& value : root["devices"].toArray()) {
+                auto device = value.toObject(); const auto local = credentials.value(device["camera_id"].toString());
+                device["password"] = local["password"];
+                const QUrl localUri(local["rtsp_url"].toString());
+                if (!localUri.userName().isEmpty()) device["username"] = localUri.userName();
+                if (!localUri.password().isEmpty()) device["password"] = localUri.password();
+                devices.append(device);
+            }
+            root["devices"] = devices;
+            data = QJsonDocument(root).toJson();
+            m_lastError.clear();
+        } catch (const std::exception& e) {
+            m_lastError = QString::fromUtf8(e.what());
+            return false; // Never manufacture demo devices after a DB failure.
+        }
+    } else if (!hasLocal) {
         populateDefaultsIfEmpty();
         locker.unlock();
         save(path);
         return true;
     }
-
-    QByteArray data = file.readAll();
-    file.close();
 
     QJsonDocument doc = QJsonDocument::fromJson(data);
     if (!doc.isObject()) {
@@ -151,55 +185,13 @@ bool DeviceConfigManager::load(const QString& configPath) {
         if (!v.isObject()) continue;
         QJsonObject obj = v.toObject();
 
-        DiscoveredCameraItem item;
-        item.cameraId = obj.value("camera_id").toString();
+        auto item = deviceFromJson(obj);
         if (item.cameraId.isEmpty()) continue;
-
-        item.customName = obj.value("custom_name").toString();
-        item.ipOrSn = obj.value("ip_or_sn").toString();
-        item.protocolType = stringToProtocol(obj.value("protocol_type").toString());
-        item.protocolName = obj.value("protocol_name").toString("IP Camera");
-        item.modelName = obj.value("model_name").toString("Network Camera");
-        item.port = obj.value("port").toInt(80);
-        item.rtspPort = obj.value("rtsp_port").toInt(554);
-        item.rtspUrl = obj.value("rtsp_url").toString();
-        item.username = obj.value("username").toString("");
-        item.password = obj.value("password").toString("");
-        item.defaultProfileId = obj.value("default_profile_id").toString("PRESSURE_GAUGE_1.6MPA");
-        item.isAutoConnect = obj.value("is_auto_connect").toBool(false);
-        item.isOnline = obj.value("is_online").toBool(true);
-        item.lastSeenTime = obj.value("last_seen_time").toString();
-
-        // Asset & Physical Installation Metadata (no fake defaults, strictly read from configuration)
-        item.substation = obj.value("substation").toString("").trimmed();
-        item.area = obj.value("area").toString("").trimmed();
-        item.installationLocation = obj.value("installation_location").toString(obj.value("location").toString("")).trimmed();
-        item.deviceTag = obj.value("device_tag").toString("").trimmed();
-        item.gaugeType = obj.value("gauge_type").toString("").trimmed();
-        item.manufacturer = obj.value("manufacturer").toString("").trimmed();
-        item.accuracyClass = obj.value("accuracy_class").toString("").trimmed();
-
-        // Load Calibration Parameters (supports direct fields or calibration sub-object)
-        QJsonObject calObj = obj.contains("calibration") ? obj["calibration"].toObject() : obj;
-        item.perspectiveEnabled = calObj.value("perspective_correction_enabled").toBool(true);
-        item.calibratedWidth = calObj.value("calibrated_width").toInt(800);
-        item.calibratedHeight = calObj.value("calibrated_height").toInt(448);
-        item.pt0_x = calObj.value("pt_0_x").toDouble(404.444);
-        item.pt0_y = calObj.value("pt_0_y").toDouble(19.2593);
-        item.pt1_x = calObj.value("pt_1_x").toDouble(644.444);
-        item.pt1_y = calObj.value("pt_1_y").toDouble(306.667);
-        item.pt2_x = calObj.value("pt_2_x").toDouble(392.593);
-        item.pt2_y = calObj.value("pt_2_y").toDouble(408.889);
-        item.pt3_x = calObj.value("pt_3_x").toDouble(139.259);
-        item.pt3_y = calObj.value("pt_3_y").toDouble(339.259);
-        item.centerX = calObj.value("center_x").toDouble(407.407);
-        item.centerY = calObj.value("center_y").toDouble(327.407);
-        item.pointerBaseRadius = calObj.value("pointer_base_radius").toDouble(calObj.value("radius").toDouble(47.0));
 
         m_devices.insert(item.cameraId, item);
     }
 
-    if (m_devices.isEmpty()) {
+    if (m_devices.isEmpty() && !DatabaseSettings::fromEnvironment().enabled) {
         populateDefaultsIfEmpty();
     }
 
@@ -238,63 +230,33 @@ bool DeviceConfigManager::save(const QString& configPath) {
 
     QJsonArray devArr;
     for (const auto& item : m_devices) {
-        QJsonObject obj;
-        obj["camera_id"] = item.cameraId;
-        obj["custom_name"] = item.customName;
-        obj["ip_or_sn"] = item.ipOrSn;
-        obj["protocol_type"] = protocolToString(item.protocolType);
-        obj["protocol_name"] = item.protocolName;
-        obj["model_name"] = item.modelName;
-        obj["port"] = item.port;
-        obj["rtsp_port"] = item.rtspPort;
-        obj["rtsp_url"] = item.rtspUrl;
-        obj["username"] = item.username;
-        obj["password"] = item.password;
-        obj["default_profile_id"] = item.defaultProfileId;
-        obj["is_auto_connect"] = item.isAutoConnect;
-        obj["is_online"] = item.isOnline;
-        obj["last_seen_time"] = item.lastSeenTime;
-
-        // Asset & Physical Installation Metadata
-        obj["substation"] = item.substation;
-        obj["area"] = item.area;
-        obj["installation_location"] = item.installationLocation;
-        obj["device_tag"] = item.deviceTag;
-        obj["gauge_type"] = item.gaugeType;
-        obj["manufacturer"] = item.manufacturer;
-        obj["accuracy_class"] = item.accuracyClass;
-
-        // Calibration Sub-Object
-        QJsonObject calObj;
-        calObj["perspective_correction_enabled"] = item.perspectiveEnabled;
-        calObj["calibrated_width"] = item.calibratedWidth;
-        calObj["calibrated_height"] = item.calibratedHeight;
-        calObj["pt_0_x"] = item.pt0_x;
-        calObj["pt_0_y"] = item.pt0_y;
-        calObj["pt_1_x"] = item.pt1_x;
-        calObj["pt_1_y"] = item.pt1_y;
-        calObj["pt_2_x"] = item.pt2_x;
-        calObj["pt_2_y"] = item.pt2_y;
-        calObj["pt_3_x"] = item.pt3_x;
-        calObj["pt_3_y"] = item.pt3_y;
-        calObj["center_x"] = item.centerX;
-        calObj["center_y"] = item.centerY;
-        calObj["pointer_base_radius"] = item.pointerBaseRadius;
-        obj["calibration"] = calObj;
-
+        QJsonObject obj = deviceToJson(item, true);
         devArr.append(obj);
     }
     root["devices"] = devArr;
 
-    QFile file(path);
-    if (!file.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
+    QSaveFile file(path);
+    if (!file.open(QIODevice::WriteOnly)) {
         qWarning() << "[DeviceConfigManager] Failed to write device registry to:" << path;
         return false;
     }
 
     QJsonDocument doc(root);
-    file.write(doc.toJson(QJsonDocument::Indented));
-    file.close();
+    const auto bytes = doc.toJson(QJsonDocument::Indented);
+    if (file.write(bytes) != bytes.size() || !file.commit()) return false;
+    if (DatabaseSettings::fromEnvironment().enabled) {
+        try {
+            MySqlRepository::queueRegistry(root);
+        } catch (const std::exception& e) {
+            m_lastError = QString::fromUtf8(e.what());
+            emit databaseStatus(m_lastError);
+            return false;
+        }
+        locker.unlock();
+        retryDatabaseSync();
+        // Database mode uses this one file as the local credential cache only.
+        return true;
+    }
 
     // Synchronize to workspace devices.json copies if running from build directory
     QStringList syncCandidates = {

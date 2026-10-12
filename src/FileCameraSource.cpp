@@ -49,6 +49,7 @@ bool FileCameraSource::open() {
 }
 
 bool FileCameraSource::grabFrame(cv::Mat& frame) {
+    frame.release();
     if (!m_isOpen) return false;
 
     if (!m_isList) {

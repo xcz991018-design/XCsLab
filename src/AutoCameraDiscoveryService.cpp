@@ -16,6 +16,7 @@ AutoCameraDiscoveryService::AutoCameraDiscoveryService(QObject *parent)
 
 AutoCameraDiscoveryService::~AutoCameraDiscoveryService() {
     stopAutoScan();
+    m_scanFuture.waitForFinished();
 }
 
 void AutoCameraDiscoveryService::startAutoScan(int intervalMs) {
@@ -44,7 +45,7 @@ void AutoCameraDiscoveryService::triggerScanNow() {
 
     emit logGenerated(tr("[AUTO-DISCOVERY] Broadcasting ONVIF WS-Discovery Probe & GB28181 Catalog Query packets..."));
 
-    QtConcurrent::run([this]() {
+    m_scanFuture = QtConcurrent::run([this]() {
         executeDiscoveryProcess();
 
         QMutexLocker locker(&m_mutex);

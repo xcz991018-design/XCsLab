@@ -1,0 +1,57 @@
+#pragma once
+#include "InspectionService.hpp"
+#include <QJsonObject>
+#include <QByteArray>
+
+struct DatabaseSettings {
+    bool enabled{true};
+    QString host{QStringLiteral("127.0.0.1")};
+    QString database{QStringLiteral("BYS_GaugeReaderDB")};
+    QString user{QStringLiteral("root")};
+    QString password;
+    unsigned int port{3306};
+    QString tlsMode{QStringLiteral("required")};
+    QString caFile;
+    QString configurationError;
+    int maxImageBytes{32 * 1024 * 1024};
+    static DatabaseSettings fromEnvironment();
+};
+struct StoredInspection {
+    QString taskId, cameraId, parentTaskId, unit, errorCode, errorMessage;
+    QString inputKind, qualityStatus, processStatus;
+    QDateTime capturedAt, processedAt;
+    double value{0}, confidence{0};
+    bool success{false}, recognitionPerformed{false}, hasOriginal{false};
+    DiscoveredCameraItem device;
+    QJsonObject profile;
+    QJsonObject latestReview;
+};
+struct StoredImage {
+    QByteArray bytes;
+    QString sha256;
+    int width{0}, height{0};
+    StoredInspection inspection;
+};
+// Blocking repository: callers must run on a worker. Connections never cross threads.
+class MySqlRepository {
+public:
+    explicit MySqlRepository(DatabaseSettings settings = DatabaseSettings::fromEnvironment());
+    void checkConnection() const;
+    QString testConnection() const;
+    QJsonObject loadRegistry() const;
+    void saveRegistry(const QJsonObject& registry) const;
+    void saveInspection(const QJsonObject& envelope) const;
+    QList<StoredInspection> history(const QString& cameraId, const QDateTime& from,
+                                  const QDateTime& until, int page, int pageSize = 50) const;
+    StoredImage original(const QString& taskId) const;
+    void addReview(const QString& taskId, const QString& reviewer, const QString& decision,
+                   const QString& correctedValue, const QString& comment) const;
+    static QJsonObject inspectionEnvelope(const InspectionTask&, const InspectionOutcome&);
+    static QString queueInspection(const QJsonObject& envelope, const QString& directory);
+    static QString queueRegistry(const QJsonObject& registry);
+    static QJsonObject sanitizedRegistry(QJsonObject registry);
+    static QString retryPending(const QString& evidenceDirectory, int limit = 20);
+    static QString registryQueueDirectory();
+private:
+    DatabaseSettings m_settings;
+};

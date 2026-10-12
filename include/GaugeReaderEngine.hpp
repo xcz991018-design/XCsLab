@@ -17,7 +17,19 @@ struct ProcessingStepImage {
     cv::Mat image;           // Intermediate Mat image
 };
 
+enum class GaugeRunMode { Production, Evidence, Debug };
+
+inline const char* gaugeRunModeName(GaugeRunMode mode) {
+    switch (mode) {
+    case GaugeRunMode::Production: return "production";
+    case GaugeRunMode::Evidence: return "evidence";
+    case GaugeRunMode::Debug: return "debug";
+    }
+    return "production";
+}
+
 struct GaugeResult {
+    GaugeRunMode runMode{GaugeRunMode::Debug};
     bool success{false};
     double value{0.0};
     std::string unit{"MPa"};
@@ -71,7 +83,8 @@ public:
     /**
      * @brief Process an input gauge frame (4 steps: Original -> FOV Correction -> Preprocessing -> Recognition).
      */
-    GaugeResult process(const cv::Mat& frame, GaugeProfile& profile);
+    GaugeResult process(const cv::Mat& frame, GaugeProfile& profile,
+                        GaugeRunMode mode = GaugeRunMode::Debug);
 
     /**
      * @brief Rectify perspective distortion using 4 cardinal tangent points (12H Top, 3H Right, 6H Bottom, 9H Left).
