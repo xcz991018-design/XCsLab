@@ -14,12 +14,14 @@
 #include <QString>
 #include <QStringList>
 #include "AutoCameraDiscoveryService.hpp"
+#include "GaugeTemplateRecord.hpp"
 
 class CameraInfoEditDialog : public QDialog {
     Q_OBJECT
 
 public:
-    CameraInfoEditDialog(const QString& configPath, const QString& cameraId, QWidget *parent = nullptr, bool isNewDevice = false);
+    CameraInfoEditDialog(const QString& cameraId, QWidget *parent = nullptr, bool isNewDevice = false,
+                         GaugeTemplateBackend backend = {});
     ~CameraInfoEditDialog() override = default;
 
     QString getUpdatedCameraId() const;
@@ -32,9 +34,13 @@ private:
     void setupUi();
     void loadCameraInfo();
     bool saveCameraInfo();
-    QStringList loadAvailableProfiles();
+    void refreshProfiles(const QString& selected = QString());
 
-    QString m_configPath;
+    GaugeTemplateBackend m_templateBackend;
+    QStringList m_availableProfileIds;
+    quint64 m_templateGeneration{0};
+    bool m_templatesLoading{false};
+    QLabel* m_templateStatus{nullptr};
     QString m_originalCameraId;
     bool m_isNewDevice{false};
 
@@ -46,6 +52,8 @@ private:
     QSpinBox *m_portSpin{nullptr};
     QSpinBox *m_rtspPortSpin{nullptr};
     QLineEdit *m_rtspUrlEdit{nullptr};
+    QLineEdit *m_usernameEdit{nullptr};
+    QLineEdit *m_passwordEdit{nullptr};
     QCheckBox *m_autoConnectCheck{nullptr};
 
     // Gauge Profile & Location Parameters

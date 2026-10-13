@@ -1,4 +1,4 @@
-﻿#ifndef GAUGE_READER_ENGINE_HPP
+#ifndef GAUGE_READER_ENGINE_HPP
 #define GAUGE_READER_ENGINE_HPP
 
 #include "GaugeProfile.hpp"
@@ -6,16 +6,6 @@
 #include <opencv2/opencv.hpp>
 #include <string>
 #include <vector>
-
-/**
- * @brief Detailed intermediate processing step image metadata and image container.
- */
-struct ProcessingStepImage {
-    int stepNumber{0};
-    std::string title;       // e.g. "步骤 5: 高斯平滑降噪 (Gaussian Blur)"
-    std::string description; // e.g. "7x7高斯核滤波，消除高频高光噪声与锯齿"
-    cv::Mat image;           // Intermediate Mat image
-};
 
 enum class GaugeRunMode { Production, Evidence, Debug };
 
@@ -42,30 +32,24 @@ struct GaugeResult {
     // PointerDetector detailed detection result & trajectory metrics
     PointerResult pointerDetectorResult;
 
-    // 4 Main Pipeline Stage Images (原图 - 矫正 - 图像预处理 - 识别)
+    // 4 Main Pipeline Stage Images (原图 - 矫正 - 灰度图 - 识别)
     cv::Mat step1_original;       // Step 1: Raw input original frame
     cv::Mat step2_rectified;      // Step 2: Rectified front-view dial image
-    cv::Mat step3_preprocessed;   // Step 3: Preprocessed (Grayscale, Gaussian Blur & Edge/Threshold) image
+    cv::Mat step3_gray;   // Step 3: Actual grayscale detector input (BGR for display)
     cv::Mat step4_recognition;    // Step 4: Final recognition overlay result image
 
     // Detailed Stage Visualization Images (for internal analysis)
     cv::Mat originalImage;       // Stage 1
     cv::Mat rectifiedImage;      // Stage 2
     cv::Mat grayImage;           // Stage 3
-    cv::Mat blurredImage;        // Stage 3
-    cv::Mat hubRoiImage;         // Stage 4 helper
-    cv::Mat needleBinaryImage;   // Stage 4 helper
     cv::Mat overlayImage;        // Stage 4
-
-    // Complete Step-by-Step Processing Images for visual inspection & tuning
-    std::vector<ProcessingStepImage> intermediateSteps;
 
     // Fail-Safe Secondary Check Metrics (防错位二次检测指标)
     bool centerInconsistent{false};
     double centerOffsetDist{0.0};
     std::string warningMessage;
 
-    // Step 12 Separate Diagnostic Window Output
+    // Pointer detection diagnostic Window Output
     cv::Mat diagnosticHudImage;
     std::string diagnosticText;
 
@@ -73,6 +57,7 @@ struct GaugeResult {
     std::string errorStep;               // Pipeline step where error occurred
     std::string detailedDebugInfo;       // Detailed debug diagnostic text
     double confidence{0.0};
+    QJsonObject recognitionQuality; // Advisory; never changes success/value/confidence.
 };
 
 class GaugeReaderEngine {
@@ -81,7 +66,7 @@ public:
     ~GaugeReaderEngine() = default;
 
     /**
-     * @brief Process an input gauge frame (4 steps: Original -> FOV Correction -> Preprocessing -> Recognition).
+     * @brief Process an input gauge frame (4 steps: Original -> FOV Correction -> Grayscale -> Recognition).
      */
     GaugeResult process(const cv::Mat& frame, GaugeProfile& profile,
                         GaugeRunMode mode = GaugeRunMode::Debug);
@@ -99,7 +84,7 @@ public:
     /**
      * @brief Locate circular dial ROI in the image.
      */
-    static bool locateDialCircle(const cv::Mat& gray, cv::Point2f& center, float& radius, cv::Mat* outHubVis = nullptr);
+    static bool locateDialCircle(const cv::Mat& gray, cv::Point2f& center, float& radius);
 
     /**
      * @brief Detect pointer angle within valid scale angular range.

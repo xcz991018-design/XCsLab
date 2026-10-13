@@ -1,4 +1,5 @@
 #include "GaugeReaderEngine.hpp"
+#include "RecognitionQuality.hpp"
 #include <cmath>
 #include <iostream>
 #include <numeric>
@@ -17,7 +18,7 @@ double GaugeReaderEngine::normalizeAngle(double angleDeg) {
 
 
 
-bool GaugeReaderEngine::locateDialCircle(const cv::Mat& gray, cv::Point2f& center, float& radius, cv::Mat* outHubVis) {
+bool GaugeReaderEngine::locateDialCircle(const cv::Mat& gray, cv::Point2f& center, float& radius) {
     cv::Mat blurred;
     cv::GaussianBlur(gray, blurred, cv::Size(9, 9), 2.0);
 
@@ -77,17 +78,6 @@ bool GaugeReaderEngine::locateDialCircle(const cv::Mat& gray, cv::Point2f& cente
 
     center = refinedCenter;
     radius = bestRadius;
-
-    if (outHubVis) {
-        cv::cvtColor(gray, *outHubVis, cv::COLOR_GRAY2BGR);
-        // Draw primary Hough circle
-        cv::circle(*outHubVis, bestCenter, static_cast<int>(bestRadius), cv::Scalar(255, 200, 0), 2, cv::LINE_AA);
-        // Draw ROI bounding box
-        cv::rectangle(*outHubVis, cv::Rect(x1, y1, x2 - x1, y2 - y1), cv::Scalar(0, 255, 255), 2);
-        // Draw refined pin center
-        cv::circle(*outHubVis, center, 5, cv::Scalar(0, 0, 255), -1, cv::LINE_AA);
-        cv::drawMarker(*outHubVis, center, cv::Scalar(0, 255, 0), cv::MARKER_CROSS, 20, 2);
-    }
 
     return found;
 }
@@ -326,7 +316,7 @@ GaugeResult GaugeReaderEngine::process(const cv::Mat& frame, GaugeProfile& profi
     if (evidence) res.step2_rectified = workFrame.clone();
     if (debug) res.rectifiedImage = workFrame;
 
-    // Step 3: 图像预处理 (Multi-Stage Anti-Glare & Pointer Recovery Preprocessing Pipeline)
+    // Grayscale is the direct input to pointer detection.
     cv::Mat gray;
     if (workFrame.channels() == 3) {
         cv::cvtColor(workFrame, gray, cv::COLOR_BGR2GRAY);
@@ -335,80 +325,7 @@ GaugeResult GaugeReaderEngine::process(const cv::Mat& frame, GaugeProfile& profi
     }
     if (debug) res.grayImage = gray;
     // The core stages also need the actual detector input in evidence mode.
-    if (evidence) cv::cvtColor(gray, res.step3_preprocessed, cv::COLOR_GRAY2BGR);
-
-    cv::Mat claheGray;
-    cv::Mat blurred;
-    cv::Mat threshOtsu;
-    cv::Mat threshBlackHat;
-    cv::Mat adaptMask;
-    cv::Mat threshCombined;
-
-    if (debug && profile.enable_steps_4_to_9) {
-        // 1. CLAHE (Contrast Limited Adaptive Histogram Equalization for Glare & Reflection Balancing)
-        double clipLimit = profile.clahe_clip_limit > 0 ? profile.clahe_clip_limit : 2.5;
-        int gridS = profile.clahe_grid_size > 0 ? profile.clahe_grid_size : 8;
-        cv::Ptr<cv::CLAHE> clahe = cv::createCLAHE(clipLimit, cv::Size(gridS, gridS));
-        clahe->apply(gray, claheGray);
-
-        // 2. Gaussian Blur to reduce high-frequency specular noise
-        int gSize = (profile.gaussian_blur_size > 0 && profile.gaussian_blur_size % 2 == 1) ? profile.gaussian_blur_size : 7;
-        double gSigma = profile.gaussian_blur_sigma > 0 ? profile.gaussian_blur_sigma : 1.5;
-        cv::GaussianBlur(claheGray, blurred, cv::Size(gSize, gSize), gSigma);
-        cv::cvtColor(blurred, res.blurredImage, cv::COLOR_GRAY2BGR);
-
-        // 3. Channel A: Standard Otsu Thresholding
-        cv::threshold(blurred, threshOtsu, 0, 255, cv::THRESH_BINARY + cv::THRESH_OTSU);
-
-        // 4. Channel B: Black-Hat Morphological Filter (Exposes solid dark pointer under reflections)
-        cv::Mat blackHat;
-        int hatSize = (profile.blackhat_kernel_size > 0 && profile.blackhat_kernel_size % 2 == 1) ? profile.blackhat_kernel_size : 21;
-        double hatThresh = profile.blackhat_threshold >= 0 ? profile.blackhat_threshold : 32.0;
-        cv::Mat kernelHat = cv::getStructuringElement(cv::MORPH_ELLIPSE, cv::Size(hatSize, hatSize));
-        cv::morphologyEx(claheGray, blackHat, cv::MORPH_BLACKHAT, kernelHat);
-
-        cv::threshold(blackHat, threshBlackHat, hatThresh, 255, cv::THRESH_BINARY);
-        cv::bitwise_not(threshBlackHat, threshBlackHat); // Invert so dark pointer is 0, background is 255
-
-        // 5. Channel C: High-Gradient Shadow Discrimination Mask
-        int bgSize = (profile.local_bg_kernel_size > 0 && profile.local_bg_kernel_size % 2 == 1) ? profile.local_bg_kernel_size : 35;
-        double diffThresh = profile.adapt_diff_threshold >= 0 ? profile.adapt_diff_threshold : 35.0;
-        float gradThresh = profile.grad_mag_threshold >= 0 ? static_cast<float>(profile.grad_mag_threshold) : 22.0f;
-
-        cv::Mat localBg;
-        cv::GaussianBlur(claheGray, localBg, cv::Size(bgSize, bgSize), 0);
-
-        cv::Mat adaptDiff;
-        cv::subtract(localBg, claheGray, adaptDiff);
-
-        cv::Mat gradX, gradY, gradMag;
-        cv::Sobel(claheGray, gradX, CV_32F, 1, 0, 3);
-        cv::Sobel(claheGray, gradY, CV_32F, 0, 1, 3);
-        cv::magnitude(gradX, gradY, gradMag);
-
-        cv::Mat diffMask, magMask;
-        cv::compare(adaptDiff, diffThresh, diffMask, cv::CMP_GT);
-        cv::compare(gradMag, gradThresh, magMask, cv::CMP_GT);
-        cv::Mat solidPointer = diffMask & magMask;
-        cv::bitwise_not(solidPointer, adaptMask);
-
-        // 6. Multi-Channel Anti-Glare Fusion & Shadow Discrimination
-        cv::Mat threshFilteredOtsu = threshOtsu | adaptMask;
-        threshCombined = threshFilteredOtsu & threshBlackHat & adaptMask;
-
-        // 7. Morphological Micro-Closing to repair tiny glare gaps along pointer shaft
-        int closeSize = (profile.morph_close_size > 0 && profile.morph_close_size % 2 == 1) ? profile.morph_close_size : 3;
-        cv::Mat kernelClose = cv::getStructuringElement(cv::MORPH_ELLIPSE, cv::Size(closeSize, closeSize));
-        cv::morphologyEx(threshCombined, threshCombined, cv::MORPH_CLOSE, kernelClose);
-
-        cv::Mat threshBgr;
-        cv::cvtColor(threshCombined, threshBgr, cv::COLOR_GRAY2BGR);
-        res.step3_preprocessed = threshBgr;
-    } else if (debug) {
-        // Fast path: skip heavy morphological filtering (Steps 4-9) to save execution time
-        cv::cvtColor(gray, res.blurredImage, cv::COLOR_GRAY2BGR);
-        res.step3_preprocessed = res.blurredImage.clone();
-    }
+    if (evidence) cv::cvtColor(gray, res.step3_gray, cv::COLOR_GRAY2BGR);
 
     // Step 4: 识别 (Dial Center, Pointer Angle, Value & Overlay Result)
     if (profile.perspective_correction_enabled && !profile.auto_detect_roi && profile.center.x > 0 && profile.center.y > 0 && !invH.empty()) {
@@ -513,10 +430,6 @@ GaugeResult GaugeReaderEngine::process(const cv::Mat& frame, GaugeProfile& profi
     if (debug) {
         res.diagnosticHudImage = res.pointerDetectorResult.hudImage;
         res.diagnosticText = res.pointerDetectorResult.hudText;
-        cv::Mat binaryVis;
-        detector.renderDebugVisualization(binaryVis, cv::Point2d(res.center.x, res.center.y), res.pointerDetectorResult);
-        res.needleBinaryImage = binaryVis;
-        if (!binaryVis.empty()) res.step3_preprocessed = binaryVis;
     }
 
     res.pointer_angle_deg = res.pointerDetectorResult.angle;
@@ -539,9 +452,10 @@ GaugeResult GaugeReaderEngine::process(const cv::Mat& frame, GaugeProfile& profi
     res.value = profile.min_val + fraction * (profile.max_val - profile.min_val);
     res.confidence = res.pointerDetectorResult.confidence;
     res.success = res.pointerDetectorResult.valid;
+    res.recognitionQuality = evaluateRecognitionQuality(res.pointerDetectorResult, profile.qualityConfig);
 
     if (!res.success) {
-        res.errorStep = "步骤 11: 径向截面与轨迹指针检测 (Radial Trajectory Visual)";
+        res.errorStep = "灰度图指针检测 (Grayscale Pointer Detection)";
         res.errorMessage = res.pointerDetectorResult.failureReason.empty() ?
             "指针特征检测未通过 (置信度不足或有效截面缺失)" : res.pointerDetectorResult.failureReason;
         res.detailedDebugInfo = res.pointerDetectorResult.detailedDebugText;
@@ -558,6 +472,7 @@ GaugeResult GaugeReaderEngine::process(const cv::Mat& frame, GaugeProfile& profi
         }
     }
 
+    res.detailedDebugInfo += "\n" + qualitySummary(res.recognitionQuality).toStdString();
     float tipR = static_cast<float>(res.pointerDetectorResult.tipRadius > 0 ? res.pointerDetectorResult.tipRadius : (res.radius * 0.8f));
     double tipRad = res.pointer_angle_deg * M_PI / 180.0;
     res.pointer_tip = cv::Point2f(res.center.x + tipR * static_cast<float>(std::cos(tipRad)),
@@ -573,97 +488,10 @@ GaugeResult GaugeReaderEngine::process(const cv::Mat& frame, GaugeProfile& profi
         res.step4_recognition = rectOverlay;
     }
 
-    auto toBgrMat = [](const cv::Mat& m) -> cv::Mat {
-        if (m.empty()) return cv::Mat();
-        if (m.channels() == 3) return m;
-        cv::Mat out;
-        cv::cvtColor(m, out, cv::COLOR_GRAY2BGR);
-        return out;
-    };
-
-    if (debug) {
-        // Build intermediate output only when requested.
-        // 1. Step 1: 原始采集图像
-        res.intermediateSteps.push_back({
-            1,
-            "步骤 1: 原始采集图像 (Original Stream Frame)",
-            "摄像头/图像源采集到的未经任何处理的原始图像帧",
-            toBgrMat(res.step1_original)
-        });
-
-        // 2. Step 2: 4切点透视校正图
-        res.intermediateSteps.push_back({
-            2,
-            "步骤 2: 4切点视场透视矫正图 (FOV Rectified Image)",
-            "基于12点/3点/6点/9点4个切点透视变换提取正视圆形表盘",
-            toBgrMat(res.step2_rectified)
-        });
-
-        // 3. Step 3: 灰度化图像
-        res.intermediateSteps.push_back({
-            3,
-            "步骤 3: 灰度化图像 (Grayscale Image)",
-            "透视矫正图转8位单通道灰度图像",
-            toBgrMat(gray)
-        });
-
-        if (profile.enable_steps_4_to_9) {
-            // 4. Step 4: CLAHE 自适应对比度增强图
-            res.intermediateSteps.push_back({
-                4,
-                "步骤 4: CLAHE 对比度增强图 (CLAHE Balanced)",
-                "限制对比度自适应直方图均衡化，消除局部阴影与光照不均",
-                toBgrMat(claheGray)
-            });
-
-            // 5. Step 5: 高斯平滑降噪图
-            res.intermediateSteps.push_back({
-                5,
-                "步骤 5: 高斯平滑降噪图 (Gaussian Blur)",
-                "7x7高斯核低通滤波，滤除高频高光噪点与噪波",
-                toBgrMat(blurred)
-            });
-
-            // 6. Step 6: 通道 A - Otsu 二值化图
-            res.intermediateSteps.push_back({
-                6,
-                "步骤 6: 通道 A - Otsu 二值化图 (Channel A: Otsu Threshold)",
-                "全局自适应 Otsu 阈值分割得到初步指针与刻度二值掩码",
-                toBgrMat(threshOtsu)
-            });
-
-            // 7. Step 7: 通道 B - 黑帽形态学滤波图
-            res.intermediateSteps.push_back({
-                7,
-                "步骤 7: 通道 B - 黑帽形态学滤波图 (Channel B: Black-Hat Filter)",
-                "21x21椭圆核黑帽滤波提取细微深色指针特征，有效抑制反光",
-                toBgrMat(threshBlackHat)
-            });
-
-            // 8. Step 8: 通道 C - 高梯度阴影鉴别掩码
-            res.intermediateSteps.push_back({
-                8,
-                "步骤 8: 通道 C - 阴影鉴别掩码 (Channel C: High-Gradient Mask)",
-                "Sobel梯度与局部背景差分掩码，精准区分物理指针边缘与漫反射软阴影",
-                toBgrMat(adaptMask)
-            });
-
-            // 9. Step 9: 多通道二值融合与微闭合二值图
-            res.intermediateSteps.push_back({
-                9,
-                "步骤 9: 多通道二值融合与微闭合二值图 (Multi-Channel Fused)",
-                "Otsu & 黑帽 & 梯度掩码与运算，配合3x3椭圆核微闭合修复小空洞",
-                toBgrMat(threshCombined)
-            });
-        }
-
-    } // Debug-only intermediate steps 1-9.
-
-    // 10. Step 10: 表盘圆心与旋转轴心定位图与二次防错校验
-    cv::Mat hubVis;
+    // Check calibration against the independently located hub.
     cv::Point2f autoCenter;
     float autoRadius{0.0f};
-    locateDialCircle(gray, autoCenter, autoRadius, debug ? &hubVis : nullptr);
+    locateDialCircle(gray, autoCenter, autoRadius);
 
     cv::Point2f expectedCenter(gray.cols * 0.5f, gray.rows * 0.5f);
     if (!profile.auto_detect_roi && profile.center.x > 0 && profile.center.y > 0 && !invH.empty()) {
@@ -684,81 +512,16 @@ GaugeResult GaugeReaderEngine::process(const cv::Mat& frame, GaugeProfile& profi
                  autoCenter.x, autoCenter.y, expectedCenter.x, expectedCenter.y, centerOffsetDist, tolerance);
         res.warningMessage = warnBuf;
 
-        // Overlay visual warning banner on hubVis
-        if (!hubVis.empty()) {
-            int barY = hubVis.rows - 38;
-            cv::rectangle(hubVis, cv::Rect(10, barY, hubVis.cols - 20, 30), cv::Scalar(0, 0, 220), -1);
-            cv::putText(hubVis, "WARNING: Dial Center Offset Exceeds Safety Tolerance!",
-                        cv::Point(20, barY + 20), cv::FONT_HERSHEY_SIMPLEX, 0.48, cv::Scalar(255, 255, 255), 1, cv::LINE_AA);
-        }
     }
 
-    if (debug) {
-        res.hubRoiImage = hubVis;
-
-        std::string step10Desc = "霍夫圆检测表盘外圈轮廓，并在中心 ROI 精准定位指针旋转轴心";
-        if (res.centerInconsistent) {
-            step10Desc += " 【⚠️ 防错提示：与标定中心偏差 " + std::to_string(static_cast<int>(centerOffsetDist)) + "px，高于阈值】";
-        }
-
-        res.intermediateSteps.push_back({
-            10,
-            "步骤 10: 表盘圆心与旋转轴心定位图 (Dial & Hub Pin Location)",
-            step10Desc,
-            toBgrMat(hubVis)
-        });
-
-        // 11. Step 11: 径向截面与轨迹指针检测二值图
-        res.intermediateSteps.push_back({
-            11,
-            "步骤 11: 径向截面与轨迹指针检测 (Radial Trajectory Visual)",
-            "PointerDetector 算法提取指针截面宽度、连续性与中心线轨迹",
-            toBgrMat(res.needleBinaryImage)
-        });
-
-        // 12. Step 12: 最终仪表读数识别叠加图
-        res.intermediateSteps.push_back({
-            12,
-            "步骤 12: 最终识别读数叠加图 (Final Recognition Overlay)",
-            "绘制指针轴线、终点、刻度射线、截面分布图与 Top-Right 读数面板",
-            toBgrMat(res.step4_recognition)
-        });
-
-    } // Debug-only intermediate steps 10-12.
-
-    // Save step photo outputs to files only if explicitly enabled in profile (avoids ~1000ms disk I/O lag)
     if (debug && profile.save_debug_images) {
-        std::filesystem::create_directories("debug_steps");
-
-        if (!res.step1_original.empty()) cv::imwrite("step1_original.png", res.step1_original);
-        if (!res.step2_rectified.empty()) cv::imwrite("step2_rectified.png", res.step2_rectified);
-        if (!res.step3_preprocessed.empty()) cv::imwrite("step3_preprocessed.png", res.step3_preprocessed);
-        if (!res.step4_recognition.empty()) cv::imwrite("step4_recognition.png", res.step4_recognition);
-
-        for (const auto& stepItem : res.intermediateSteps) {
-            if (!stepItem.image.empty()) {
-                char filename[128];
-                snprintf(filename, sizeof(filename), "debug_steps/step%02d_%s.png", stepItem.stepNumber,
-                         (stepItem.stepNumber == 1 ? "original" :
-                          stepItem.stepNumber == 2 ? "rectified" :
-                          stepItem.stepNumber == 3 ? "gray" :
-                          stepItem.stepNumber == 4 ? "clahe" :
-                          stepItem.stepNumber == 5 ? "gaussian_blur" :
-                          stepItem.stepNumber == 6 ? "otsu_threshold" :
-                          stepItem.stepNumber == 7 ? "blackhat_filter" :
-                          stepItem.stepNumber == 8 ? "shadow_mask" :
-                          stepItem.stepNumber == 9 ? "fused_binary" :
-                          stepItem.stepNumber == 10 ? "hub_location" :
-                          stepItem.stepNumber == 11 ? "trajectory_binary" : "recognition_result"));
-                cv::imwrite(filename, stepItem.image);
-            }
-        }
-
-        if (!res.diagnosticHudImage.empty()) {
-            cv::imwrite("debug_steps/step12_diagnostics_hud.png", res.diagnosticHudImage);
-        }
+        std::filesystem::create_directories("debug_images");
+        cv::imwrite("debug_images/original.png", res.step1_original);
+        cv::imwrite("debug_images/rectified.png", res.step2_rectified);
+        cv::imwrite("debug_images/gray.png", res.step3_gray);
+        cv::imwrite("debug_images/recognition.png", res.step4_recognition);
+        if (!res.diagnosticHudImage.empty()) cv::imwrite("debug_images/diagnostic_hud.png", res.diagnosticHudImage);
     }
-
     return res;
 }
 
@@ -830,9 +593,10 @@ void GaugeReaderEngine::drawOverlay(cv::Mat& canvas, const GaugeProfile& profile
         if (!invH.empty()) cv::perspectiveTransform(points, points, invH);
         return cv::Point(cvRound(points[0].x), cvRound(points[0].y));
     };
-    auto drawMeasuredSections = [&](const std::vector<RadialSection>& sections, const char* labelPrefix) {
+    auto drawMeasuredSections = [&](const std::vector<RadialSection>& sections, const char* labelPrefix, double maxGap = 1e6) {
         cv::Point previousLeft, previousRight;
         bool previousValid = false;
+        double previousRadius = 0.0;
         double lastWidthRadius = -1e6;
         for (const auto& section : sections) {
             if (!section.valid) {
@@ -841,7 +605,7 @@ void GaugeReaderEngine::drawOverlay(cv::Mat& canvas, const GaugeProfile& profile
             }
             const cv::Point left = overlayPoint(section.leftPoint);
             const cv::Point right = overlayPoint(section.rightPoint);
-            if (previousValid) {
+            if (previousValid && section.radius - previousRadius <= maxGap) {
                 cv::line(canvas, previousLeft, left, cv::Scalar(255, 255, 0), 1, cv::LINE_AA);
                 cv::line(canvas, previousRight, right, cv::Scalar(255, 0, 255), 1, cv::LINE_AA);
             }
@@ -853,6 +617,7 @@ void GaugeReaderEngine::drawOverlay(cv::Mat& canvas, const GaugeProfile& profile
             cv::circle(canvas, right, 1, cv::Scalar(255, 0, 255), -1, cv::LINE_AA);
             previousLeft = left;
             previousRight = right;
+            previousRadius = section.radius;
             previousValid = true;
         }
         double lastLabelRadius = -1e6;
@@ -870,7 +635,7 @@ void GaugeReaderEngine::drawOverlay(cv::Mat& canvas, const GaugeProfile& profile
         };
     drawMeasuredSections(res.pointerDetectorResult.sections, "");
     if (res.pointerDetectorResult.tailDetected) {
-        drawMeasuredSections(res.pointerDetectorResult.tailProfile.sections, "tail ");
+        drawMeasuredSections(res.pointerDetectorResult.tailProfile.sections, "tail ", 4.0);
     }
 
     // 2. Draw Zero & Max Scale Rays - Thin Lines (1 px)

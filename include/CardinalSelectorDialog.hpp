@@ -53,7 +53,7 @@ class CardinalSelectorDialog : public QDialog {
     Q_OBJECT
 
 public:
-    CardinalSelectorDialog(const cv::Mat& frame, GaugeProfile& profile, const QString& configPath, const QString& cameraId = "", QWidget *parent = nullptr);
+    CardinalSelectorDialog(const cv::Mat& frame, GaugeProfile& profile, const QString& cameraId = "", QWidget *parent = nullptr);
     ~CardinalSelectorDialog() override = default;
 
 private slots:
@@ -68,7 +68,6 @@ private:
 
     cv::Mat m_frame;
     GaugeProfile& m_profile;
-    QString m_configPath;
     QString m_cameraId;
     std::vector<cv::Point2f> m_currentPts;
     cv::Point2f m_currentCenterPt{-1.0f, -1.0f};

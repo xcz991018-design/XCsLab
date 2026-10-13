@@ -5,6 +5,11 @@
 #include <QSet>
 #include <QDebug>
 #include <set>
+#include "DeviceConfigManager.hpp"
+#include <QUrl>
+#include "CameraDiscoveryTargets.hpp"
+#include <QFile>
+#include <QJsonDocument>
 
 AutoCameraDiscoveryService::AutoCameraDiscoveryService(QObject *parent)
     : QObject(parent) {
@@ -43,7 +48,7 @@ void AutoCameraDiscoveryService::triggerScanNow() {
         m_isScanning = true;
     }
 
-    emit logGenerated(tr("[AUTO-DISCOVERY] Broadcasting ONVIF WS-Discovery Probe & GB28181 Catalog Query packets..."));
+    emit logGenerated(tr("[AUTO-DISCOVERY] 正在执行 ONVIF 发现与已登记设备连通性检查..."));
 
     m_scanFuture = QtConcurrent::run([this]() {
         executeDiscoveryProcess();
@@ -54,6 +59,19 @@ void AutoCameraDiscoveryService::triggerScanNow() {
 }
 
 void AutoCameraDiscoveryService::executeDiscoveryProcess() {
+    const auto knownCameras = DeviceConfigManager::instance().getAllDevices();
+    // Probe saved addresses too: routed cameras need not answer LAN discovery.
+    for (const auto& camera : knownCameras) {
+        if (camera.protocolType != CameraProtocolType::ONVIF_RTSP_STREAM) continue;
+        const QUrl uri(camera.rtspUrl);
+        const QString host = uri.host().isEmpty() ? camera.ipOrSn : uri.host();
+        const int port = camera.rtspUrl.isEmpty() ? camera.port : uri.port(camera.rtspPort > 0 ? camera.rtspPort : 554);
+        QTcpSocket socket;
+        if (!host.isEmpty()) socket.connectToHost(host, static_cast<quint16>(port));
+        const bool reachable = !host.isEmpty() && socket.waitForConnected(350);
+        socket.abort();
+        emit cameraOnlineStateChanged(camera.cameraId, reachable);
+    }
     // 1. Real ONVIF WS-Discovery UDP Socket Probe
     emit logGenerated(tr("[AUTO-DISCOVERY] [ONVIF Phase] Broadcasting Probe to 239.255.255.250:3702 on local net interfaces..."));
     auto onvifList = ONVIFDeviceManager::probeDevicesWSDiscovery(1500);
@@ -79,7 +97,7 @@ void AutoCameraDiscoveryService::executeDiscoveryProcess() {
         item.lastSeenTime = QDateTime::currentDateTime().toString("yyyy-MM-dd HH:mm:ss");
 
         emit cameraDiscovered(item);
-        emit logGenerated(tr("[AUTO-DISCOVERY] Found Real ONVIF Device: %1 (%2) -> Auto-Registered.").arg(item.cameraId).arg(item.modelName));
+        emit logGenerated(tr("[AUTO-DISCOVERY] Found Real ONVIF Device: %1 (%2).").arg(item.cameraId).arg(item.modelName));
         newFound++;
         foundIps.insert(dev.ipAddress);
     }
@@ -97,6 +115,13 @@ void AutoCameraDiscoveryService::executeDiscoveryProcess() {
         "192.168.0.64",
         "192.168.0.108"
     };
+
+    QFile credentials(DeviceConfigManager::resolveConfigPath());
+    QJsonObject credentialAddresses;
+    if (credentials.open(QIODevice::ReadOnly))
+        credentialAddresses = QJsonDocument::fromJson(credentials.readAll()).object();
+    const auto savedTargets = cameraDiscoveryTargets(knownCameras, credentialAddresses);
+    for (auto it = savedTargets.begin(); it != savedTargets.end(); ++it) candidateIpSet.insert(it.key());
 
     // Dynamically add active local network interface gateway & subnet IPs to candidate set
     QList<QNetworkInterface> interfaces = QNetworkInterface::allInterfaces();
@@ -135,7 +160,8 @@ void AutoCameraDiscoveryService::executeDiscoveryProcess() {
     for (const QString& candIp : candidateIpSet) {
         if (foundIps.find(candIp.toStdString()) != foundIps.end()) continue;
 
-        int portsToTest[] = {34567, 554, 80, 8000};
+        // An arbitrary HTTP service must not be registered as a camera.
+        const auto portsToTest = savedTargets.value(candIp, QList<int>{554});
         bool isReachable = false;
         int hitPort = 0;
 
@@ -143,8 +169,12 @@ void AutoCameraDiscoveryService::executeDiscoveryProcess() {
             QTcpSocket socket;
             socket.connectToHost(candIp, static_cast<quint16>(testPort));
             if (socket.waitForConnected(350)) { // 350ms check
-                isReachable = true;
-                hitPort = testPort;
+                socket.write("OPTIONS * RTSP/1.0\r\nCSeq: 1\r\n\r\n");
+                socket.waitForBytesWritten(350);
+                if (socket.waitForReadyRead(500) && socket.readLine().startsWith("RTSP/1.0 ")) {
+                    isReachable = true;
+                    hitPort = testPort;
+                }
                 socket.abort(); // Immediately send TCP RST to free Xiongmai device socket slot
                 break;
             }
@@ -159,9 +189,9 @@ void AutoCameraDiscoveryService::executeDiscoveryProcess() {
             item.protocolType = (hitPort == 34567 ? CameraProtocolType::SDK_JLINK : CameraProtocolType::ONVIF_RTSP_STREAM);
             item.protocolName = (hitPort == 34567 ? "Xiongmai JLink Camera" : "IP Camera (RTSP)");
             item.modelName = (hitPort == 34567 ? "JFTech Xiongmai Camera" : "Network Camera");
-            item.port = hitPort;
-            item.rtspPort = (hitPort == 554 ? 554 : 554);
-            item.rtspUrl = QString("rtsp://admin:@%1:554/h264/ch1/main/av_stream").arg(candIp);
+            item.port = 80;
+            item.rtspPort = hitPort;
+            item.rtspUrl = QString(); // Configure the actual vendor path and credentials.
             item.username = "";
             item.password = "";
             item.isOnline = true;
@@ -169,7 +199,7 @@ void AutoCameraDiscoveryService::executeDiscoveryProcess() {
             item.lastSeenTime = QDateTime::currentDateTime().toString("yyyy-MM-dd HH:mm:ss");
 
             emit cameraDiscovered(item);
-            emit logGenerated(tr("[AUTO-DISCOVERY] Found Active Camera at %1 (TCP Port %2 Open) -> Auto-Registered.").arg(candIp).arg(hitPort));
+            emit logGenerated(tr("[AUTO-DISCOVERY] Found Active Camera at %1 (RTSP Port %2).").arg(candIp).arg(hitPort));
             newFound++;
             foundIps.insert(candIp.toStdString());
         }

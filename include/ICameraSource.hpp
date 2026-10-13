@@ -6,7 +6,7 @@
 #include <memory>
 #include <chrono>
 
-enum class CaptureFailure { None, NotOpen, OpenFailed, ReadFailed, NoFrame, StaleFrame, UnsupportedProtocol, InvalidInput };
+enum class CaptureFailure { None, NotOpen, OpenFailed, ReadFailed, NoFrame, StaleFrame, UnsupportedProtocol, InvalidInput, Timeout, Cancelled, WorkerFailed };
 inline const char* captureFailureName(CaptureFailure error) {
     switch (error) {
     case CaptureFailure::None: return "OK";
@@ -17,6 +17,9 @@ inline const char* captureFailureName(CaptureFailure error) {
     case CaptureFailure::StaleFrame: return "STALE_FRAME";
     case CaptureFailure::UnsupportedProtocol: return "UNSUPPORTED_PROTOCOL";
     case CaptureFailure::InvalidInput: return "INVALID_INPUT";
+    case CaptureFailure::Timeout: return "CAPTURE_TIMEOUT";
+    case CaptureFailure::Cancelled: return "CAPTURE_CANCELLED";
+    case CaptureFailure::WorkerFailed: return "CAPTURE_WORKER_FAILED";
     }
     return "INVALID_INPUT";
 }

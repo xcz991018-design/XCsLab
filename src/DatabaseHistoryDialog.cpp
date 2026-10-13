@@ -25,6 +25,25 @@ struct ImageResult { StoredImage original; QImage image; QString error; };
 DatabaseHistoryDialog::DatabaseHistoryDialog(QWidget* parent,
     std::function<void(InspectionTask)> analyze) : QDialog(parent), m_analyze(std::move(analyze)) {
     setWindowTitle(tr("数据库历史查询与原图复核")); resize(1250,760);
+    // Keep this light dialog and its original-image viewer readable when the
+    // parent window supplies a dark theme with pale text.
+    setStyleSheet(R"(
+        QDialog { background-color: #ffffff; }
+        QWidget { color: #000000; }
+        QLineEdit, QComboBox, QDateTimeEdit, QAbstractItemView {
+            background-color: #ffffff;
+            color: #000000;
+            selection-background-color: #cce8ff;
+            selection-color: #000000;
+        }
+        QHeaderView::section, QPushButton {
+            background-color: #f0f0f0;
+            color: #000000;
+        }
+        QPushButton:hover { background-color: #e0e0e0; }
+        QPushButton:disabled { background-color: #e8e8e8; color: #000000; }
+        QTableWidget::item:selected { background-color: #cce8ff; color: #000000; }
+    )");
     m_pool.setMaxThreadCount(2);
     auto* layout=new QVBoxLayout(this); auto* filters=new QHBoxLayout;
     m_camera=new QLineEdit(this); m_camera->setPlaceholderText(tr("摄像头编号，留空查询全部"));

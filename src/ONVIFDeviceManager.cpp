@@ -1,6 +1,8 @@
 #include "ONVIFDeviceManager.hpp"
 #include <iostream>
 #include <sstream>
+#include "OnvifSoap.hpp"
+#include "SnapshotFrameReader.hpp"
 
 ONVIFDeviceManager::ONVIFDeviceManager(const ONVIFDeviceInfo& info)
     : m_info(info) {}
@@ -179,7 +181,8 @@ std::vector<ONVIFDeviceInfo> ONVIFDeviceManager::probeDevicesWSDiscovery(int tim
                     }
 
                     dev.serialNumber = "SN-" + QString::number(qHash(senderIp)).toStdString();
-                    dev.rtspUri = "rtsp://admin:@" + ipStd + ":554/h264/ch1/main/av_stream";
+                    dev.rtspUri.clear();
+                    dev.port = QUrl(xaddr).port(80);
 
                     list.push_back(dev);
                 }
@@ -254,15 +257,17 @@ bool ONVIFDeviceManager::checkTcpPort(const std::string& ip, int port, int timeo
 bool ONVIFDeviceManager::open() {
     logMessage("Connecting to ONVIF Device XAddr: " + m_info.xaddr);
 
-    if (!fetchDeviceInformation()) {
-        logMessage("ERROR: Failed to connect to ONVIF Device Service SOAP endpoint.");
+    if (m_info.rtspUri.empty() && (!fetchProfiles() || fetchStreamUri().empty())) {
+        logMessage(m_lastError);
         return false;
     }
-
-    fetchProfiles();
-    fetchStreamUri();
-
-    logMessage("Opening RTSP Stream: " + m_info.rtspUri);
+    QUrl authenticated(QString::fromStdString(m_info.rtspUri));
+    if (authenticated.userName().isEmpty() && !m_info.username.empty()) {
+        authenticated.setUserName(QString::fromStdString(m_info.username));
+        authenticated.setPassword(QString::fromStdString(m_info.password));
+    }
+    m_info.rtspUri = authenticated.toEncoded().toStdString();
+    logMessage("Opening camera stream for " + m_info.ipAddress);
     m_isOpen = true;
     m_capAttempted = false;
     m_isRealStreamActive = false;
@@ -288,21 +293,74 @@ bool ONVIFDeviceManager::open() {
 }
 
 bool ONVIFDeviceManager::fetchDeviceInformation() {
-    logMessage("SOAP Request -> GetDeviceInformation(http://www.onvif.org/ver10/device/wsdl)");
-    logMessage("SOAP Response 200 OK -> Manufacturer: " + m_info.manufacturer + ", Model: " + m_info.model + ", Serial: " + m_info.serialNumber);
+    QUrl endpoint(QString::fromStdString(m_info.xaddr));
+    if (m_info.xaddr.empty()) {
+        endpoint.setScheme("http"); endpoint.setHost(QString::fromStdString(m_info.ipAddress));
+        endpoint.setPort(m_info.port); endpoint.setPath("/onvif/device_service");
+    }
+    QString error;
+    const auto data = OnvifSoap::request(endpoint, "http://www.onvif.org/ver10/device/wsdl/GetDeviceInformation",
+        "<tds:GetDeviceInformation/>", QString::fromStdString(m_info.username), QString::fromStdString(m_info.password), error);
+    m_lastError = error.toStdString();
+    if (data.isEmpty()) return false;
+    m_info.manufacturer = OnvifSoap::element(data, "Manufacturer").toStdString();
+    m_info.model = OnvifSoap::element(data, "Model").toStdString();
+    m_info.serialNumber = OnvifSoap::element(data, "SerialNumber").toStdString();
     return true;
 }
 
 bool ONVIFDeviceManager::fetchProfiles() {
-    logMessage("SOAP Request -> GetProfiles(http://www.onvif.org/ver10/media/wsdl)");
-    logMessage("Active Profile Token: " + m_info.profileToken + " (Resolution: 1920x1080, Codec: H.264)");
-    return true;
+    QUrl endpoint(QString::fromStdString(m_info.xaddr));
+    if (m_info.xaddr.empty()) {
+        endpoint.setScheme("http"); endpoint.setHost(QString::fromStdString(m_info.ipAddress));
+        endpoint.setPort(m_info.port); endpoint.setPath("/onvif/device_service");
+    }
+    QString error;
+    auto data = OnvifSoap::request(endpoint, "http://www.onvif.org/ver10/device/wsdl/GetCapabilities",
+        "<tds:GetCapabilities><tds:Category>Media</tds:Category></tds:GetCapabilities>",
+        QString::fromStdString(m_info.username), QString::fromStdString(m_info.password), error);
+    QXmlStreamReader reader(data);
+    QString media;
+    while (!reader.atEnd()) {
+        reader.readNext();
+        if (reader.isStartElement() && reader.name() == "Media") {
+            while (reader.readNextStartElement()) {
+                if (reader.name() == "XAddr") media = reader.readElementText();
+                else reader.skipCurrentElement();
+            }
+        }
+    }
+    if (media.isEmpty()) { m_lastError = error.isEmpty() ? "Camera did not advertise an ONVIF Media service; enter a full RTSP address" : error.toStdString(); return false; }
+    m_mediaEndpoint = endpoint.resolved(QUrl(media)).toString().toStdString();
+    data = OnvifSoap::request(QUrl(QString::fromStdString(m_mediaEndpoint)), "http://www.onvif.org/ver10/media/wsdl/GetProfiles",
+        "<trt:GetProfiles/>", QString::fromStdString(m_info.username), QString::fromStdString(m_info.password), error);
+    QXmlStreamReader profiles(data);
+    m_info.profileToken.clear();
+    while (!profiles.atEnd()) {
+        profiles.readNext();
+        if (profiles.isStartElement() && profiles.name() == "Profiles") {
+            const auto token = profiles.attributes().value("token").toString();
+            if (!token.isEmpty()) { m_info.profileToken = token.toStdString(); break; }
+        }
+    }
+    m_lastError = error.isEmpty() ? "No ONVIF media profile returned" : error.toStdString();
+    if (!m_info.profileToken.empty()) { m_lastError.clear(); return true; }
+    return false;
 }
 
 std::string ONVIFDeviceManager::fetchStreamUri(const std::string& profileToken) {
-    (void)profileToken;
-    logMessage("SOAP Request -> GetStreamUri(Transport: RTP-Unicast/UDP, Protocol: RTSP)");
-    logMessage("Obtained Stream URI: " + m_info.rtspUri);
+    if (m_mediaEndpoint.empty() && !fetchProfiles()) return {};
+    QString error;
+    const auto token = QString::fromStdString(profileToken.empty() ? m_info.profileToken : profileToken);
+    const auto data = OnvifSoap::request(QUrl(QString::fromStdString(m_mediaEndpoint)), "http://www.onvif.org/ver10/media/wsdl/GetStreamUri",
+        QString("<trt:GetStreamUri><trt:StreamSetup><tt:Stream>RTP-Unicast</tt:Stream><tt:Transport><tt:Protocol>RTSP</tt:Protocol></tt:Transport></trt:StreamSetup><trt:ProfileToken>%1</trt:ProfileToken></trt:GetStreamUri>").arg(OnvifSoap::escape(token)),
+        QString::fromStdString(m_info.username), QString::fromStdString(m_info.password), error);
+    const QUrl uri(OnvifSoap::element(data, "Uri"));
+    if (!uri.isValid() || uri.host().isEmpty() || uri.scheme().compare("rtsp", Qt::CaseInsensitive) != 0) {
+        m_lastError = error.isEmpty() ? "No valid RTSP URI returned; enter a full RTSP address" : error.toStdString(); return {};
+    }
+    m_info.rtspUri = uri.toEncoded().toStdString();
+    m_lastError.clear();
     return m_info.rtspUri;
 }
 
@@ -318,13 +376,11 @@ void ONVIFDeviceManager::workerLoop() {
         if (!m_isRealStreamActive) {
             // STATE: DISCONNECTED / RECONNECTING
             std::string ip = m_info.ipAddress;
-            int rtspPort = m_info.port > 0 ? m_info.port : 554;
+            const QUrl stream(QString::fromStdString(m_info.rtspUri));
+            int rtspPort = stream.port(554);
 
             // 1. Check physical network link (RTSP 554, Web 80, JLink 34567)
-            bool portOpen = checkTcpPort(ip, 554, 250) || 
-                           checkTcpPort(ip, static_cast<quint16>(rtspPort), 250) || 
-                           checkTcpPort(ip, 80, 250) ||
-                           checkTcpPort(ip, 34567, 250);
+            bool portOpen = checkTcpPort(stream.host().toStdString(), rtspPort, 250);
 
             if (!portOpen) {
                 m_reconnectAttempts++;
@@ -433,28 +489,31 @@ bool ONVIFDeviceManager::grabFrame(cv::Mat& frame) {
 
 FrameCaptureResult ONVIFDeviceManager::captureSnapshot() {
     auto cached = readFrame();
-    if (cached.ok()) return cached;
+    if (cached.ok() && !isUniformSnapshotFrame(cached.frame)) return cached;
     FrameCaptureResult result;
     // Use the configured, authenticated endpoint; never guess another identity or use samples.
     if (m_info.rtspUri.empty()) {
-        result.failure = CaptureFailure::InvalidInput;
-        result.message = "Camera stream URI is missing";
-        return result;
+        if (fetchStreamUri().empty()) {
+            result.failure = CaptureFailure::OpenFailed;
+            result.message = m_lastError;
+            return result;
+        }
+    }
+    QUrl uri(QString::fromStdString(m_info.rtspUri));
+    if (uri.userName().isEmpty() && !m_info.username.empty()) {
+        uri.setUserName(QString::fromStdString(m_info.username));
+        uri.setPassword(QString::fromStdString(m_info.password));
     }
     cv::VideoCapture cap;
     const std::vector<int> params = {cv::CAP_PROP_OPEN_TIMEOUT_MSEC, 2000,
                                      cv::CAP_PROP_READ_TIMEOUT_MSEC, 2000};
-    if (!cap.open(m_info.rtspUri, cv::CAP_FFMPEG, params)) {
+    if (!cap.open(uri.toEncoded().toStdString(), cv::CAP_FFMPEG, params)) {
         result.failure = CaptureFailure::OpenFailed;
         result.message = "Unable to open configured camera stream";
         return result;
     }
-    if (!cap.read(result.frame) || result.frame.empty()) {
-        result.frame.release();
-        result.failure = CaptureFailure::ReadFailed;
-        result.message = "Unable to read camera image";
-    } else result.capturedAt = std::chrono::system_clock::now();
-    return result;
+    return readDecodedSnapshot([&cap](cv::Mat& frame) { return cap.read(frame); }, SnapshotDecodePolicy(),
+                               [&cap]() { return static_cast<int>(cap.get(cv::CAP_PROP_FRAME_TYPE)); });
 }
 
 bool ONVIFDeviceManager::captureSingleSnapshot(cv::Mat& frame) {

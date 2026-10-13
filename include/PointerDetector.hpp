@@ -653,7 +653,7 @@ public:
         PointerDetectionResult& res);
 
 private:
-    // Step 2: Compute single-pass Scharr gradient magnitude and unit orientation
+    // Compute single-pass Scharr gradient magnitude and unit orientation
     GradientFeatureMap computeGradientFeatures(const cv::Mat& gray);
 
     // Section VI: Track a single continuous edge in the candidate corridor (isLeft: t < 0 vs !isLeft: t > 0)
@@ -671,7 +671,7 @@ private:
         const cv::Point2d& effectivePivot,
         double thetaDeg);
 
-    // Step 3: Extract cross section bilateral edge pair for candidate (theta, r) with Edge Tracking
+    // Extract cross section bilateral edge pair for candidate (theta, r) with Edge Tracking
     PointerCrossSection extractCrossSection(
         const cv::Mat& gray,
         const GradientFeatureMap& features,
@@ -683,14 +683,14 @@ private:
         double previousWidth = -1.0,
         double previousCenterT = 0.0);
 
-    // Step 4 & 5: Evaluate non-directional candidate axis theta in [0, 180°)
+    // Evaluate non-directional candidate axis theta in [0, 180°)
     PointerAxisCandidate evaluateCandidateAxis(
         const cv::Mat& gray,
         const GradientFeatureMap& features,
         const cv::Point2d& effectivePivot,
         double thetaDeg);
 
-    // Step 6: Evaluate Radial Direction Profile along a ray (phi in [0, 360))
+    // Evaluate Radial Direction Profile along a ray (phi in [0, 360))
     RadialDirectionProfile evaluateRadialDirectionProfile(
         const cv::Mat& gray,
         const GradientFeatureMap& features,
@@ -710,7 +710,7 @@ private:
         const cv::Point2d& effectivePivot,
         double thetaDeg);
 
-    // Step 9: Evaluate TipLikelihood for forward (+u) vs backward (-u) directions
+    // Evaluate TipLikelihood for forward (+u) vs backward (-u) directions
     double evaluateTipLikelihood(
         const std::vector<PointerCrossSection>& sections,
         double& outTaperScore,

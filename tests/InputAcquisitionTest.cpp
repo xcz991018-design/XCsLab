@@ -1,4 +1,5 @@
 #include "InspectionService.hpp"
+#include "DeviceConfigManager.hpp"
 #include "CameraPreviewService.hpp"
 #include "FileCameraSource.hpp"
 #include "SDKCameraSourceStub.hpp"
@@ -6,8 +7,10 @@
 #include <QEventLoop>
 #include <QTimer>
 #include <QTemporaryDir>
+#include <QDir>
 #include <QFile>
 #include <QJsonDocument>
+#include <QJsonArray>
 #include <QJsonObject>
 #include <QThread>
 #include <thread>
@@ -40,8 +43,72 @@ std::atomic<bool> TestSource::workerOnly{true};
 
 int main(int argc, char** argv) {
     QCoreApplication app(argc, argv);
-    QTemporaryDir directory;
+    QTemporaryDir directory(QDir::currentPath() + "/capture-test-XXXXXX");
     if (!directory.isValid()) return 1;
+    if (!app.arguments().contains("--capture-only")) {
+    // An empty registry must stay empty; local analysis has its own task identity.
+    const auto registryPath = directory.path() + "/devices.json";
+    QFile registry(registryPath);
+    if (!registry.open(QIODevice::WriteOnly)) return 1;
+    registry.write("{\"devices\":[],\"system\":{}}");
+    registry.close();
+    auto& manager = DeviceConfigManager::instance();
+    if (!manager.load(registryPath) || !manager.getAllDevices().isEmpty() ||
+        !manager.getLastActiveDeviceId().isEmpty()) { std::cerr << "Empty registry failed: " << manager.lastError().toStdString() << " devices=" << manager.getAllDevices().size() << "\n"; return 1; }
+    QJsonArray legacyDevices;
+    for (const auto& id : {"CAM_20", "CAM_5-1-2", "CAM_5-3-1", "CAM_5-3-4", "CAM_5-4-1"})
+        legacyDevices.append(QJsonObject{{"camera_id", id}, {"protocol_type", "LOCAL_FILE"}});
+    legacyDevices.append(QJsonObject{{"camera_id", "REAL_CAMERA"}, {"protocol_type", "ONVIF_RTSP_STREAM"}});
+    legacyDevices.append(QJsonObject{{"camera_id", "USER_IMAGE"}, {"protocol_type", "LOCAL_FILE"}});
+    if (!registry.open(QIODevice::WriteOnly | QIODevice::Truncate)) return 1;
+    registry.write(QJsonDocument(QJsonObject{{"devices", legacyDevices},
+        {"system", QJsonObject{{"last_active_device_id", "CAM_20"}}}}).toJson());
+    registry.close();
+    if (!manager.load(registryPath) || manager.getAllDevices().size() != 2 ||
+        manager.getLastActiveDeviceId() == "CAM_20") return 1;
+    if (!registry.open(QIODevice::ReadOnly)) return 1;
+    if (QJsonDocument::fromJson(registry.readAll()).object()["devices"].toArray().size() != 2) return 1;
+    registry.close();
+    if (!manager.load(registryPath) || manager.getAllDevices().size() != 2) return 1;
+    // A later ONVIF scan must resolve to the existing physical camera archive.
+    DiscoveredCameraItem configured;
+    configured.cameraId = "CAM_IP_192_168_110_11";
+    configured.ipOrSn = "192.168.110.11";
+    configured.protocolType = CameraProtocolType::SDK_JLINK;
+    configured.customName = "Configured gauge";
+    configured.username = "operator";
+    configured.password = "test-secret";
+    configured.centerX = 999;
+    configured.isAutoConnect = true;
+    manager.addOrUpdateDevice(configured, false);
+    auto discovered = configured;
+    discovered.cameraId = "CAM_ONVIF_192_168_110_11";
+    discovered.protocolType = CameraProtocolType::ONVIF_RTSP_STREAM;
+    discovered.customName = "ONVIF camera";
+    discovered.password.clear();
+    discovered.centerX = 407.407;
+    discovered.isAutoConnect = false;
+    const auto merged = manager.registerDiscoveredDevice(discovered, false);
+    if (merged.cameraId != configured.cameraId || merged.centerX != 999 ||
+        merged.password != configured.password || merged.customName != configured.customName ||
+        merged.protocolType != configured.protocolType || !merged.isAutoConnect ||
+        manager.getAllDevices().size() != 3) return 1;
+    discovered.cameraId = "CAM_ONVIF_192_168_110_12";
+    discovered.ipOrSn = "192.168.110.12";
+    manager.registerDiscoveredDevice(discovered, false);
+    if (manager.getAllDevices().size() != 4) return 1;
+    // Simulate a legacy registry containing both protocol identities.
+    discovered.cameraId = "CAM_ONVIF_192_168_110_11";
+    discovered.ipOrSn = configured.ipOrSn;
+    manager.addOrUpdateDevice(discovered, false);
+    manager.setLastActiveDeviceId(discovered.cameraId, false);
+    if (!manager.save(registryPath) || !manager.load(registryPath)) return 1;
+    const auto restored = manager.getDevice(configured.cameraId);
+    if (manager.getAllDevices().size() != 4 || manager.hasDevice(discovered.cameraId) ||
+        restored.centerX != 999 || restored.password != configured.password ||
+        manager.getLastActiveDeviceId() != configured.cameraId) return 1;
+    if (!manager.load(registryPath) || manager.getAllDevices().size() != 4) return 1;
+    }
     int acquisitions = 0;
     InspectionService service(nullptr, 1, [&](const InspectionTask& task) {
         ++acquisitions;
@@ -101,6 +168,7 @@ int main(int argc, char** argv) {
     if (invalidLive.errorCode != "INVALID_INPUT" || acquisitions != initialAcquisitions) return 1;
 
     // Legacy APIs also cannot return stale caller buffers or sample/diagnostic images.
+    if (!app.arguments().contains("--capture-only")) {
     cv::Mat frame(16, 16, CV_8UC3);
     FileCameraSource file(directory.path().toStdString() + "/missing.png");
     if (file.grabFrame(frame) || !frame.empty() || file.captureSnapshot().failure != CaptureFailure::OpenFailed) return 1;
@@ -113,6 +181,7 @@ int main(int argc, char** argv) {
     SDKCameraSourceStub sdk("demo");
     sdk.setSampleFrame(live.capturedFrame);
     if (sdk.captureSnapshot().failure != CaptureFailure::UnsupportedProtocol || sdk.grabFrame(frame) || !frame.empty()) return 1;
+    }
 
     // Switching while an old stream connects suppresses that stream's late result.
     CameraPreviewService preview(nullptr, [](const InspectionTask& request) { return std::make_shared<TestSource>(request.device.cameraId); });
@@ -135,6 +204,26 @@ int main(int argc, char** argv) {
     heartbeat.start(5);
     loop.exec();
     if (!received || oldDelivered || ticks < 2 || !TestSource::workerOnly.load()) return 1;
+    if (preview.snapshot("first").ok()) return 1;
+    auto snapshot = preview.snapshot("second");
+    if (!snapshot.ok()) return 1;
+    snapshot.frame.setTo(cv::Scalar(12, 34, 56));
+    if (preview.snapshot("second").frame.at<cv::Vec3b>(0, 0)[0] != 90) return 1;
+    task.device.protocolType = CameraProtocolType::ONVIF_RTSP_STREAM;
+    task.previewSnapshot = snapshot.frame;
+    task.previewCapturedAt = QDateTime::fromMSecsSinceEpoch(
+        std::chrono::duration_cast<std::chrono::milliseconds>(snapshot.capturedAt.time_since_epoch()).count(), Qt::UTC);
+    const auto capturedPreview = run(task);
+    if (!capturedPreview.errorCode.isEmpty() || acquisitions != initialAcquisitions ||
+        capturedPreview.capturedAt != task.previewCapturedAt ||
+        cv::norm(capturedPreview.capturedFrame, snapshot.frame, cv::NORM_INF) != 0 ||
+        cv::norm(cv::imread(capturedPreview.originalPath.toStdString()), snapshot.frame, cv::NORM_INF) != 0) return 1;
+    task.previewCapturedAt = QDateTime::currentDateTimeUtc().addSecs(-3);
+    const auto expiredPreview = run(task);
+    if (expiredPreview.errorCode != "STALE_FRAME" || !expiredPreview.originalPath.isEmpty() ||
+        acquisitions != initialAcquisitions) return 1;
+    preview.select(InspectionTask());
+    if (preview.snapshot("second").ok()) return 1;
     preview.stop();
     std::cout << "Explicit inputs, no fallback, typed failures, historical identity and nonblocking preview switching passed\n";
     return 0;

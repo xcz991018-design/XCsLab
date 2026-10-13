@@ -3,6 +3,9 @@
 #include "DatabaseHistoryDialog.hpp"
 #include "DatabaseConnectionDialog.hpp"
 #include "DeviceConfigManager.hpp"
+#include "GaugeTemplateMigration.hpp"
+#include "GaugeTemplateStore.hpp"
+#include "GaugeProfile.hpp"
 #include <mysql.h>
 #include <QApplication>
 #include <QTemporaryDir>
@@ -40,7 +43,7 @@ struct TestDatabase {
         qputenv("GAUGE_MYSQL_TLS_MODE","required");
         MySqlRepository().checkConnection();
         execute("USE `"+name+"`");
-        require(scalar("SELECT COUNT(*) FROM information_schema.tables WHERE table_schema=DATABASE()")==7, "Automatic schema initialization failed");
+        require(scalar("SELECT COUNT(*) FROM information_schema.tables WHERE table_schema=DATABASE()")==8, "Automatic schema initialization failed");
 
     }
     ~TestDatabase() {
@@ -72,6 +75,28 @@ int main(int argc,char** argv) {
         TestDatabase database; QTemporaryDir folder; require(folder.isValid(),"Temporary directory failed");
         qputenv("GAUGE_MYSQL_OUTBOX",(folder.path()+"/registry_outbox").toUtf8());
         MySqlRepository repository; repository.checkConnection();
+        // Simulate upgrading an existing database with the original seven tables.
+        database.execute("DROP TABLE gauge_templates");
+        repository.checkConnection();
+        require(database.scalar("SELECT COUNT(*) FROM information_schema.tables WHERE table_schema=DATABASE()")==8,
+                "Existing database template upgrade failed");
+        const auto imported = materializeLegacyGaugeTemplates(QString(REPO_SOURCE_DIR)+"/config/gauge_profile.json");
+        require(repository.importTemplates(imported)==imported.size(), "Legacy migration failed");
+        require(repository.importTemplates(imported)==0, "Repeated migration overwrote templates");
+        auto custom = GaugeTemplateStore::defaults(); custom["gauge_id"] = "SQL_'quoted"; custom["max_val"] = 4;
+        custom["extra"] = QJsonObject{{"preserved", true}};
+        auto created = repository.saveTemplate(custom);
+        require(created.revision==1 && repository.loadTemplate(created.id).definition==custom, "Database template round trip failed");
+        require(throws([&]{repository.saveTemplate(custom);}), "Duplicate database template accepted");
+        custom["max_val"] = 5;
+        const auto updated = repository.saveTemplate(custom, created.revision);
+        require(updated.revision==2 && updated.definition["extra"].isObject(), "Database template update failed");
+        require(throws([&]{repository.saveTemplate(custom,created.revision);}) &&
+                throws([&]{repository.deleteTemplate(created.id,created.revision);}), "Stale template revision accepted");
+        repository.deleteTemplate(created.id,updated.revision);
+        require(throws([&]{repository.loadTemplate(created.id);}) && throws([&]{repository.saveTemplate(custom);}),
+                "Deleted template resurrected");
+        require(database.scalar("SELECT COUNT(*) FROM gauge_templates WHERE deleted_at IS NOT NULL")==1, "Template deletion was not retained");
         {
             DatabaseConnectionDialog connectionDialog(nullptr,folder.path()+"/gui_connection.json");
             connectionDialog.findChild<QLineEdit*>("mysqlHost")->setText("127.0.0.1");
@@ -99,6 +124,12 @@ int main(int argc,char** argv) {
         QJsonObject registry; registry["system"]=QJsonObject{{"last_active_device_id",device.cameraId}};
         registry["devices"]=QJsonArray{deviceToJson(device,true)};
         repository.saveRegistry(registry);
+        const auto usedTemplate = repository.loadTemplate(device.defaultProfileId);
+        require(throws([&]{repository.deleteTemplate(usedTemplate.id,usedTemplate.revision);}), "Referenced template deleted");
+        auto invalidRegistry = registry;
+        auto missingTemplateDevice = deviceToJson(device,true); missingTemplateDevice["default_profile_id"] = "MISSING_TEMPLATE";
+        invalidRegistry["devices"] = QJsonArray{missingTemplateDevice};
+        require(throws([&]{repository.saveRegistry(invalidRegistry);}), "Registry accepted missing template");
         const auto loaded=repository.loadRegistry(); auto archive=loaded["devices"].toArray()[0].toObject();
         require(!archive.contains("password") && QUrl(archive["rtsp_url"].toString()).password().isEmpty(),"Credentials leaked into archive");
         require(archive["custom_name"].toString()==device.customName,"Archive round trip failed");
@@ -108,11 +139,13 @@ int main(int argc,char** argv) {
         QFile imageFile(imagePath); require(imageFile.open(QIODevice::ReadOnly),"Image read failed"); auto imageBytes=imageFile.readAll(); imageFile.close();
         InspectionTask task; task.taskId=QUuid::createUuid().toString(QUuid::WithoutBraces); task.device=device;
         task.inputKind=InspectionInputKind::LocalImage; task.captureOnly=true; task.localImagePath=imagePath;
-        task.outputDirectory=folder.path()+"/evidence"; task.profilePath=QString(REPO_SOURCE_DIR)+"/config/gauge_profile.json";
+        task.outputDirectory=folder.path()+"/evidence";
         InspectionOutcome out; out.taskId=task.taskId; out.cameraId=device.cameraId;
         out.capturedAt=QDateTime::currentDateTimeUtc(); out.originalPath=imagePath; out.recognitionPerformed=true;
         out.result.success=true; out.result.value=0.73; out.result.unit="MPa"; out.result.confidence=0.91;
-        QFile profile(task.profilePath); require(profile.open(QIODevice::ReadOnly),"Profile unavailable"); out.profileSnapshot=QJsonDocument::fromJson(profile.readAll()).object();
+        const auto currentTemplate = repository.loadTemplate(device.defaultProfileId);
+        out.profileSnapshot=QJsonObject{{"profiles",QJsonArray{currentTemplate.definition}},
+            {"_database_template_id",currentTemplate.id},{"_database_template_revision",static_cast<double>(currentTemplate.revision)}};
         auto envelope=MySqlRepository::inspectionEnvelope(task,out); repository.saveInspection(envelope); repository.saveInspection(envelope);
         require(database.scalar("SELECT COUNT(*) FROM inspection_history")==1,"Idempotency failed");
         auto original=repository.original(task.taskId);
@@ -132,16 +165,54 @@ int main(int argc,char** argv) {
         repository.saveRegistry(registry);
         require(repository.history(device.cameraId,begin,end,0)[0].device.customName=="测试油压表","History lost frozen archive");
         require(repository.history(device.cameraId,begin,end,0)[0].latestReview["decision"].toString()=="corrected", "Latest review query failed");
+        auto changedDefinition = currentTemplate.definition; changedDefinition["max_val"] = 9;
+        repository.saveTemplate(changedDefinition,currentTemplate.revision);
+        require(repository.importTemplates(imported)==0 && repository.loadTemplate(currentTemplate.id).definition["max_val"].toDouble()==9,
+                "Migration overwrote a database edit");
+        require(repository.original(out.taskId).inspection.profile==out.profileSnapshot, "Template update changed historical snapshot");
         // Exercise the actual application's authoritative DB load and asynchronous save.
         const auto registryPath=folder.path()+"/devices.json";
         QFile registryFile(registryPath); require(registryFile.open(QIODevice::WriteOnly),"Local credential file failed");
         registryFile.write(QJsonDocument(registry).toJson()); registryFile.close();
         auto& manager=DeviceConfigManager::instance();
         require(manager.load(registryPath),"Device manager database load failed");
+        // A missing template in a pending registry must recover after migration,
+        // without erasing the existing database archives or pending changes.
+        auto pendingRegistry = registry;
+        auto pendingDevice = deviceToJson(device,true);
+        pendingDevice["default_profile_id"] = "RECOVERED_TEMPLATE";
+        pendingRegistry["devices"] = QJsonArray{pendingDevice};
+        MySqlRepository::queueRegistry(pendingRegistry);
+        require(!manager.load(registryPath) && manager.lastError().contains("RECOVERED_TEMPLATE"),
+                "Missing template regression was not detected");
+        auto recoveredTemplate = GaugeTemplateStore::defaults(); recoveredTemplate["gauge_id"] = "RECOVERED_TEMPLATE";
+        repository.saveTemplate(recoveredTemplate);
+        require(manager.load(registryPath) && manager.getDevice(device.cameraId).defaultProfileId=="RECOVERED_TEMPLATE",
+                "Migrated template did not unblock registry restoration");
+        repository.saveRegistry(registry);
+        require(manager.load(registryPath), "Registry reset failed");
         require(manager.getDevice(device.cameraId).password=="secret" && manager.getDevice(device.cameraId).username=="operator", "Local credentials were not restored");
         auto edited=manager.getDevice(device.cameraId); edited.customName="界面保存档案";
         manager.addOrUpdateDevice(edited); manager.waitForDatabaseWrites();
         require(repository.loadRegistry()["devices"].toArray()[0].toObject()["custom_name"].toString()==edited.customName,"Asynchronous archive save failed");
+        // Refresh discovers a camera: automatic registration must survive a DB-backed restart.
+        DiscoveredCameraItem discoveredCamera;
+        discoveredCamera.cameraId = "CAM_ONVIF_192_0_2_25";
+        discoveredCamera.ipOrSn = "192.0.2.25";
+        discoveredCamera.protocolType = CameraProtocolType::ONVIF_RTSP_STREAM;
+        discoveredCamera.customName = "新车间摄像头";
+        discoveredCamera.isOnline = true;
+        const auto addedCamera = manager.registerDiscoveredDevice(discoveredCamera);
+        manager.waitForDatabaseWrites();
+        require(repository.loadRegistry()["devices"].toArray().size()==2,"Discovered camera was not registered in DB");
+        manager.registerDiscoveredDevice(discoveredCamera);
+        manager.waitForDatabaseWrites();
+        require(repository.loadRegistry()["devices"].toArray().size()==2,"Repeated discovery duplicated DB device");
+        manager.setLastActiveDeviceId(addedCamera.cameraId);
+        manager.waitForDatabaseWrites();
+        require(manager.load(registryPath) && manager.hasDevice(addedCamera.cameraId),"DB restart did not restore discovered camera");
+        require(manager.getLastActiveDeviceId()==addedCamera.cameraId,"DB restart lost last connected device");
+        require(!manager.getDevice(addedCamera.cameraId).isOnline,"DB restart reused stale online state");
         auto bad=envelope; bad["task_id"]=QUuid::createUuid().toString(QUuid::WithoutBraces);
         bad["original_path"]=folder.path()+"/missing.png";
         require(throws([&]{repository.saveInspection(bad);}),"Missing original accepted");
@@ -155,6 +226,7 @@ int main(int argc,char** argv) {
         const auto reread=run(service,task);
         require(reread.errorCode.isEmpty() && reread.databaseSaved,"DB historical service failed");
         require(factoryCalls==0 && cv::norm(reread.capturedFrame,pixels,cv::NORM_INF)==0,"History used wrong image or opened camera");
+        require(reread.profileSnapshot==out.profileSnapshot, "Historical reanalysis used current template");
         require(repository.original(reread.taskId).bytes==imageBytes,"Reanalysis changed original bytes");
         require(repository.original(reread.taskId).inspection.device.customName=="测试油压表", "Reanalysis did not preserve historical config identity");
         require(database.scalar("SELECT COUNT(*) FROM image_blobs")==1,"Original was duplicated");
@@ -162,6 +234,8 @@ int main(int argc,char** argv) {
         const auto configured=run(service,recalibrated);
         require(configured.databaseSaved && repository.original(configured.taskId).inspection.device.customName==task.device.customName,
             "Explicit updated configuration was ignored");
+        require(configured.profileSnapshot["profiles"].toArray()[0].toObject()["max_val"].toDouble()==9,
+                "New task did not read current database template");
         auto wrong=task; wrong.device.cameraId="CAM_WRONG";
         auto rejected=run(service,wrong); require(!rejected.errorCode.isEmpty() && rejected.capturedFrame.empty(),"Wrong camera history accepted");
 
@@ -198,6 +272,7 @@ int main(int argc,char** argv) {
         qputenv("GAUGE_MYSQL_PORT","33378");
         auto pending=run(service,task);
         require(pending.databasePending && !pending.databaseSaved && !pending.databaseError.isEmpty(),"Disconnected writer lost outbox state");
+        require(pending.errorCode=="TEMPLATE_DATABASE_FAILED", "Database outage silently used a local template");
         qputenv("GAUGE_MYSQL_PORT","33379");
         require(MySqlRepository::retryPending(task.outputDirectory).isEmpty(),"Outbox replay failed");
         require(repository.original(pending.taskId).bytes==imageBytes,"Outbox original changed");

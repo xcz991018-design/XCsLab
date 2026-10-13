@@ -28,6 +28,7 @@ public:
     DiscoveredCameraItem getDevice(const QString& cameraId) const;
     bool hasDevice(const QString& cameraId) const;
 
+    DiscoveredCameraItem registerDiscoveredDevice(const DiscoveredCameraItem& item, bool autoSave = true);
     void addOrUpdateDevice(const DiscoveredCameraItem& item, bool autoSave = true);
     bool removeDevice(const QString& cameraId, bool autoSave = true);
 
@@ -64,8 +65,6 @@ private:
     ~DeviceConfigManager() override;
     DeviceConfigManager(const DeviceConfigManager&) = delete;
     DeviceConfigManager& operator=(const DeviceConfigManager&) = delete;
-
-    void populateDefaultsIfEmpty();
 
     mutable QMutex m_mutex;
     QMap<QString, DiscoveredCameraItem> m_devices;

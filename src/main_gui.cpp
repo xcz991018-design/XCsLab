@@ -1,7 +1,10 @@
 #include <QApplication>
 #include "MainWindow.hpp"
+#include "IsolatedCapture.hpp"
 
 int main(int argc, char *argv[]) {
+    const int workerExit = runCaptureWorker(argc, argv);
+    if (workerExit >= 0) return workerExit;
     // Force OpenCV FFmpeg backend to use RTSP over TCP with zero latency, low delay & no buffering
     qputenv("OPENCV_FFMPEG_CAPTURE_OPTIONS", "fflags;nobuffer|flags;low_delay|framedrop|max_delay;0|rtsp_transport;tcp|stimeout;3000000");
 

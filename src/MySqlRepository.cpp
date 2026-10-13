@@ -3,6 +3,9 @@
 #include "DatabaseSettingsStore.hpp"
 #include "MySqlErrorText.hpp"
 #include "MySqlBootstrapSchema.hpp"
+#include "MySqlTemplateSchema.hpp"
+#include "GaugeTemplateStore.hpp"
+#include "GaugeProfile.hpp"
 #include <mysql.h>
 #include <QCryptographicHash>
 #include <QJsonDocument>
@@ -100,6 +103,15 @@ public:
                             .arg(decodeMySqlError(QByteArray(mysql_error(handle)))));
                 }
             }
+            if (mysql_query(handle, "SELECT 1 FROM gauge_templates LIMIT 0")) {
+                if (mysql_errno(handle) != 1146)
+                    fail(QString("MYSQL_TEMPLATE_SCHEMA_CHECK_FAILED: %1").arg(decodeMySqlError(QByteArray(mysql_error(handle)))));
+                for (const auto& statement : QByteArray(MySqlTemplateSchema).split(';')) {
+                    const auto sql = statement.trimmed();
+                    if (!sql.isEmpty() && mysql_real_query(handle, sql.constData(), static_cast<unsigned long>(sql.size())))
+                        fail(QString("MYSQL_TEMPLATE_SCHEMA_CREATE_FAILED: %1").arg(decodeMySqlError(QByteArray(mysql_error(handle)))));
+                }
+            } else if (auto* result = mysql_store_result(handle)) mysql_free_result(result);
             if (mysql_query(handle, "SET time_zone = '+00:00'")) fail("MYSQL_SESSION_SETUP_FAILED");
         }
         catch (...) { mysql_close(handle); handle = nullptr; mysql_thread_end(); throw; }
@@ -243,9 +255,9 @@ QString MySqlRepository::testConnection() const {
     Connection c(m_settings);
     const auto result=c.exec("SELECT COUNT(*) FROM information_schema.tables WHERE table_schema=?"
         " AND table_name IN ('camera_archives','camera_config_versions','inspection_history','inspection_evidence',"
-        "'reading_reviews','image_blobs','runtime_settings')", {m_settings.database.toUtf8()});
-    return str(result[0][0]).toInt()==7 ? QStringLiteral("连接成功，数据库所需表已存在。")
-        : QStringLiteral("连接成功，但数据库表结构尚未准备齐全。请先执行 database/mysql 中的三份迁移脚本。");
+        "'reading_reviews','image_blobs','runtime_settings','gauge_templates')", {m_settings.database.toUtf8()});
+    return str(result[0][0]).toInt()==8 ? QStringLiteral("连接成功，数据库所需表已存在。")
+        : QStringLiteral("连接成功，但数据库表结构尚未准备齐全。请先执行 database/mysql 中的迁移脚本（001–004）。");
 }
 QJsonObject MySqlRepository::sanitizedRegistry(QJsonObject registry) {
     QJsonArray devices;
@@ -263,6 +275,17 @@ QJsonObject MySqlRepository::loadRegistry() const {
 }
 void MySqlRepository::saveRegistry(const QJsonObject& registry) const {
     Connection c(m_settings); Transaction tx(c); QSet<QString> ids;
+    // Always lock templates before archives, matching deleteTemplate's order.
+    QStringList templates;
+    for (const auto& value : registry["devices"].toArray()) {
+        auto id = value.toObject()["default_profile_id"].toString();
+        if (id.isEmpty()) id = "PRESSURE_GAUGE_1.6MPA";
+        if (!templates.contains(id)) templates.append(id);
+    }
+    templates.sort();
+    for (const auto& id : templates)
+        if (c.exec("SELECT template_id FROM gauge_templates WHERE template_id=? AND deleted_at IS NULL FOR UPDATE", {id.toUtf8()}).empty())
+            fail(QStringLiteral("设备选择的数据库模板不存在：%1").arg(id));
     // This desktop registry is a complete snapshot; only its serialized writer submits it.
     c.exec("SELECT camera_id FROM camera_archives FOR UPDATE");
     for (const auto& value : registry["devices"].toArray()) {
@@ -274,6 +297,111 @@ void MySqlRepository::saveRegistry(const QJsonObject& registry) const {
     c.exec("INSERT INTO runtime_settings(setting_key,setting_json) VALUES('system',?)"
         " ON DUPLICATE KEY UPDATE setting_json=VALUES(setting_json)", {json(registry["system"].toObject())});
     tx.commit();
+}
+
+namespace {
+GaugeTemplateRecord templateRecord(const Row& row) {
+    GaugeTemplateRecord record;
+    record.id = str(row[0]);
+    record.definition = QJsonDocument::fromJson(row[1].value_or(QByteArray())).object();
+    record.revision = str(row[2]).toULongLong();
+    if (record.definition.isEmpty() || record.definition["gauge_id"].toString() != record.id || !record.revision)
+        fail("DATABASE_TEMPLATE_INVALID");
+    return record;
+}
+void validateTemplate(const QJsonObject& definition) {
+    const auto error = GaugeTemplateStore::validate(definition);
+    if (!error.isEmpty()) fail(error);
+    GaugeProfile profile;
+    if (!profile.loadFromJson(definition)) fail("DATABASE_TEMPLATE_INVALID");
+}
+const QByteArray templateReferences = "SELECT camera_id FROM camera_archives WHERE deleted_at IS NULL AND "
+    "CASE WHEN JSON_TYPE(JSON_EXTRACT(archive_json,'$.default_profile_id'))='STRING' AND "
+    "JSON_UNQUOTE(JSON_EXTRACT(archive_json,'$.default_profile_id'))<>'' "
+    "THEN JSON_UNQUOTE(JSON_EXTRACT(archive_json,'$.default_profile_id')) ELSE 'PRESSURE_GAUGE_1.6MPA' END=?";
+}
+
+QList<GaugeTemplateRecord> MySqlRepository::loadTemplates() const {
+    Connection c(m_settings);
+    QList<GaugeTemplateRecord> records;
+    for (const auto& row : c.exec("SELECT template_id,definition,revision FROM gauge_templates WHERE deleted_at IS NULL ORDER BY template_id")) {
+        auto record = templateRecord(row);
+        validateTemplate(record.definition);
+        records.append(record);
+    }
+    // One registry read provides usage labels; deletion rechecks under locks.
+    QMap<QString, QStringList> usage;
+    for (const auto& row : c.exec("SELECT camera_id,archive_json FROM camera_archives WHERE deleted_at IS NULL")) {
+        auto id = QJsonDocument::fromJson(row[1].value_or(QByteArray())).object()["default_profile_id"].toString();
+        if (id.isEmpty()) id = "PRESSURE_GAUGE_1.6MPA";
+        usage[id].append(str(row[0]));
+    }
+    for (auto& record : records) record.usedBy = usage.value(record.id);
+    return records;
+}
+
+GaugeTemplateRecord MySqlRepository::loadTemplate(const QString& id) const {
+    Connection c(m_settings);
+    const auto rows = c.exec("SELECT template_id,definition,revision FROM gauge_templates WHERE template_id=? AND deleted_at IS NULL", {id.toUtf8()});
+    if (rows.empty()) fail(QStringLiteral("数据库模板不存在或已删除：%1").arg(id));
+    auto record = templateRecord(rows.front());
+    validateTemplate(record.definition);
+    return record;
+}
+
+GaugeTemplateRecord MySqlRepository::saveTemplate(const QJsonObject& definition, quint64 expectedRevision) const {
+    validateTemplate(definition);
+    const auto id = definition["gauge_id"].toString();
+    Connection c(m_settings); Transaction tx(c);
+    const auto rows = c.exec("SELECT revision,deleted_at FROM gauge_templates WHERE template_id=? FOR UPDATE", {id.toUtf8()});
+    if (!expectedRevision && !rows.empty()) fail(QStringLiteral("模板编号已存在（含已删除模板），请使用不同编号"));
+    if (expectedRevision && (rows.empty() || rows.front()[1] || str(rows.front()[0]).toULongLong() != expectedRevision))
+        fail(QStringLiteral("模板已被其他操作修改或删除，请刷新列表后重试"));
+    const auto now = time(QDateTime::currentDateTimeUtc());
+    const auto revision = expectedRevision + 1;
+    if (!expectedRevision) c.exec("INSERT INTO gauge_templates(template_id,definition,revision,created_at,updated_at) VALUES(?,?,1,?,?)",
+                                 {id.toUtf8(), json(definition), now, now});
+    else c.exec("UPDATE gauge_templates SET definition=?,revision=?,updated_at=? WHERE template_id=?",
+                {json(definition), number(revision), now, id.toUtf8()});
+    tx.commit();
+    return {id, definition, revision, {}};
+}
+
+void MySqlRepository::deleteTemplate(const QString& id, quint64 expectedRevision) const {
+    Connection c(m_settings); Transaction tx(c);
+    const auto rows = c.exec("SELECT revision,deleted_at FROM gauge_templates WHERE template_id=? FOR UPDATE", {id.toUtf8()});
+    if (!expectedRevision || rows.empty() || rows.front()[1] || str(rows.front()[0]).toULongLong() != expectedRevision)
+        fail(QStringLiteral("模板已被其他操作修改或删除，请刷新列表后重试"));
+    const auto references = c.exec(templateReferences + " FOR UPDATE", {id.toUtf8()});
+    if (!references.empty()) {
+        QStringList devices;
+        for (const auto& row : references) devices.append(str(row[0]));
+        fail(QStringLiteral("模板正在被设备使用，请先更换设备模板：%1").arg(devices.join("、")));
+    }
+    const auto now = time(QDateTime::currentDateTimeUtc());
+    c.exec("UPDATE gauge_templates SET deleted_at=?,updated_at=?,revision=revision+1 WHERE template_id=?", {now, now, id.toUtf8()});
+    tx.commit();
+}
+
+int MySqlRepository::importTemplates(const QList<QJsonObject>& definitions) const {
+    QMap<QString, QJsonObject> unique;
+    for (const auto& definition : definitions) {
+        validateTemplate(definition);
+        const auto id = definition["gauge_id"].toString();
+        if (unique.contains(id)) fail(QStringLiteral("迁移文件中的模板编号重复：%1").arg(id));
+        unique[id] = definition;
+    }
+    Connection c(m_settings); Transaction tx(c);
+    int imported = 0;
+    const auto now = time(QDateTime::currentDateTimeUtc());
+    for (auto it = unique.begin(); it != unique.end(); ++it) {
+        // Repeated migration never overwrites database edits or resurrects deletes.
+        if (!c.exec("SELECT template_id FROM gauge_templates WHERE template_id=? FOR UPDATE", {it.key().toUtf8()}).empty()) continue;
+        c.exec("INSERT INTO gauge_templates(template_id,definition,revision,created_at,updated_at) VALUES(?,?,1,?,?)",
+               {it.key().toUtf8(), json(it.value()), now, now});
+        ++imported;
+    }
+    tx.commit(); return imported;
 }
 QJsonObject MySqlRepository::inspectionEnvelope(const InspectionTask& task, const InspectionOutcome& out) {
     QJsonObject record;
@@ -290,6 +418,7 @@ QJsonObject MySqlRepository::inspectionEnvelope(const InspectionTask& task, cons
     record["value"] = out.result.success ? QJsonValue(out.result.value) : QJsonValue(QJsonValue::Null);
     record["unit"] = QString::fromStdString(out.result.unit); record["confidence"] = out.result.confidence;
     record["error_code"] = out.errorCode;
+    record["recognition_quality"] = out.result.recognitionQuality;
     record["error_message"] = out.errorMessage;
     record["original_path"] = QFileInfo(out.originalPath).absoluteFilePath();
     if (out.originalPath.isEmpty()) record["original_path"] = QString();

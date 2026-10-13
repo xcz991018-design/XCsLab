@@ -1,8 +1,8 @@
 #include "InspectionService.hpp"
+#include "IsolatedCapture.hpp"
 #include "FileCameraSource.hpp"
 #include "MySqlRepository.hpp"
 #include "DeviceCodec.hpp"
-#include <QTemporaryFile>
 #include <QFutureWatcher>
 #include <QtConcurrent/QtConcurrent>
 #include <QDir>
@@ -28,14 +28,9 @@ CameraSourcePtr createSource(const InspectionTask& task) {
         info.port = dev.port;
         info.username = dev.username.toStdString();
         info.password = dev.password.toStdString();
+        info.xaddr.clear();
         QUrl uri(dev.rtspUrl);
-        if (dev.rtspUrl.isEmpty()) {
-            uri.setScheme("rtsp");
-            uri.setHost(dev.ipOrSn);
-            uri.setPort(dev.rtspPort > 0 ? dev.rtspPort : 554);
-            uri.setPath("/h264/ch1/main/av_stream");
-        }
-        if (uri.userName().isEmpty() && !dev.username.isEmpty()) {
+        if (!dev.rtspUrl.isEmpty() && uri.userName().isEmpty() && !dev.username.isEmpty()) {
             uri.setUserName(dev.username);
             uri.setPassword(dev.password);
         }
@@ -53,7 +48,7 @@ struct CapturedTask {
 };
 
 CapturedTask capture(const InspectionTask& task, const InspectionService::SourceFactory& factory,
-                     const std::shared_ptr<std::atomic<bool>>& cancel) {
+                     const std::shared_ptr<std::atomic<bool>>& cancel, bool isolate) {
     CapturedTask data;
     data.task = task;
     data.outcome.taskId = task.taskId;
@@ -123,14 +118,27 @@ CapturedTask capture(const InspectionTask& task, const InspectionService::Source
             data.outcome.errorMessage = QStringLiteral("实时抓拍不能使用本地图像设备");
             return data;
         }
-        auto source = factory(task);
-        if (!source) {
+        if (!task.previewSnapshot.empty()) {
+            const auto age = task.previewCapturedAt.msecsTo(QDateTime::currentDateTimeUtc());
+            if (!task.previewCapturedAt.isValid() || age < 0 || age >= 2000) {
+                data.outcome.errorCode = "STALE_FRAME";
+                data.outcome.errorMessage = QStringLiteral("预览帧已过期，请等待实时画面更新后重新抓拍");
+                return data;
+            }
+            data.frame = task.previewSnapshot.clone();
+            data.task.previewSnapshot.release();
+            data.outcome.capturedAt = task.previewCapturedAt;
+            data.outcome.capturedFrame = data.frame;
+            return data;
+        }
+        auto source = isolate ? CameraSourcePtr() : factory(task);
+        if (!source && !isolate) {
             data.outcome.errorCode = "UNSUPPORTED_PROTOCOL";
             data.outcome.errorMessage = QStringLiteral("协议尚未接入生产采集服务");
         } else {
-            const auto acquired = source->captureSnapshot();
+            const auto acquired = isolate ? isolatedCapture(task, cancel) : source->captureSnapshot();
             data.frame = acquired.frame;
-            source->close();
+            if (source) source->close();
             if (!acquired.ok()) {
                 data.frame.release();
                 data.outcome.errorCode = captureFailureName(acquired.failure == CaptureFailure::None
@@ -156,22 +164,32 @@ InspectionOutcome recognize(CapturedTask data, const std::shared_ptr<std::atomic
     try {
         QJsonObject frozen = data.task.historicalProfile;
         if (frozen.isEmpty()) {
-            QFile file(data.task.profilePath);
-            if (file.open(QIODevice::ReadOnly)) frozen = QJsonDocument::fromJson(file.readAll()).object();
+            // Capturing without recognition is still possible with no database,
+            // but an algorithm run never falls back to local files or defaults.
+            if (data.task.captureOnly && !DatabaseSettings::fromEnvironment().enabled) return out;
+            try {
+                const auto id = data.task.device.defaultProfileId.isEmpty()
+                    ? QStringLiteral("PRESSURE_GAUGE_1.6MPA") : data.task.device.defaultProfileId;
+                const auto record = MySqlRepository().loadTemplate(id);
+                frozen = QJsonObject{{"profiles", QJsonArray{record.definition}},
+                                     {"_database_template_id", record.id},
+                                     {"_database_template_revision", static_cast<double>(record.revision)}};
+            } catch (const std::exception& e) {
+                out.errorCode = "TEMPLATE_DATABASE_FAILED";
+                out.errorMessage = QString::fromUtf8(e.what());
+                return out;
+            }
         }
         out.profileSnapshot = frozen;
         if (data.task.captureOnly) return out;
         GaugeProfile profile;
         const auto& dev = data.task.device;
-        QTemporaryFile profileFile;
-        const auto profileBytes = QJsonDocument(frozen).toJson();
-        if (frozen.isEmpty() || !profileFile.open() || profileFile.write(profileBytes) != profileBytes.size()) {
+        if (frozen.isEmpty()) {
             out.errorCode = "PROFILE_INVALID";
             out.errorMessage = QStringLiteral("无法冻结仪表配置");
             return out;
         }
-        profileFile.flush();
-        if (!profile.loadFromFile(profileFile.fileName().toStdString(), dev.defaultProfileId.toStdString())) {
+        if (!profile.loadFromJson(frozen, dev.defaultProfileId.toStdString())) {
             out.errorCode = "PROFILE_INVALID";
             out.errorMessage = QStringLiteral("无法加载仪表配置");
             return out;
@@ -187,13 +205,10 @@ InspectionOutcome recognize(CapturedTask data, const std::shared_ptr<std::atomic
         profile.calibrated_height = dev.calibratedHeight;
         profile.auto_detect_roi = false;
         profile.save_debug_images = false; // Shared debug filenames are unsafe under concurrency.
-        if (frozen.contains("_runtime_enable_preprocessing"))
-            profile.enable_steps_4_to_9 = frozen["_runtime_enable_preprocessing"].toBool();
-        if (data.task.overridePreprocessing) profile.enable_steps_4_to_9 = data.task.enablePreprocessing;
-        out.profileSnapshot["_runtime_enable_preprocessing"] = profile.enable_steps_4_to_9;
         GaugeReaderEngine engine;
         out.recognitionPerformed = true;
         out.result = engine.process(data.frame, profile, data.task.runMode);
+        out.profileSnapshot["_runtime_quality_config"] = out.result.recognitionQuality["config"];
         if (!out.result.success) {
             out.errorCode = "RECOGNITION_FAILED";
             out.errorMessage = QString::fromStdString(out.result.errorMessage);
@@ -228,17 +243,9 @@ InspectionOutcome persist(InspectionOutcome out, const InspectionTask& task,
         saveImage(out.capturedFrame, "original.png", out.originalPath);
         saveImage(out.result.step2_rectified, "rectified.png", out.rectifiedPath);
         saveImage(out.result.step4_recognition, "recognition.png", out.recognitionPath);
-        QJsonArray debugSteps;
         if (task.runMode == GaugeRunMode::Debug) {
-            for (const auto& step : out.result.intermediateSteps) {
-                QString path;
-                saveImage(step.image, QString("step_%1.png").arg(step.stepNumber, 2, 10, QChar('0')), path);
-                QJsonObject entry;
-                entry["number"] = step.stepNumber;
-                entry["title"] = QString::fromStdString(step.title);
-                entry["path"] = path;
-                debugSteps.append(entry);
-            }
+            QString grayPath;
+            saveImage(out.result.step3_gray, "gray.png", grayPath);
             QString hudPath;
             saveImage(out.result.diagnosticHudImage, "diagnostic_hud.png", hudPath);
         }
@@ -253,7 +260,6 @@ InspectionOutcome persist(InspectionOutcome out, const InspectionTask& task,
         record["original_path"] = out.originalPath;
         record["review_image_available"] = !out.originalPath.isEmpty();
         record["recognition_path"] = out.recognitionPath;
-        record["debug_steps"] = debugSteps;
         record["center_inconsistent"] = out.result.centerInconsistent;
         record["center_offset_px"] = out.result.centerOffsetDist;
         record["warning"] = QString::fromStdString(out.result.warningMessage);
@@ -266,6 +272,7 @@ InspectionOutcome persist(InspectionOutcome out, const InspectionTask& task,
         record["value"] = out.result.success ? QJsonValue(out.result.value) : QJsonValue(QJsonValue::Null);
         record["unit"] = QString::fromStdString(out.result.unit);
         record["confidence"] = out.result.confidence;
+        record["recognition_quality"] = out.result.recognitionQuality;
         record["error_code"] = out.errorCode;
         record["error_message"] = out.errorMessage.isEmpty() ? QString::fromStdString(out.result.errorMessage) : out.errorMessage;
         const QByteArray json = QJsonDocument(record).toJson();
@@ -299,6 +306,7 @@ InspectionOutcome persist(InspectionOutcome out, const InspectionTask& task,
     compact.unit = out.result.unit;
     compact.pointer_angle_deg = out.result.pointer_angle_deg;
     compact.confidence = out.result.confidence;
+    compact.recognitionQuality = out.result.recognitionQuality;
     compact.centerInconsistent = out.result.centerInconsistent;
     compact.centerOffsetDist = out.result.centerOffsetDist;
     compact.warningMessage = out.result.warningMessage;
@@ -315,7 +323,7 @@ CameraSourcePtr InspectionService::createCameraSource(const InspectionTask& task
 }
 
 InspectionService::InspectionService(QObject* parent, int maxConcurrent, SourceFactory factory)
-    : QObject(parent), m_factory(factory ? std::move(factory) : SourceFactory(createSource)),
+    : QObject(parent), m_factory(factory ? factory : SourceFactory(createSource)), m_isolateCapture(!factory),
       m_limit(std::max(1, maxConcurrent)) {
     qRegisterMetaType<InspectionOutcome>();
     m_capturePool.setMaxThreadCount(m_limit);
@@ -410,8 +418,8 @@ void InspectionService::dispatch() {
             }));
         });
         const auto factory = m_factory;
-        captureWatcher->setFuture(QtConcurrent::run(&m_capturePool, [task, factory, cancel]() {
-            return capture(task, factory, cancel);
+        captureWatcher->setFuture(QtConcurrent::run(&m_capturePool, [task, factory, cancel, isolate = m_isolateCapture]() {
+            return capture(task, factory, cancel, isolate);
         }));
     }
     if (m_active == 0 && (m_cancel->load() || m_next == m_tasks.size())) {

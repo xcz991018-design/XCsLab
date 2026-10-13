@@ -68,6 +68,9 @@ set(CLI_SOURCES
 
 # GUI Target Sources
 set(GUI_SOURCES
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/GaugeTemplateStore.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/GaugeTemplateDialog.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/include/GaugeTemplateDialog.hpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/MySqlErrorText.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/DatabaseSettingsStore.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/DatabaseConnectionDialog.cpp"
@@ -104,6 +107,7 @@ add_executable(gauge_reader_test ${CLI_SOURCES})
 target_link_libraries(gauge_reader_test PRIVATE ${OpenCV_LIBS} ${QT_LIBS} ws2_32)
 
 add_executable(gauge_reader_gui WIN32 ${GUI_SOURCES})
+target_sources(gauge_reader_gui PRIVATE src/IsolatedCapture.cpp)
 target_link_libraries(gauge_reader_gui PRIVATE ${OpenCV_LIBS} ${QT_LIBS} gauge_mysql_client ws2_32 crypt32)
 
 # Copy DLLs and config files to target binary directory
@@ -142,6 +146,7 @@ add_custom_command(TARGET gauge_reader_test POST_BUILD
 
 # Headless runtime: same inspection pipeline, no MainWindow dependency.
 add_library(gauge_inspection_runtime STATIC
+    src/GaugeTemplateStore.cpp src/GaugeTemplateMigration.cpp
     src/MySqlErrorText.cpp
     src/DatabaseSettingsStore.cpp
     src/MySqlRepository.cpp src/DeviceCodec.cpp include/DeviceConfigManager.hpp
@@ -151,9 +156,40 @@ add_library(gauge_inspection_runtime STATIC
     src/GaugeReaderEngine.cpp src/PointerDetector.cpp src/ONVIFDeviceManager.cpp)
 target_link_libraries(gauge_inspection_runtime PUBLIC ${OpenCV_LIBS} ${QT_LIBS} gauge_mysql_client ws2_32 crypt32)
 add_executable(gauge_reader_service src/main_service.cpp)
+target_sources(gauge_inspection_runtime PRIVATE src/IsolatedCapture.cpp)
 target_link_libraries(gauge_reader_service PRIVATE gauge_inspection_runtime)
+target_link_libraries(gauge_reader_test PRIVATE gauge_inspection_runtime)
 include(CTest)
 if(BUILD_TESTING)
+    add_executable(camera_discovery_target_tests tests/CameraDiscoveryTargetsTest.cpp)
+    target_link_libraries(camera_discovery_target_tests PRIVATE gauge_inspection_runtime)
+    add_test(NAME camera_discovery_saved_targets COMMAND camera_discovery_target_tests)
+    add_executable(snapshot_frame_tests tests/SnapshotFrameReaderTest.cpp)
+    target_link_libraries(snapshot_frame_tests PRIVATE gauge_inspection_runtime)
+    add_test(NAME snapshot_decoder_warmup COMMAND snapshot_frame_tests)
+    set_tests_properties(snapshot_decoder_warmup PROPERTIES TIMEOUT 15)
+    add_executable(gauge_template_tests tests/GaugeTemplateTest.cpp src/GaugeTemplateDialog.cpp include/GaugeTemplateDialog.hpp src/CameraInfoEditDialog.cpp include/CameraInfoEditDialog.hpp)
+    target_link_libraries(gauge_template_tests PRIVATE gauge_inspection_runtime)
+    add_test(NAME gauge_template_management COMMAND gauge_template_tests)
+    set_tests_properties(gauge_template_management PROPERTIES ENVIRONMENT "QT_QPA_PLATFORM=offscreen" TIMEOUT 30)
+    if(WIN32 AND TARGET Qt5::Core)
+        get_target_property(template_qt_core Qt5::Core IMPORTED_LOCATION_RELEASE)
+        get_filename_component(template_qt_bin "${template_qt_core}" DIRECTORY)
+        if(EXISTS "${template_qt_bin}/../plugins/platforms/qoffscreen.dll")
+            add_custom_command(TARGET gauge_template_tests POST_BUILD
+                COMMAND ${CMAKE_COMMAND} -E make_directory "$<TARGET_FILE_DIR:gauge_template_tests>/platforms"
+                COMMAND ${CMAKE_COMMAND} -E copy_if_different "${template_qt_bin}/../plugins/platforms/qoffscreen.dll" "$<TARGET_FILE_DIR:gauge_template_tests>/platforms")
+        endif()
+    endif()
+    add_executable(tail_endpoint_tests tests/TailEndpointTest.cpp)
+    target_link_libraries(tail_endpoint_tests PRIVATE gauge_inspection_runtime)
+    add_test(NAME tail_endpoints_12345 COMMAND tail_endpoint_tests "${CMAKE_CURRENT_SOURCE_DIR}/test_images/12345.png")
+    add_executable(recognition_quality_tests tests/RecognitionQualityTest.cpp)
+    target_link_libraries(recognition_quality_tests PRIVATE ${OpenCV_LIBS} ${QT_LIBS})
+    add_test(NAME recognition_quality_advisory COMMAND recognition_quality_tests)
+    add_executable(isolated_capture_tests tests/IsolatedCaptureTest.cpp)
+    target_link_libraries(isolated_capture_tests PRIVATE gauge_inspection_runtime)
+    add_test(NAME isolated_capture_deadlines COMMAND isolated_capture_tests)
     file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/tests-disabled-mysql.json" "{\"version\":1,\"enabled\":false}")
     add_executable(inspection_service_tests tests/InspectionServiceTest.cpp)
     target_link_libraries(inspection_service_tests PRIVATE gauge_inspection_runtime)
@@ -162,6 +198,9 @@ if(BUILD_TESTING)
     target_link_libraries(gauge_run_mode_tests PRIVATE gauge_inspection_runtime)
     add_test(NAME gauge_run_modes COMMAND gauge_run_mode_tests)
     add_executable(input_acquisition_tests tests/InputAcquisitionTest.cpp)
+    add_executable(onvif_resolution_tests tests/OnvifResolutionTest.cpp)
+    target_link_libraries(onvif_resolution_tests PRIVATE gauge_inspection_runtime)
+    add_test(NAME onvif_stream_resolution COMMAND onvif_resolution_tests)
     target_link_libraries(input_acquisition_tests PRIVATE gauge_inspection_runtime)
     add_test(NAME explicit_input_acquisition COMMAND input_acquisition_tests)
     add_executable(mysql_integration_tests tests/MySqlIntegrationTest.cpp src/DatabaseHistoryDialog.cpp src/DatabaseConnectionDialog.cpp)
@@ -181,8 +220,17 @@ if(BUILD_TESTING)
 endif()
 
 if(WIN32)
-    foreach(runtime_target gauge_reader_gui gauge_reader_service inspection_service_tests gauge_run_mode_tests input_acquisition_tests mysql_integration_tests database_configuration_tests)
+    foreach(runtime_target gauge_reader_gui gauge_reader_service camera_discovery_target_tests snapshot_frame_tests gauge_template_tests isolated_capture_tests inspection_service_tests gauge_run_mode_tests input_acquisition_tests onvif_resolution_tests mysql_integration_tests database_configuration_tests)
         if(TARGET ${runtime_target})
+            foreach(qt_module Core Network Concurrent)
+                if(TARGET Qt5::${qt_module})
+                    add_custom_command(TARGET ${runtime_target} POST_BUILD
+                        COMMAND ${CMAKE_COMMAND} -E copy_if_different "$<TARGET_FILE:Qt5::${qt_module}>" "$<TARGET_FILE_DIR:${runtime_target}>")
+                elseif(TARGET Qt6::${qt_module})
+                    add_custom_command(TARGET ${runtime_target} POST_BUILD
+                        COMMAND ${CMAKE_COMMAND} -E copy_if_different "$<TARGET_FILE:Qt6::${qt_module}>" "$<TARGET_FILE_DIR:${runtime_target}>")
+                endif()
+            endforeach()
             foreach(client_dll "${MYSQL_ROOT}/lib/libmysql.dll" "${MYSQL_ROOT}/bin/libssl-3-x64.dll" "${MYSQL_ROOT}/bin/libcrypto-3-x64.dll")
                 if(EXISTS "${client_dll}")
                     add_custom_command(TARGET ${runtime_target} POST_BUILD

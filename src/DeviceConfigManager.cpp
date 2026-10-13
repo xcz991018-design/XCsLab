@@ -13,6 +13,82 @@
 #include <QCoreApplication>
 #include <QDebug>
 #include <QUrl>
+#include <QHostAddress>
+
+namespace {
+QString networkAddress(const QJsonObject& device) {
+    const auto type = deviceFromJson(device).protocolType;
+    if (type != CameraProtocolType::ONVIF_RTSP_STREAM && type != CameraProtocolType::SDK_JLINK) return {};
+    QHostAddress address;
+    if (!address.setAddress(device["ip_or_sn"].toString().trimmed())) return {};
+    return address.toString();
+}
+bool automaticId(const QString& id) {
+    return id.startsWith("CAM_ONVIF_") || id.startsWith("CAM_IP_");
+}
+bool mergeDuplicateDevices(QJsonObject& root) {
+    QJsonArray retained;
+    auto system = root["system"].toObject();
+    bool changed = false;
+    for (const auto& value : root["devices"].toArray()) {
+        auto incoming = value.toObject();
+        const auto address = networkAddress(incoming);
+        int match = -1;
+        for (int i = 0; !address.isEmpty() && i < retained.size(); ++i) {
+            const auto existing = retained[i].toObject();
+            if (networkAddress(existing) == address &&
+                (automaticId(existing["camera_id"].toString()) || automaticId(incoming["camera_id"].toString()))) {
+                match = i; break;
+            }
+        }
+        if (match < 0) { retained.append(incoming); continue; }
+        auto existing = retained[match].toObject();
+        // Prefer a user-created, calibrated or active archive over a discovery placeholder.
+        const auto score = [&](const QJsonObject& device) {
+            int result = automaticId(device["camera_id"].toString()) ? 0 : 1000;
+            const auto defaults = deviceToJson(DiscoveredCameraItem{}, true).value("calibration");
+            if (device.contains("calibration") && device["calibration"] != defaults) result += 100;
+            if (device["camera_id"] == system["last_active_device_id"]) result += 10;
+            if (!device["password"].toString().isEmpty()) result += 1;
+            return result;
+        };
+        if (score(incoming) > score(existing)) { auto temp = existing; existing = incoming; incoming = temp; }
+        for (auto it = incoming.begin(); it != incoming.end(); ++it) {
+            if (!existing.contains(it.key()) || existing[it.key()].isNull() ||
+                (existing[it.key()].isString() && existing[it.key()].toString().isEmpty()))
+                existing[it.key()] = it.value();
+        }
+        existing["is_auto_connect"] = existing["is_auto_connect"].toBool() || incoming["is_auto_connect"].toBool();
+        if (system["last_active_device_id"] == incoming["camera_id"])
+            system["last_active_device_id"] = existing["camera_id"];
+        retained[match] = existing;
+        changed = true;
+    }
+    if (changed) { root["devices"] = retained; root["system"] = system; }
+    return changed;
+}
+// Retire only the original demo records, never cameras converted to a real protocol.
+bool removeLegacyDemoDevices(QJsonObject& root) {
+    const QStringList demoIds = {"CAM_20", "CAM_5-1-2", "CAM_5-3-1", "CAM_5-3-4", "CAM_5-4-1"};
+    QJsonArray retained;
+    bool removed = false;
+    auto system = root["system"].toObject();
+    for (const auto& value : root["devices"].toArray()) {
+        const auto device = value.toObject();
+        if (demoIds.contains(device["camera_id"].toString()) &&
+            device["protocol_type"].toString() == "LOCAL_FILE") {
+            removed = true;
+            if (system["last_active_device_id"] == device["camera_id"])
+                system["last_active_device_id"] = QString();
+        } else retained.append(value);
+    }
+    if (removed) {
+        root["devices"] = retained;
+        root["system"] = system;
+    }
+    return removed;
+}
+}
 
 DeviceConfigManager& DeviceConfigManager::instance() {
     static DeviceConfigManager inst;
@@ -62,55 +138,6 @@ QString DeviceConfigManager::resolveConfigPath(const QString& preferredPath) {
     return defaultTarget;
 }
 
-void DeviceConfigManager::populateDefaultsIfEmpty() {
-    if (!m_devices.isEmpty()) return;
-
-    struct PresetDevice {
-        QString id;
-        QString name;
-        QString ip;
-        CameraProtocolType proto;
-        QString protoName;
-        QString model;
-        int port;
-        int rtspPort;
-        QString rtspUrl;
-        QString profile;
-        bool isAuto;
-    };
-
-    PresetDevice presets[] = {
-        {"CAM_5-3-1", "主变1号油压表监控", "192.168.1.101", CameraProtocolType::LOCAL_FILE, "智能图像采集终端", "Pressure Gauge Sensor Node", 80, 554, "", "PRESSURE_GAUGE_1.6MPA", true},
-        {"CAM_5-1-2", "2号变压器油温表监控", "192.168.1.102", CameraProtocolType::LOCAL_FILE, "智能图像采集终端", "Pressure Gauge Sensor Node", 80, 554, "", "PRESSURE_GAUGE_1.6MPA", false},
-        {"CAM_5-3-4", "高压进线柜气压表监控", "192.168.1.103", CameraProtocolType::LOCAL_FILE, "智能图像采集终端", "Pressure Gauge Sensor Node", 80, 554, "", "PRESSURE_GAUGE_1.6MPA", false},
-        {"CAM_5-4-1", "GIS开关气压表监控", "192.168.1.104", CameraProtocolType::LOCAL_FILE, "智能图像采集终端", "Pressure Gauge Sensor Node", 80, 554, "", "PRESSURE_GAUGE_1.6MPA", false},
-        {"CAM_20", "20号变电柜备用监测节点", "192.168.1.120", CameraProtocolType::LOCAL_FILE, "智能图像采集终端", "Pressure Gauge Sensor Node", 80, 554, "", "PRESSURE_GAUGE_1.6MPA", false}
-    };
-
-    for (const auto& p : presets) {
-        DiscoveredCameraItem item;
-        item.cameraId = p.id;
-        item.customName = p.name;
-        item.ipOrSn = p.ip;
-        item.protocolType = p.proto;
-        item.protocolName = p.protoName;
-        item.modelName = p.model;
-        item.port = p.port;
-        item.rtspPort = p.rtspPort;
-        item.rtspUrl = p.rtspUrl;
-        item.username = "";
-        item.password = "";
-        item.defaultProfileId = p.profile;
-        item.isAutoConnect = p.isAuto;
-        item.isOnline = true;
-        item.lastSeenTime = QDateTime::currentDateTime().toString("yyyy-MM-dd HH:mm:ss");
-        m_devices.insert(item.cameraId, item);
-    }
-
-    m_lastActiveDeviceId = "CAM_5-3-1";
-    m_autoConnectOnStartup = true;
-}
-
 bool DeviceConfigManager::load(const QString& configPath) {
     QMutexLocker locker(&m_mutex);
 
@@ -123,6 +150,7 @@ bool DeviceConfigManager::load(const QString& configPath) {
     const auto localData = hasLocal ? file.readAll() : QByteArray();
     file.close();
     QByteArray data = localData;
+    bool migrated = false;
     if (DatabaseSettings::fromEnvironment().enabled) {
         try {
             // Do not overwrite a newer local pending archive with an older DB snapshot.
@@ -132,9 +160,9 @@ bool DeviceConfigManager::load(const QString& configPath) {
             auto root = repository.loadRegistry();
             const bool neverInitialized = !root.contains("system");
             if (neverInitialized) {
-                auto local = QJsonDocument::fromJson(localData);
-                if (!local.isObject()) throw std::runtime_error("MYSQL_EMPTY_REGISTRY_REQUIRES_EXPLICIT_LOCAL_IMPORT");
-                repository.saveRegistry(MySqlRepository::sanitizedRegistry(local.object()));
+                // Start from the DB records; do not import stale demo/local devices implicitly.
+                root["system"] = QJsonObject{{"auto_connect_on_startup", true}, {"last_active_device_id", ""}};
+                repository.saveRegistry(MySqlRepository::sanitizedRegistry(root));
                 root = repository.loadRegistry();
             }
             // Passwords stay in the existing local credential file, matched by camera ID.
@@ -152,6 +180,9 @@ bool DeviceConfigManager::load(const QString& configPath) {
                 devices.append(device);
             }
             root["devices"] = devices;
+            migrated = removeLegacyDemoDevices(root);
+            migrated = mergeDuplicateDevices(root) || migrated;
+            if (migrated) repository.saveRegistry(MySqlRepository::sanitizedRegistry(root));
             data = QJsonDocument(root).toJson();
             m_lastError.clear();
         } catch (const std::exception& e) {
@@ -159,7 +190,8 @@ bool DeviceConfigManager::load(const QString& configPath) {
             return false; // Never manufacture demo devices after a DB failure.
         }
     } else if (!hasLocal) {
-        populateDefaultsIfEmpty();
+        m_devices.clear();
+        m_lastActiveDeviceId.clear();
         locker.unlock();
         save(path);
         return true;
@@ -167,12 +199,13 @@ bool DeviceConfigManager::load(const QString& configPath) {
 
     QJsonDocument doc = QJsonDocument::fromJson(data);
     if (!doc.isObject()) {
-        populateDefaultsIfEmpty();
         return false;
     }
 
     m_devices.clear();
     QJsonObject root = doc.object();
+    migrated = removeLegacyDemoDevices(root) || migrated;
+    migrated = mergeDuplicateDevices(root) || migrated;
 
     if (root.contains("system")) {
         QJsonObject sys = root["system"].toObject();
@@ -187,15 +220,13 @@ bool DeviceConfigManager::load(const QString& configPath) {
 
         auto item = deviceFromJson(obj);
         if (item.cameraId.isEmpty()) continue;
+        item.isOnline = false; // Current connectivity must be checked after restoring the archive.
 
         m_devices.insert(item.cameraId, item);
     }
 
-    if (m_devices.isEmpty() && !DatabaseSettings::fromEnvironment().enabled) {
-        populateDefaultsIfEmpty();
-    }
-
     if (m_lastActiveDeviceId.isEmpty() || !m_devices.contains(m_lastActiveDeviceId)) {
+        m_lastActiveDeviceId.clear();
         for (const auto& dev : m_devices) {
             if (dev.isAutoConnect) {
                 m_lastActiveDeviceId = dev.cameraId;
@@ -207,6 +238,10 @@ bool DeviceConfigManager::load(const QString& configPath) {
         }
     }
 
+    if (migrated) {
+        locker.unlock();
+        return save(path);
+    }
     return true;
 }
 
@@ -294,6 +329,34 @@ DiscoveredCameraItem DeviceConfigManager::getDevice(const QString& cameraId) con
 bool DeviceConfigManager::hasDevice(const QString& cameraId) const {
     QMutexLocker locker(&m_mutex);
     return m_devices.contains(cameraId);
+}
+
+DiscoveredCameraItem DeviceConfigManager::registerDiscoveredDevice(const DiscoveredCameraItem& item, bool autoSave) {
+    DiscoveredCameraItem registered = item;
+    {
+        QMutexLocker locker(&m_mutex);
+        const auto address = networkAddress(deviceToJson(item, false));
+        auto match = m_devices.find(item.cameraId);
+        if (match == m_devices.end() && !address.isEmpty()) {
+            for (auto it = m_devices.begin(); it != m_devices.end(); ++it) {
+                if (networkAddress(deviceToJson(it.value(), false)) == address) { match = it; break; }
+            }
+        }
+        if (match != m_devices.end()) {
+            registered = match.value();
+            // Discovery refreshes reachability without replacing configured connection or calibration.
+            registered.isOnline = item.isOnline;
+            registered.lastSeenTime = item.lastSeenTime;
+        }
+        if (registered.lastSeenTime.isEmpty())
+            registered.lastSeenTime = QDateTime::currentDateTime().toString("yyyy-MM-dd HH:mm:ss");
+        m_devices.insert(registered.cameraId, registered);
+    }
+    if (autoSave && !save()) {
+        { QMutexLocker locker(&m_mutex); if (m_lastError.isEmpty()) m_lastError = "DEVICE_REGISTRATION_SAVE_FAILED"; }
+        emit databaseStatus(lastError());
+    }
+    return registered;
 }
 
 void DeviceConfigManager::addOrUpdateDevice(const DiscoveredCameraItem& item, bool autoSave) {

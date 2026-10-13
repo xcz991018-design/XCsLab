@@ -221,8 +221,8 @@ void InteractiveImageLabel::mouseReleaseEvent(QMouseEvent *event) {
 
 // ---------------- CardinalSelectorDialog ----------------
 
-CardinalSelectorDialog::CardinalSelectorDialog(const cv::Mat& frame, GaugeProfile& profile, const QString& configPath, const QString& cameraId, QWidget *parent)
-    : QDialog(parent), m_frame(frame), m_profile(profile), m_configPath(configPath), m_cameraId(cameraId) {
+CardinalSelectorDialog::CardinalSelectorDialog(const cv::Mat& frame, GaugeProfile& profile, const QString& cameraId, QWidget *parent)
+    : QDialog(parent), m_frame(frame), m_profile(profile), m_cameraId(cameraId) {
     setupUi();
     
     bool ptsValid = (m_profile.perspective_pts.size() == 4);

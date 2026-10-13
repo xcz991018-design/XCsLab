@@ -2,6 +2,10 @@
 #include "SDKCameraSourceStub.hpp"
 #include "GaugeProfile.hpp"
 #include "GaugeReaderEngine.hpp"
+#include "MySqlRepository.hpp"
+#include "DeviceCodec.hpp"
+#include <QCoreApplication>
+#include <QJsonArray>
 
 #include <iostream>
 #include <memory>
@@ -20,8 +24,8 @@ void printHelp(const char* progName) {
     std::cout << "Usage: " << progName << " [options]\n\n"
               << "Options:\n"
               << "  --image <path>       Path to gauge input image or directory\n"
-              << "  --config <path>      Path to centralized devices.json or gauge_profile.json\n"
-              << "  --camera-id <id>     Target Camera ID inside central devices.json registry\n"
+              << "  --template-id <id>   Algorithm template ID in MySQL\n"
+              << "  --camera-id <id>     Target Camera ID in database registry\n"
               << "  --output <path>      Path to save overlay result image (default: result.png)\n"
               << "  --mode <mode>        production, evidence, debug (default: debug)\n"
               << "  --sdk-stub           Run in reserved Camera SDK Stub mode\n"
@@ -29,26 +33,12 @@ void printHelp(const char* progName) {
 }
 
 int main(int argc, char** argv) {
+    QCoreApplication app(argc, argv);
     printBanner();
 
     std::string imagePath = "";
-    std::string configPath = "config/devices.json";
-    try {
-        std::filesystem::path exeDir = std::filesystem::absolute(argv[0]).parent_path();
-        std::filesystem::path localConfig = exeDir / "config" / "devices.json";
-        if (std::filesystem::exists(localConfig)) {
-            configPath = localConfig.string();
-        } else if (std::filesystem::exists("config/devices.json")) {
-            configPath = "config/devices.json";
-        } else if (std::filesystem::exists("../config/devices.json")) {
-            configPath = "../config/devices.json";
-        } else if (std::filesystem::exists("config/gauge_profile.json")) {
-            configPath = "config/gauge_profile.json";
-        }
-    } catch (...) {
-        // Fallback to relative default
-    }
-    std::string cameraId = "CAM_5-3-1";
+    std::string templateId = "PRESSURE_GAUGE_1.6MPA";
+    std::string cameraId;
     std::string outputPath = "result.png";
     bool runSdkStub = false;
     GaugeRunMode runMode = GaugeRunMode::Debug;
@@ -57,8 +47,8 @@ int main(int argc, char** argv) {
         std::string arg = argv[i];
         if (arg == "--image" && i + 1 < argc) {
             imagePath = argv[++i];
-        } else if (arg == "--config" && i + 1 < argc) {
-            configPath = argv[++i];
+        } else if (arg == "--template-id" && i + 1 < argc) {
+            templateId = argv[++i];
         } else if (arg == "--camera-id" && i + 1 < argc) {
             cameraId = argv[++i];
         } else if (arg == "--output" && i + 1 < argc) {
@@ -77,11 +67,24 @@ int main(int argc, char** argv) {
         }
     }
 
-    // Load Calibration Profile from Central Registry or Single File
+    // All normal runtime templates come from MySQL.
     GaugeProfile profile;
-    if (!profile.loadFromFile(configPath, cameraId)) {
-        std::cout << "[Main] Using default calibration profile." << std::endl;
-    }
+    try {
+        MySqlRepository repository;
+        if (!cameraId.empty()) {
+            bool found = false;
+            for (const auto& value : repository.loadRegistry()["devices"].toArray()) {
+                const auto device = deviceFromJson(value.toObject());
+                if (device.cameraId.toStdString() == cameraId) {
+                    templateId = device.defaultProfileId.toStdString(); found = true; break;
+                }
+            }
+            if (!found) { std::cerr << "CAMERA_NOT_FOUND\n"; return 2; }
+        }
+        if (!profile.loadFromJson(repository.loadTemplate(QString::fromStdString(templateId)).definition)) {
+            std::cerr << "DATABASE_TEMPLATE_INVALID\n"; return 2;
+        }
+    } catch (const std::exception& error) { std::cerr << error.what() << '\n'; return 2; }
 
     // Select Camera Source (Abstraction Layer)
     CameraSourcePtr cameraSource;

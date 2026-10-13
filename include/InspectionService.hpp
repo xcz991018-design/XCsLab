@@ -22,7 +22,6 @@ inline const char* inspectionInputName(InspectionInputKind kind) {
 struct InspectionTask {
     QString taskId;
     DiscoveredCameraItem device;
-    QString profilePath;
     QString localImagePath;
     QString outputDirectory;
     GaugeRunMode runMode{GaugeRunMode::Production};
@@ -30,9 +29,11 @@ struct InspectionTask {
     QString parentTaskId;
     QDateTime originalCapturedAt;
     bool captureOnly{false};
+    // Owned copy of the live preview frame selected by the snapshot button.
+    cv::Mat previewSnapshot;
+    QDateTime previewCapturedAt;
+    int captureTimeoutMs{8000}; // Whole network acquisition, including process startup/close.
     bool returnImages{false};
-    bool overridePreprocessing{false};
-    bool enablePreprocessing{false};
     QString databaseOriginalTaskId;
     QJsonObject historicalProfile;
     bool useHistoricalConfiguration{true};
@@ -90,6 +91,7 @@ private:
     QThreadPool m_recognitionPool;
     QThreadPool m_storagePool;
     SourceFactory m_factory;
+    bool m_isolateCapture{false};
     QList<InspectionTask> m_tasks;
     std::shared_ptr<std::atomic<bool>> m_cancel;
     int m_limit;

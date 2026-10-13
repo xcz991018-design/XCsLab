@@ -74,7 +74,7 @@ protected:
 
 private slots:
     void onSelectImage();
-    void onLoadConfig();
+    void onManageGaugeTemplates();
     void onRunRecognition();
     void onRecognitionFinished();
     void onCameraSelectionChanged();
@@ -91,9 +91,7 @@ private slots:
     void onSetDeviceAsDefaultAutoConnect();
     void onDeviceCustomContextMenu(const QPoint& pos);
 
-    // Intermediate Processing Steps Slots
-    void onExportAllSteps();
-    void onShowEnlargedStepImage(int stepNumber);
+    // Pointer diagnostic window
     void onShowDiagnosticWindow();
 
     // Stage 0: Live Stream & Capture Slots
@@ -125,16 +123,13 @@ private:
     void showInspectionPhotosDialog(int row);
 
     void applyDarkStyle();
-    void updateCameraListFromConfig(const QString& configPath);
     void loadAndRestoreSavedDevices();
     void updateDeviceListItemWidget(QListWidgetItem* item, const DiscoveredCameraItem& data);
     QListWidgetItem* findListItemByCameraId(const QString& camId);
-    QStringList loadCameraIdsFromConfig(const QString& configPath);
     void updateImageCard(QLabel* label, const cv::Mat& mat, const QString& title);
     static QImage cvMatToQImage(const cv::Mat& mat);
     void switchActiveCameraSource(const QString& camId);
     void applyCameraCalibrationAndProfile(const QString& camId);
-    void renderIntermediateStepsUI(const std::vector<ProcessingStepImage>& steps);
 
     // Top Status Bar Badges
     QLabel *m_statusChannelBadge{nullptr};
@@ -150,15 +145,12 @@ private:
     QListWidget *m_deviceListWidget{nullptr};
     QLineEdit *m_imagePathEdit{nullptr};
     QPushButton *m_browseImgBtn{nullptr};
-    QLineEdit *m_configPathEdit{nullptr};
     QPushButton *m_browseCfgBtn{nullptr};
     QPushButton *m_calibrateBtn{nullptr};
     QPushButton *m_snapAndRunBtn{nullptr};
     QPushButton *m_batchPatrolBtn{nullptr};
-    QCheckBox *m_enableSteps4To9Check{nullptr};
     QComboBox *m_runModeCombo{nullptr};
     QPushButton *m_runBtn{nullptr};
-    QPushButton *m_exportStepsBtn{nullptr};
 
     // Metrics Display Cards
     QLabel *m_valLabel{nullptr};
@@ -195,20 +187,13 @@ private:
     // 4 Core Pipeline Stage Image Display Labels
     QLabel *m_imgStage1{nullptr}; // Step 1: 图像/视频采集原帧 (Original Stream Frame)
     QLabel *m_imgStage2{nullptr}; // Step 2: 视场透视矫正 (FOV Rectified Image)
-    QLabel *m_imgStage3{nullptr}; // Step 3: 图像二值预处理 (Preprocessed Image)
+    QLabel *m_imgStage3{nullptr}; // Step 3: 检测输入灰度图 (Grayscale Input)
     QLabel *m_imgStage4{nullptr}; // Step 4: 最终仪表读数识别 (Final Recognition Overlay)
-
-    // Complete Step-by-Step Intermediate Pipeline Cards Container
-    QWidget *m_allStepsGridContainer{nullptr};
-    QGridLayout *m_allStepsGridLayout{nullptr};
-    std::vector<QLabel*> m_imgStepLabels;
-    std::vector<QLabel*> m_titleStepLabels;
-    std::vector<QLabel*> m_descStepLabels;
 
     // Bottom System Log Console
     QTextEdit *m_logConsole{nullptr};
 
-    // Step 12 Diagnostics Independent Window
+    // Pointer Diagnostics Independent Window
     QDialog *m_diagnosticDialog{nullptr};
     QLabel *m_diagnosticImgLabel{nullptr};
     QTextEdit *m_diagnosticTextEdit{nullptr};
@@ -218,7 +203,8 @@ private:
     GaugeResult m_latestResult;
     cv::Mat m_currentFrame;
     QString m_currentImagePath;
-    QString m_currentConfigPath;
+    quint64 m_profileGeneration{0};
+    bool m_profileReady{false};
     InspectionService* m_singleService{nullptr};
     CameraPreviewService* m_previewService{nullptr};
     InspectionTask m_singleSubmittedTask;

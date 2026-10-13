@@ -46,7 +46,6 @@ int main(int argc, char** argv) {
         InspectionTask task;
         task.device.cameraId = QString::number(i);
         task.device.protocolType = CameraProtocolType::ONVIF_RTSP_STREAM;
-        task.profilePath = output.path() + "/missing.json";
         task.outputDirectory = output.path();
         tasks.append(task);
     }
@@ -59,7 +58,7 @@ int main(int argc, char** argv) {
     QObject::connect(&timeout, &QTimer::timeout, &loop, [&]() { timedOut = true; loop.quit(); });
     QObject::connect(&service, &InspectionService::taskFinished, &loop, [&](const InspectionOutcome& out) {
         ++count;
-        const QString expected = out.cameraId == "0" ? "UNSUPPORTED_PROTOCOL" : "PROFILE_INVALID";
+        const QString expected = out.cameraId == "0" ? "UNSUPPORTED_PROTOCOL" : "TEMPLATE_DATABASE_FAILED";
         if (out.errorCode != expected)
             std::cerr << out.errorCode.toStdString() << ": " << out.errorMessage.toStdString() << "\n";
         valid &= out.errorCode == expected;

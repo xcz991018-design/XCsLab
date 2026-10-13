@@ -1,5 +1,6 @@
 #include "CameraInfoEditDialog.hpp"
 #include "DeviceConfigManager.hpp"
+#include "GaugeTemplateDialog.hpp"
 #include <QFile>
 #include <QJsonDocument>
 #include <QJsonObject>
@@ -9,9 +10,16 @@
 #include <QCoreApplication>
 #include <QTabWidget>
 #include <QDebug>
+#include <QUrl>
+#include <QFutureWatcher>
+#include <QtConcurrent/QtConcurrent>
 
-CameraInfoEditDialog::CameraInfoEditDialog(const QString& configPath, const QString& cameraId, QWidget *parent, bool isNewDevice)
-    : QDialog(parent), m_configPath(configPath), m_originalCameraId(cameraId), m_isNewDevice(isNewDevice) {
+namespace {
+struct TemplateChoices { QStringList ids; QString error; };
+}
+
+CameraInfoEditDialog::CameraInfoEditDialog(const QString& cameraId, QWidget *parent, bool isNewDevice, GaugeTemplateBackend backend)
+    : QDialog(parent), m_templateBackend(std::move(backend)), m_originalCameraId(cameraId), m_isNewDevice(isNewDevice) {
     setupUi();
     loadCameraInfo();
 }
@@ -28,6 +36,8 @@ DiscoveredCameraItem CameraInfoEditDialog::getUpdatedDeviceItem() const {
     if (DeviceConfigManager::instance().hasDevice(m_originalCameraId)) {
         item = DeviceConfigManager::instance().getDevice(m_originalCameraId);
     }
+    const QString previousAddress = item.ipOrSn;
+    const QString previousStreamUrl = item.rtspUrl;
     item.cameraId = getUpdatedCameraId();
     item.customName = m_customNameEdit ? m_customNameEdit->text().trimmed() : "";
     item.ipOrSn = m_ipEdit ? m_ipEdit->text().trimmed() : "192.168.1.101";
@@ -57,11 +67,12 @@ DiscoveredCameraItem CameraInfoEditDialog::getUpdatedDeviceItem() const {
     item.port = m_portSpin ? m_portSpin->value() : 80;
     item.rtspPort = m_rtspPortSpin ? m_rtspPortSpin->value() : 554;
     item.rtspUrl = m_rtspUrlEdit ? m_rtspUrlEdit->text().trimmed() : "";
-    item.username = "";
-    item.password = "";
-    item.defaultProfileId = m_gaugeProfileCombo ? m_gaugeProfileCombo->currentText() : "PRESSURE_GAUGE_1.6MPA";
+    item.username = m_usernameEdit ? m_usernameEdit->text().trimmed() : "";
+    item.password = m_passwordEdit ? m_passwordEdit->text() : "";
+    item.defaultProfileId = m_gaugeProfileCombo ? m_gaugeProfileCombo->currentData().toString() : QString();
     item.isAutoConnect = m_autoConnectCheck ? m_autoConnectCheck->isChecked() : false;
-    item.isOnline = true;
+    if (m_isNewDevice || previousAddress != item.ipOrSn || previousStreamUrl != item.rtspUrl)
+        item.isOnline = false;
 
     // Asset & Physical Installation Metadata
     item.substation = m_substationEdit ? m_substationEdit->text().trimmed() : "";
@@ -76,44 +87,39 @@ DiscoveredCameraItem CameraInfoEditDialog::getUpdatedDeviceItem() const {
     return item;
 }
 
-QStringList CameraInfoEditDialog::loadAvailableProfiles() {
-    QStringList profiles;
-    std::vector<QString> candidates = {
-        QCoreApplication::applicationDirPath() + "/config/gauge_profile.json",
-        "config/gauge_profile.json",
-        "../config/gauge_profile.json",
-        "gauge_profile.json"
-    };
-
-    for (const auto& cand : candidates) {
-        QFile file(cand);
-        if (file.open(QIODevice::ReadOnly)) {
-            QJsonDocument doc = QJsonDocument::fromJson(file.readAll());
-            file.close();
-            if (doc.isObject()) {
-                QJsonObject root = doc.object();
-                QJsonArray arr = root.contains("profiles") ? root["profiles"].toArray() : root["cameras"].toArray();
-                for (const auto& val : arr) {
-                    if (val.isObject()) {
-                        QJsonObject obj = val.toObject();
-                        QString id = obj.contains("gauge_id") ? obj["gauge_id"].toString() : obj["profile_id"].toString();
-                        if (!id.isEmpty() && !profiles.contains(id)) {
-                            profiles.append(id);
-                        }
-                    }
-                }
-            }
-            if (!profiles.isEmpty()) break;
+void CameraInfoEditDialog::refreshProfiles(const QString& selected) {
+    const auto id = selected.isNull() ? m_gaugeProfileCombo->currentData().toString() : selected;
+    const auto generation = ++m_templateGeneration;
+    m_templatesLoading = true;
+    m_gaugeProfileCombo->setEnabled(false);
+    if (m_saveBtn) m_saveBtn->setEnabled(false);
+    if (m_templateStatus) m_templateStatus->setText(tr("正在读取数据库模板…"));
+    auto* watcher = new QFutureWatcher<TemplateChoices>(this);
+    connect(watcher, &QFutureWatcher<TemplateChoices>::finished, this, [this, watcher, id, generation]() {
+        const auto result = watcher->result(); watcher->deleteLater();
+        if (generation != m_templateGeneration) return;
+        m_templatesLoading = false;
+        m_availableProfileIds = result.ids;
+        m_gaugeProfileCombo->clear();
+        for (const auto& available : result.ids) m_gaugeProfileCombo->addItem(available, available);
+        if (!id.isEmpty()) {
+            int index = m_gaugeProfileCombo->findData(id);
+            if (index < 0) { m_gaugeProfileCombo->addItem(tr("%1（模板不存在）").arg(id), id); index = m_gaugeProfileCombo->count() - 1; }
+            m_gaugeProfileCombo->setCurrentIndex(index);
         }
-    }
-
-    if (profiles.isEmpty()) {
-        profiles << "PRESSURE_GAUGE_1.6MPA" << "PRESSURE_GAUGE_2.5MPA" << "VACUUM_GAUGE_1.0MPA" << "TEMP_GAUGE_150C";
-    }
-
-    return profiles;
+        m_gaugeProfileCombo->setEnabled(result.error.isEmpty());
+        if (m_saveBtn) m_saveBtn->setEnabled(result.error.isEmpty() && !result.ids.isEmpty());
+        m_gaugeProfileCombo->setToolTip(result.error);
+        if (m_templateStatus) m_templateStatus->setText(result.error.isEmpty()
+            ? result.ids.isEmpty() ? tr("数据库暂无模板，请点击“管理模板”新增。") : tr("模板来自 MySQL 数据库")
+            : tr("模板加载失败：%1").arg(result.error));
+    });
+    watcher->setFuture(QtConcurrent::run([backend = m_templateBackend]() {
+        GaugeTemplateStore store(backend); TemplateChoices result;
+        if (store.load(result.error)) result.ids = store.ids();
+        return result;
+    }));
 }
-
 void CameraInfoEditDialog::setupUi() {
     setWindowTitle(m_isNewDevice ? tr("➕ 添加新摄像头设备 (Add Camera Device)") : tr("✏️ 编辑摄像头与设备连接档案 (Device & Camera Editor)"));
     resize(640, 560);
@@ -169,7 +175,13 @@ void CameraInfoEditDialog::setupUi() {
     portLayout->addWidget(m_rtspPortSpin);
 
     m_rtspUrlEdit = new QLineEdit(netTab);
-    m_rtspUrlEdit->setPlaceholderText("留空则系统根据IP/端口自动生成标准 RTSP 地址");
+    m_rtspUrlEdit->setPlaceholderText(tr("可留空：通过 ONVIF 查询实际视频地址"));
+    m_rtspUrlEdit->setToolTip(tr("留空时使用 IP、ONVIF 服务端口及账号查询实际视频地址。设备不支持 ONVIF 时填写完整 RTSP 地址。地址内的账号优先于下方账号。"));
+    m_usernameEdit = new QLineEdit(netTab);
+    m_usernameEdit->setPlaceholderText(tr("摄像头视频访问账号"));
+    m_passwordEdit = new QLineEdit(netTab);
+    m_passwordEdit->setEchoMode(QLineEdit::Password);
+    m_passwordEdit->setPlaceholderText(tr("摄像头视频访问密码"));
 
     m_autoConnectCheck = new QCheckBox(tr("⭐ 设为开机默认自动连接此设备 (Auto-Connect on Startup)"), netTab);
     m_autoConnectCheck->setStyleSheet("QCheckBox { color: #ffd740; font-weight: bold; font-size: 13px; }");
@@ -178,8 +190,13 @@ void CameraInfoEditDialog::setupUi() {
     netForm->addRow(tr("设备别名/备注 (custom_name):"), m_customNameEdit);
     netForm->addRow(tr("通信协议 (protocol):"), m_protocolCombo);
     netForm->addRow(tr("设备IP/序列号 (ip_or_sn):"), m_ipEdit);
-    netForm->addRow(tr("控制端口 (port):"), portLayout);
+    netForm->addRow(tr("ONVIF 服务端口 (port):"), portLayout);
     netForm->addRow(tr("自定义 RTSP 地址 (rtsp_url):"), m_rtspUrlEdit);
+    netForm->addRow(tr("摄像头账号:"), m_usernameEdit);
+    netForm->addRow(tr("摄像头密码:"), m_passwordEdit);
+    auto* networkHint = new QLabel(tr("跨车间接入：按 IP/完整 RTSP 地址手动添加每台摄像头。\n计算机须能访问目标网段；跨 VLAN 路由及访问权限由现场网络配置。"), netTab);
+    networkHint->setWordWrap(true);
+    netForm->addRow(networkHint);
     netForm->addRow("", m_autoConnectCheck);
 
     m_tabWidget->addTab(netTab, tr("🌐 网络与自动连接配置"));
@@ -191,7 +208,8 @@ void CameraInfoEditDialog::setupUi() {
     gaugeForm->setLabelAlignment(Qt::AlignRight | Qt::AlignVCenter);
 
     m_gaugeProfileCombo = new QComboBox(gaugeTab);
-    m_gaugeProfileCombo->addItems(loadAvailableProfiles());
+    m_gaugeProfileCombo->setObjectName("deviceGaugeTemplate");
+    refreshProfiles();
     m_gaugeProfileCombo->setStyleSheet("QComboBox { color: #ffd700; font-weight: bold; }");
 
     m_substationEdit = new QLineEdit(gaugeTab);
@@ -218,7 +236,24 @@ void CameraInfoEditDialog::setupUi() {
     m_accuracyClassEdit = new QLineEdit(gaugeTab);
     m_accuracyClassEdit->setPlaceholderText(tr("例如: 1.6级 (必填)"));
 
-    gaugeForm->addRow(tr("表计算法模板 (gauge_profile):"), m_gaugeProfileCombo);
+    auto* profileRow = new QWidget(gaugeTab);
+    auto* profileLayout = new QHBoxLayout(profileRow);
+    profileLayout->setContentsMargins(0, 0, 0, 0);
+    profileLayout->addWidget(m_gaugeProfileCombo, 1);
+    auto* manageProfiles = new QPushButton(tr("管理模板…"), profileRow);
+    manageProfiles->setObjectName("manageDeviceGaugeTemplates");
+    profileLayout->addWidget(manageProfiles);
+    connect(manageProfiles, &QPushButton::clicked, this, [this]() {
+        GaugeTemplateDialog dialog(this, m_templateBackend);
+        connect(&dialog, &GaugeTemplateDialog::templatesChanged, this, [this]() { refreshProfiles(); });
+        dialog.exec();
+        refreshProfiles();
+    });
+    gaugeForm->addRow(tr("表计算法模板:"), profileRow);
+    m_templateStatus = new QLabel(tr("正在读取数据库模板…"), gaugeTab);
+    m_templateStatus->setWordWrap(true);
+    m_templateStatus->setTextFormat(Qt::PlainText);
+    gaugeForm->addRow(m_templateStatus);
     gaugeForm->addRow(tr("<font color='#ff5252'>*</font> 变电站/厂区 (substation):"), m_substationEdit);
     gaugeForm->addRow(tr("<font color='#ff5252'>*</font> 安装区域 (area):"), m_areaEdit);
     gaugeForm->addRow(tr("<font color='#ff5252'>*</font> 安装点位 (installation_location):"), m_locationEdit);
@@ -235,6 +270,7 @@ void CameraInfoEditDialog::setupUi() {
     // Action Buttons
     QHBoxLayout *btnLayout = new QHBoxLayout();
     m_saveBtn = new QPushButton(tr("💾 保存设备配置并立即生效"), this);
+    m_saveBtn->setEnabled(!m_templatesLoading && !m_availableProfileIds.isEmpty());
     m_cancelBtn = new QPushButton(tr("取消"), this);
 
     m_saveBtn->setStyleSheet("QPushButton { background-color: #00897b; color: white; font-weight: bold; padding: 8px 20px; border-radius: 4px; font-size: 13px; }"
@@ -284,6 +320,8 @@ void CameraInfoEditDialog::loadCameraInfo() {
         m_portSpin->setValue(dev.port > 0 ? dev.port : 80);
         m_rtspPortSpin->setValue(dev.rtspPort > 0 ? dev.rtspPort : 554);
         m_rtspUrlEdit->setText(dev.rtspUrl);
+        m_usernameEdit->setText(dev.username);
+        m_passwordEdit->setText(dev.password);
         m_autoConnectCheck->setChecked(dev.isAutoConnect);
 
         if (dev.protocolType == CameraProtocolType::ONVIF_RTSP_STREAM) {
@@ -297,7 +335,7 @@ void CameraInfoEditDialog::loadCameraInfo() {
         }
 
         if (!dev.defaultProfileId.isEmpty()) {
-            m_gaugeProfileCombo->setCurrentText(dev.defaultProfileId);
+            refreshProfiles(dev.defaultProfileId);
         }
 
         m_substationEdit->setText(dev.substation);
@@ -320,6 +358,12 @@ void CameraInfoEditDialog::onSave() {
 }
 
 bool CameraInfoEditDialog::saveCameraInfo() {
+    const auto selectedProfile = m_gaugeProfileCombo->currentData().toString();
+    if (m_templatesLoading || selectedProfile.isEmpty() || !m_availableProfileIds.contains(selectedProfile)) {
+        m_tabWidget->setCurrentIndex(1);
+        QMessageBox::warning(this, tr("验证失败"), tr("请选择有效的表计算法模板；可以点击“管理模板”新增模板。"));
+        return false;
+    }
     QString newCamId = getUpdatedCameraId();
     if (newCamId.isEmpty()) {
         if (m_tabWidget) m_tabWidget->setCurrentIndex(0);
@@ -333,6 +377,22 @@ bool CameraInfoEditDialog::saveCameraInfo() {
         QMessageBox::warning(this, tr("验证失败"), tr("设备别名/备注 (custom_name) 不能为空！"));
         m_customNameEdit->setFocus();
         return false;
+    }
+
+    if ((m_isNewDevice || newCamId != m_originalCameraId) &&
+        DeviceConfigManager::instance().hasDevice(newCamId)) {
+        QMessageBox::warning(this, tr("验证失败"), tr("设备编号已存在，请使用唯一编号，避免覆盖其他车间的摄像头。"));
+        return false;
+    }
+    if (m_protocolCombo->currentIndex() == 0) {
+        const QString address = m_rtspUrlEdit->text().trimmed();
+        const QUrl uri(address, QUrl::StrictMode);
+        if ((!address.isEmpty() && (!uri.isValid() || uri.scheme().compare("rtsp", Qt::CaseInsensitive) != 0 || uri.host().isEmpty() || uri.port(554) <= 0)) ||
+            (address.isEmpty() && m_ipEdit->text().trimmed().isEmpty())) {
+            m_tabWidget->setCurrentIndex(0);
+            QMessageBox::warning(this, tr("验证失败"), tr("请填写摄像头 IP/主机名，或有效的完整地址 rtsp://主机:端口/视频路径。"));
+            return false;
+        }
     }
 
     // Strict validation for Tab 2 (Physical Installation & Gauge Spec Metadata)

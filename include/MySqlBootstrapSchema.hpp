@@ -1,4 +1,4 @@
-// Initial schema for new databases; keep aligned with migrations 001-003.
+// Base schema for new databases; MySqlTemplateSchema adds migration 004.
 #pragma once
 inline constexpr const char* MySqlBootstrapSchema = R"SQL(CREATE TABLE IF NOT EXISTS camera_archives (
     camera_id VARCHAR(128) COLLATE utf8mb4_bin PRIMARY KEY,

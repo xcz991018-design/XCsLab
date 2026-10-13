@@ -1,6 +1,8 @@
 #include "MainWindow.hpp"
+#include "RecognitionQuality.hpp"
 #include "CardinalSelectorDialog.hpp"
 #include "CameraInfoEditDialog.hpp"
+#include "GaugeTemplateDialog.hpp"
 #include <QFileDialog>
 #include <QMessageBox>
 #include <QFileInfo>
@@ -24,6 +26,15 @@ MainWindow::MainWindow(QWidget *parent) : QMainWindow(parent) {
     m_discoveryService = new AutoCameraDiscoveryService(this);
     connect(m_discoveryService, &AutoCameraDiscoveryService::logGenerated, this, &MainWindow::onLogReceived);
     connect(m_discoveryService, &AutoCameraDiscoveryService::cameraDiscovered, this, &MainWindow::onDiscoveredCameraAdded);
+    connect(m_discoveryService, &AutoCameraDiscoveryService::cameraOnlineStateChanged, this,
+            [this](const QString& cameraId, bool online) {
+        if (!m_discoveredItemsMap.contains(cameraId)) return;
+        DeviceConfigManager::instance().markDeviceOnline(cameraId, online);
+        auto& device = m_discoveredItemsMap[cameraId];
+        device.isOnline = online;
+        if (online) device.lastSeenTime = QDateTime::currentDateTime().toString("yyyy-MM-dd HH:mm:ss");
+        if (auto* row = findListItemByCameraId(cameraId)) updateDeviceListItemWidget(row, device);
+    });
 
     setupUi();
     applyDarkStyle();
@@ -124,12 +135,20 @@ MainWindow::MainWindow(QWidget *parent) : QMainWindow(parent) {
     connect(m_previewService, &CameraPreviewService::frameReady, this,
             [this](const QString& cameraId, const FrameCaptureResult& result) {
         if (!m_isLiveStreaming) return;
+        if (m_discoveredItemsMap.contains(cameraId)) {
+            DeviceConfigManager::instance().markDeviceOnline(cameraId, result.ok());
+            auto& device = m_discoveredItemsMap[cameraId];
+            device.isOnline = result.ok();
+            if (result.ok()) device.lastSeenTime = QDateTime::currentDateTime().toString("yyyy-MM-dd HH:mm:ss");
+            if (auto* row = findListItemByCameraId(cameraId)) updateDeviceListItemWidget(row, device);
+        }
         m_liveCamInfoBadge->setText(tr("设备: %1 | 采集状态: %2").arg(cameraId, captureFailureName(result.failure)));
         if (m_visionTabWidget->currentIndex() == 0) {
             if (result.ok()) updateImageCard(m_liveStreamLabel, result.frame, "Live frame");
             else {
                 m_liveStreamLabel->clear();
                 m_liveStreamLabel->setText(tr("暂无真实画面: %1").arg(captureFailureName(result.failure)));
+                if (!result.message.empty()) m_liveStreamLabel->setText(tr("暂无真实画面: %1\n%2").arg(captureFailureName(result.failure), QString::fromStdString(result.message)));
             }
         }
     });
@@ -137,46 +156,36 @@ MainWindow::MainWindow(QWidget *parent) : QMainWindow(parent) {
     m_autoPatrolTimer = new QTimer(this);
     connect(m_autoPatrolTimer, &QTimer::timeout, this, &MainWindow::onStartAllDevicesInspection);
 
-    // Default paths setup: prioritize local deployed config in the application directory
-    QString appLocalConfig = QCoreApplication::applicationDirPath() + "/config/gauge_profile.json";
-    if (QFileInfo::exists(appLocalConfig)) {
-        m_currentConfigPath = appLocalConfig;
-    } else if (QFileInfo::exists("config/gauge_profile.json")) {
-        m_currentConfigPath = "config/gauge_profile.json";
-    } else if (QFileInfo::exists("../config/gauge_profile.json")) {
-        m_currentConfigPath = "../config/gauge_profile.json";
-    } else {
-        m_currentConfigPath = appLocalConfig;
-    }
-
     m_currentImagePath.clear();
-    m_imagePathEdit->setText(m_currentImagePath);
-    m_configPathEdit->setText(m_currentConfigPath);
-
-    // Load initial profile from config
-    m_profile.loadFromFile(m_currentConfigPath.toStdString());
+    m_imagePathEdit->clear();
 
     // Populate Camera List from Persistent Device Registry & Auto-Connect Previous Device
     loadAndRestoreSavedDevices();
 
     // Start background periodic network discovery without clearing user list
-    if (!DatabaseSettings::fromEnvironment().enabled) m_discoveryService->startAutoScan(30000);
+    m_discoveryService->startAutoScan(30000);
     if (DatabaseSettings::fromEnvironment().enabled) {
         connect(&DeviceConfigManager::instance(), &DeviceConfigManager::databaseStatus, this, [this](const QString& error) {
+            if (error == "REGISTRY_SYNC_IN_PROGRESS") {
+                m_databaseStatusLabel->setText(tr("MySQL 档案正在同步…")); return;
+            }
             m_databaseStatusLabel->setText(error.isEmpty() ? tr("MySQL 档案已同步") : tr("MySQL 待同步: %1").arg(error));
             if (!error.isEmpty()) onLogReceived(tr("[MYSQL] 档案同步失败: %1").arg(error));
         });
         connect(m_inspectionService, &InspectionService::databaseSyncFinished, this, [this](const QString& error) {
+            if (error == "REGISTRY_SYNC_IN_PROGRESS") {
+                m_databaseStatusLabel->setText(tr("MySQL 档案正在同步…")); return;
+            }
             m_databaseStatusLabel->setText(error.isEmpty() ? tr("MySQL 同步检查完成") : tr("MySQL 待同步: %1").arg(error));
         });
         m_databaseSyncTimer = new QTimer(this);
         connect(m_databaseSyncTimer, &QTimer::timeout, this, [this]() {
-            if (!m_registryLoaded) loadAndRestoreSavedDevices();
-            DeviceConfigManager::instance().retryDatabaseSync();
+            if (!m_registryLoaded) { loadAndRestoreSavedDevices(); return; }
             m_inspectionService->retryDatabaseWrites(QCoreApplication::applicationDirPath() + "/inspection_snapshots");
         });
         m_databaseSyncTimer->start(30000);
-        m_inspectionService->retryDatabaseWrites(QCoreApplication::applicationDirPath() + "/inspection_snapshots");
+        if (m_registryLoaded)
+            m_inspectionService->retryDatabaseWrites(QCoreApplication::applicationDirPath() + "/inspection_snapshots");
     }
 
     onLogReceived(tr("[SYSTEM] 工业指针仪表智能感知识别与检测平台已就绪。"));
@@ -210,6 +219,10 @@ void MainWindow::setupUi() {
         : DatabaseSettings::fromEnvironment().configurationError.isEmpty() ? tr("MySQL 未配置；请点击 MySQL 连接配置")
         : DatabaseSettings::fromEnvironment().configurationError, centralWidget);
     databaseBar->addWidget(connectionButton);
+    auto* templateButton = new QPushButton(tr("表计算法模板管理"), centralWidget);
+    templateButton->setObjectName("gaugeTemplateManagementButton");
+    databaseBar->addWidget(templateButton);
+    connect(templateButton, &QPushButton::clicked, this, &MainWindow::onManageGaugeTemplates);
     databaseBar->addWidget(historyButton); databaseBar->addWidget(m_databaseStatusLabel, 1);
     rootLayout->addLayout(databaseBar);
     connect(connectionButton, &QPushButton::clicked, this, [this]() {
@@ -339,14 +352,9 @@ QWidget* MainWindow::createLeftSidebar(QWidget *parent) {
     imgFileLayout->addWidget(m_browseImgBtn);
     fileLayout->addLayout(imgFileLayout);
 
-    fileLayout->addWidget(new QLabel(tr("参数配置文件:")));
-    QHBoxLayout *cfgFileLayout = new QHBoxLayout();
-    m_configPathEdit = new QLineEdit(fileBox);
-    m_browseCfgBtn = new QPushButton(tr("浏览..."), fileBox);
-    cfgFileLayout->addWidget(m_configPathEdit);
-    cfgFileLayout->addWidget(m_browseCfgBtn);
-    fileLayout->addLayout(cfgFileLayout);
-
+    fileLayout->addWidget(new QLabel(tr("算法模板：MySQL 数据库"), fileBox));
+    m_browseCfgBtn = new QPushButton(tr("管理表计算法模板…"), fileBox);
+    fileLayout->addWidget(m_browseCfgBtn);
     m_snapAndRunBtn = new QPushButton(tr("📷 拍摄并识别当前表计"), fileBox);
     m_snapAndRunBtn->setStyleSheet("background-color: #00897b; color: white; font-weight: bold; font-size: 13px; padding: 9px; border-radius: 6px;");
     fileLayout->addWidget(m_snapAndRunBtn);
@@ -359,16 +367,10 @@ QWidget* MainWindow::createLeftSidebar(QWidget *parent) {
     m_calibrateBtn->setStyleSheet("background-color: #37474f; color: #00e5ff; border: 1px solid #00acc1; font-weight: bold; padding: 6px; border-radius: 4px;");
     fileLayout->addWidget(m_calibrateBtn);
 
-    m_enableSteps4To9Check = new QCheckBox(tr("⚡ 执行步骤 4-9 (抗反光多通道预处理)"), fileBox);
-    m_enableSteps4To9Check->setChecked(false); // 默认不进行，以节省运行时间
-    m_enableSteps4To9Check->setToolTip(tr("默认取消勾选以节省运行时间。勾选后将生成步骤4-9（CLAHE对比度增强、高斯平滑降噪、Otsu二值化、黑帽滤波与阴影鉴别等）。"));
-    m_enableSteps4To9Check->setStyleSheet("QCheckBox { color: #80deea; font-size: 11px; padding: 3px 0px; } QCheckBox::indicator:checked { background-color: #00bcd4; }");
-    fileLayout->addWidget(m_enableSteps4To9Check);
-
     m_runModeCombo = new QComboBox(fileBox);
     m_runModeCombo->addItem(tr("生产模式：读数与原图留存"), int(GaugeRunMode::Production));
     m_runModeCombo->addItem(tr("证据模式：核心四步图片"), int(GaugeRunMode::Evidence));
-    m_runModeCombo->addItem(tr("调试模式：完整步骤与诊断图"), int(GaugeRunMode::Debug));
+    m_runModeCombo->addItem(tr("调试模式：识别图片与算法诊断"), int(GaugeRunMode::Debug));
     m_runModeCombo->setCurrentIndex(1);
     m_runModeCombo->setToolTip(tr("生产模式不绘制中间图；全站巡检在所有模式下保留本次原图供人工复核。"));
     fileLayout->addWidget(m_runModeCombo);
@@ -376,10 +378,6 @@ QWidget* MainWindow::createLeftSidebar(QWidget *parent) {
     m_runBtn = new QPushButton(tr("分析指定图片（本地/历史）"), fileBox);
     m_runBtn->setStyleSheet("background-color: #2e7d32; color: white; font-weight: bold; font-size: 12px; padding: 6px; border-radius: 4px;");
     fileLayout->addWidget(m_runBtn);
-
-    m_exportStepsBtn = new QPushButton(tr("💾 导出 12 步中间图像"), fileBox);
-    m_exportStepsBtn->setStyleSheet("background-color: #455a64; color: white; font-weight: bold; padding: 6px; border-radius: 4px;");
-    fileLayout->addWidget(m_exportStepsBtn);
 
     sideLayout->addWidget(fileBox);
 
@@ -416,6 +414,10 @@ QWidget* MainWindow::createLeftSidebar(QWidget *parent) {
     resLayout->addWidget(m_angleLabel);
     resLayout->addWidget(m_centerLabel);
     resLayout->addWidget(m_confidenceLabel);
+    auto qualityLabel = new QLabel(tr("旁路质量：未评估"), resultBox);
+    qualityLabel->setObjectName("recognitionQuality");
+    qualityLabel->setWordWrap(true);
+    resLayout->addWidget(qualityLabel);
     resLayout->addWidget(m_timeLabel);
     resLayout->addWidget(m_statusLabel);
     sideLayout->addWidget(resultBox);
@@ -429,12 +431,11 @@ QWidget* MainWindow::createLeftSidebar(QWidget *parent) {
     connect(m_deviceListWidget, &QListWidget::itemDoubleClicked, this, &MainWindow::onEditCameraInfo);
     connect(m_deviceListWidget, &QListWidget::customContextMenuRequested, this, &MainWindow::onDeviceCustomContextMenu);
     connect(m_browseImgBtn, &QPushButton::clicked, this, &MainWindow::onSelectImage);
-    connect(m_browseCfgBtn, &QPushButton::clicked, this, &MainWindow::onLoadConfig);
+    connect(m_browseCfgBtn, &QPushButton::clicked, this, &MainWindow::onManageGaugeTemplates);
     connect(m_snapAndRunBtn, &QPushButton::clicked, this, &MainWindow::onCaptureAndRecognizeCurrent);
     connect(m_batchPatrolBtn, &QPushButton::clicked, this, &MainWindow::onStartAllDevicesInspection);
     connect(m_calibrateBtn, &QPushButton::clicked, this, &MainWindow::onCalibrateCardinalPoints);
     connect(m_runBtn, &QPushButton::clicked, this, &MainWindow::onRunRecognition);
-    connect(m_exportStepsBtn, &QPushButton::clicked, this, &MainWindow::onExportAllSteps);
 
     return sidebar;
 }
@@ -477,10 +478,10 @@ QWidget* MainWindow::createCenterVisionArea(QWidget *parent) {
 
     gridLayout->addWidget(createStageCard(tr("步骤 1: 实时传输/采集原帧 (Original Stream Frame)"), m_imgStage1), 0, 0);
     gridLayout->addWidget(createStageCard(tr("步骤 2: 4切点视场透视矫正图 (FOV Rectified Image)"), m_imgStage2), 0, 1);
-    gridLayout->addWidget(createStageCard(tr("步骤 3: 图像预处理图 (Preprocessed Image)"), m_imgStage3), 1, 0);
+    gridLayout->addWidget(createStageCard(tr("步骤 3: 检测输入灰度图 (Grayscale Input)"), m_imgStage3), 1, 0);
 
     QGroupBox *stage4Card = createStageCard(tr("步骤 4: 最终仪表读数识别 (Final Recognition Result)"), m_imgStage4);
-    QPushButton *stage4DiagBtn = new QPushButton(tr("📊 独立窗口查看步骤12算法诊断信息 (HUD)"), stage4Card);
+    QPushButton *stage4DiagBtn = new QPushButton(tr("📊 独立窗口查看指针算法诊断信息 (HUD)"), stage4Card);
     stage4DiagBtn->setStyleSheet("QPushButton { background-color: #1a2a3a; color: #00e5ff; border: 1px solid #00a0e9; padding: 5px; border-radius: 4px; font-size: 12px; font-weight: bold; margin-top: 4px; }"
                                  "QPushButton:hover { background-color: #243b55; border-color: #00e5ff; }");
     connect(stage4DiagBtn, &QPushButton::clicked, this, &MainWindow::onShowDiagnosticWindow);
@@ -490,40 +491,7 @@ QWidget* MainWindow::createCenterVisionArea(QWidget *parent) {
     tab1Scroll->setWidget(gridContainer);
     m_visionTabWidget->addTab(tab1Scroll, tr("⚡ 核心 4 步主流程 (Core 4 Stages)"));
 
-    // --- Tab 2: 全流程 12 步中间图像调试与优化 ---
-    QScrollArea *tab2Scroll = new QScrollArea(m_visionTabWidget);
-    tab2Scroll->setWidgetResizable(true);
-    tab2Scroll->setStyleSheet("QScrollArea { border: none; background-color: #121216; }");
-
-    QWidget *allStepsWidget = new QWidget(tab2Scroll);
-    QVBoxLayout *allStepsMainLayout = new QVBoxLayout(allStepsWidget);
-    allStepsMainLayout->setContentsMargins(8, 8, 8, 8);
-    allStepsMainLayout->setSpacing(8);
-
-    QHBoxLayout *topCtrlLayout = new QHBoxLayout();
-    QLabel *tipLabel = new QLabel(tr("🔬 图像处理全流程 12 个中间步骤拆解（点击卡片图像或【🔍 放大查看】观察高清特征与参数的效果）"), allStepsWidget);
-    tipLabel->setStyleSheet("color: #00e5ff; font-weight: bold; font-size: 13px;");
-    topCtrlLayout->addWidget(tipLabel);
-    topCtrlLayout->addStretch();
-
-    QPushButton *tabExportBtn = new QPushButton(tr("💾 一键导出所有中间步骤图像"), allStepsWidget);
-    tabExportBtn->setStyleSheet("QPushButton { background-color: #00897b; color: white; font-weight: bold; padding: 6px 12px; border-radius: 4px; }"
-                                 "QPushButton:hover { background-color: #00bfa5; }"
-                                 "QPushButton:pressed { background-color: #00695c; }");
-    topCtrlLayout->addWidget(tabExportBtn);
-    connect(tabExportBtn, &QPushButton::clicked, this, &MainWindow::onExportAllSteps);
-
-    allStepsMainLayout->addLayout(topCtrlLayout);
-
-    m_allStepsGridContainer = new QWidget(allStepsWidget);
-    m_allStepsGridLayout = new QGridLayout(m_allStepsGridContainer);
-    m_allStepsGridLayout->setSpacing(10);
-    allStepsMainLayout->addWidget(m_allStepsGridContainer);
-
-    tab2Scroll->setWidget(allStepsWidget);
-    m_visionTabWidget->addTab(tab2Scroll, tr("🔬 全流程 12 步中间图像调试与优化 (Step-by-Step Optimization)"));
-
-    // --- Tab 3: 全站设备巡检读数总览 (Batch Patrol Inspection Matrix) ---
+    // --- Tab 2: 全站设备巡检读数总览 (Batch Patrol Inspection Matrix) ---
     QWidget *inspectionArea = createInspectionStageArea(m_visionTabWidget);
     m_visionTabWidget->addTab(inspectionArea, tr("📊 全站设备巡检报表 (Batch Inspection Matrix)"));
 
@@ -543,7 +511,7 @@ QWidget* MainWindow::createLiveStreamStageArea(QWidget *parent) {
     QHBoxLayout *tbLayout = new QHBoxLayout(toolbarBox);
     tbLayout->setContentsMargins(10, 6, 10, 6);
 
-    m_liveCamInfoBadge = new QLabel(tr("📷 当前通道: CAM_5-3-1 | 协议: ONVIF (RTSP) | 地址: 192.168.1.101 | 状态: 🟢 实时传输中"), toolbarBox);
+    m_liveCamInfoBadge = new QLabel(tr("📷 当前通道: 未选择摄像头"), toolbarBox);
     m_liveCamInfoBadge->setStyleSheet("color: #00e5ff; font-weight: bold; font-size: 13px;");
     tbLayout->addWidget(m_liveCamInfoBadge);
 
@@ -659,7 +627,7 @@ void MainWindow::loadAndRestoreSavedDevices() {
     if (DatabaseSettings::fromEnvironment().enabled && !m_registryLoaded) {
         if (m_registryWatcher) return;
         m_deviceListWidget->setEnabled(false);
-        for (auto* button : {m_addDeviceBtn,m_removeDeviceBtn,m_autoDiscoverBtn,m_captureBtn,m_snapAndRunBtn,m_startPatrolBtn,m_batchPatrolBtn})
+        for (auto* button : {m_addDeviceBtn,m_removeDeviceBtn,m_captureBtn,m_snapAndRunBtn,m_startPatrolBtn,m_batchPatrolBtn})
             button->setEnabled(false);
         m_registryWatcher = new QFutureWatcher<bool>(this);
         connect(m_registryWatcher, &QFutureWatcher<bool>::finished, this, [this]() {
@@ -667,12 +635,15 @@ void MainWindow::loadAndRestoreSavedDevices() {
             m_registryWatcher->deleteLater(); m_registryWatcher = nullptr;
             m_registryLoaded = loaded;
             m_databaseStatusLabel->setText(loaded ? tr("MySQL 档案加载完成") : tr("MySQL 档案加载失败: %1").arg(DeviceConfigManager::instance().lastError()));
-            if (!loaded) { onLogReceived(m_databaseStatusLabel->text()); return; }
+            if (!loaded) {
+                onLogReceived(m_databaseStatusLabel->text());
+                m_autoDiscoverBtn->setEnabled(true);
+                return;
+            }
             m_deviceListWidget->setEnabled(true);
             for (auto* button : {m_addDeviceBtn,m_removeDeviceBtn,m_autoDiscoverBtn,m_captureBtn,m_snapAndRunBtn,m_startPatrolBtn,m_batchPatrolBtn})
                 button->setEnabled(true);
             loadAndRestoreSavedDevices();
-            m_discoveryService->startAutoScan(30000);
         });
         m_registryWatcher->setFuture(QtConcurrent::run([]() { return DeviceConfigManager::instance().load(); }));
         return;
@@ -684,7 +655,10 @@ void MainWindow::loadAndRestoreSavedDevices() {
     if (!DatabaseSettings::fromEnvironment().enabled) DeviceConfigManager::instance().load();
     QList<DiscoveredCameraItem> devices = DeviceConfigManager::instance().getAllDevices();
 
-    for (const auto& dev : devices) {
+    for (auto& dev : devices) {
+        // Saved online flags describe a previous run, not the current network.
+        dev.isOnline = false;
+        DeviceConfigManager::instance().markDeviceOnline(dev.cameraId, false);
         m_discoveredItemsMap.insert(dev.cameraId, dev);
         QListWidgetItem *item = new QListWidgetItem(m_deviceListWidget);
         item->setData(Qt::UserRole, dev.cameraId);
@@ -696,32 +670,23 @@ void MainWindow::loadAndRestoreSavedDevices() {
     }
 
     // Determine target device to auto-connect on startup
-    QString targetId = DeviceConfigManager::instance().getLastActiveDeviceId();
-    QListWidgetItem *targetItem = findListItemByCameraId(targetId);
-
-    if (!targetItem && m_deviceListWidget->count() > 0) {
-        // Fallback to first auto-connect device or row 0
-        for (int i = 0; i < m_deviceListWidget->count(); ++i) {
-            QListWidgetItem *it = m_deviceListWidget->item(i);
-            QString cid = it->data(Qt::UserRole).toString();
-            if (m_discoveredItemsMap.value(cid).isAutoConnect) {
-                targetItem = it;
-                targetId = cid;
-                break;
-            }
-        }
-        if (!targetItem) {
-            targetItem = m_deviceListWidget->item(0);
-            targetId = targetItem->data(Qt::UserRole).toString();
+    QString targetId;
+    if (DatabaseSettings::fromEnvironment().enabled) {
+        targetId = DeviceConfigManager::instance().getLastActiveDeviceId();
+    }
+    if (targetId.isEmpty() && DeviceConfigManager::instance().isAutoConnectEnabled()) {
+        for (const auto& device : devices) {
+            if (device.isAutoConnect) { targetId = device.cameraId; break; }
         }
     }
+    QListWidgetItem *targetItem = findListItemByCameraId(targetId);
 
     if (targetItem) {
         m_deviceListWidget->setCurrentItem(targetItem);
         switchActiveCameraSource(targetId);
         QString devName = m_discoveredItemsMap.value(targetId).customName;
         if (devName.isEmpty()) devName = m_discoveredItemsMap.value(targetId).modelName;
-        onLogReceived(tr("[SYSTEM] 🚀 开机已直接自动连接至上次设备: %1 (%2) [免手动刷新]").arg(targetId).arg(devName));
+        onLogReceived(tr("[SYSTEM] 正在尝试连接已配置的自动连接设备: %1 (%2)，连接结果以实际采集为准。").arg(targetId).arg(devName));
     }
 
     // Initialize or sync inspection matrix table with all saved devices
@@ -820,46 +785,6 @@ QListWidgetItem* MainWindow::findListItemByCameraId(const QString& camId) {
     return nullptr;
 }
 
-void MainWindow::updateCameraListFromConfig(const QString& configPath) {
-    Q_UNUSED(configPath);
-    loadAndRestoreSavedDevices();
-}
-
-QStringList MainWindow::loadCameraIdsFromConfig(const QString& configPath) {
-    QStringList ids;
-    QFile file(configPath);
-
-    if (!file.open(QIODevice::ReadOnly)) {
-        QStringList candidates = {
-            configPath,
-            "../" + configPath,
-            "config/" + QFileInfo(configPath).fileName()
-        };
-        for (const auto& cand : candidates) {
-            file.setFileName(cand);
-            if (file.open(QIODevice::ReadOnly)) break;
-        }
-    }
-
-    if (file.isOpen()) {
-        QJsonDocument doc = QJsonDocument::fromJson(file.readAll());
-        file.close();
-        if (doc.isObject()) {
-            QJsonObject root = doc.object();
-            QJsonArray camArr = root.contains("cameras") ? root["cameras"].toArray() : root["profiles"].toArray();
-
-            for (const auto& val : camArr) {
-                if (val.isObject()) {
-                    QJsonObject obj = val.toObject();
-                    if (obj.contains("camera_id")) ids.append(obj["camera_id"].toString());
-                    else if (obj.contains("gauge_id")) ids.append(obj["gauge_id"].toString());
-                }
-            }
-        }
-    }
-    return ids;
-}
-
 void MainWindow::onTriggerAutoDiscovery() {
     m_autoDiscoverBtn->setEnabled(false);
     onLogReceived(tr("[AUTO-DISCOVERY] 正在静默向局域网广播探针报文检测在线状态...（保留现有设备库，不中断当前流）"));
@@ -873,38 +798,36 @@ void MainWindow::onTriggerAutoDiscovery() {
 }
 
 void MainWindow::onDiscoveredCameraAdded(const DiscoveredCameraItem& item) {
-    if (m_discoveredItemsMap.contains(item.cameraId)) {
-        // Upgrade / update existing entry without destroying user custom name and credentials
-        auto existing = m_discoveredItemsMap.value(item.cameraId);
-        existing.isOnline = true;
-        if (!item.ipOrSn.isEmpty()) existing.ipOrSn = item.ipOrSn;
-        if (existing.protocolType == CameraProtocolType::LOCAL_FILE && item.protocolType != CameraProtocolType::LOCAL_FILE) {
-            existing.protocolType = item.protocolType;
-            existing.protocolName = item.protocolName;
-            existing.modelName = item.modelName;
-            existing.port = item.port;
-            existing.rtspPort = item.rtspPort;
-            if (!item.rtspUrl.isEmpty()) existing.rtspUrl = item.rtspUrl;
+    if (DatabaseSettings::fromEnvironment().enabled && !m_registryLoaded) {
+        // Do not submit an incomplete snapshot that could replace DB archives.
+        m_discoveredItemsMap[item.cameraId] = item;
+        auto* row = findListItemByCameraId(item.cameraId);
+        if (!row) {
+            row = new QListWidgetItem(m_deviceListWidget);
+            row->setData(Qt::UserRole, item.cameraId);
         }
-        m_discoveredItemsMap[item.cameraId] = existing;
-        DeviceConfigManager::instance().addOrUpdateDevice(existing, true);
-
-        QListWidgetItem *it = findListItemByCameraId(item.cameraId);
-        if (it) {
-            updateDeviceListItemWidget(it, existing);
-        }
+        updateDeviceListItemWidget(row, item);
+        onLogReceived(tr("[AUTO-DISCOVERY] 已发现摄像头 %1；数据库档案未就绪，恢复后再登记。").arg(item.ipOrSn));
         return;
     }
+    const int previousCount = DeviceConfigManager::instance().getAllDevices().size();
+    const auto registered = DeviceConfigManager::instance().registerDiscoveredDevice(item, true);
+    if (DeviceConfigManager::instance().getAllDevices().size() > previousCount) {
+        onLogReceived(DatabaseSettings::fromEnvironment().enabled
+            ? tr("[DEVICE] 新发现设备 %1 已自动登记并提交数据库同步，写入状态见 MySQL 状态栏。").arg(registered.cameraId)
+            : tr("[DEVICE] 新发现设备 %1 已登记到本地档案；启用 MySQL 后可使用数据库设备管理。").arg(registered.cameraId));
+    }
+    m_discoveredItemsMap.insert(registered.cameraId, registered);
+    auto* listItem = findListItemByCameraId(registered.cameraId);
+    if (!listItem) {
+        listItem = new QListWidgetItem(m_deviceListWidget);
+        listItem->setData(Qt::UserRole, registered.cameraId);
+    }
+    updateDeviceListItemWidget(listItem, registered);
 
-    // New device discovered from local network
-    DiscoveredCameraItem newItem = item;
-    newItem.isOnline = true;
-    m_discoveredItemsMap.insert(newItem.cameraId, newItem);
-    DeviceConfigManager::instance().addOrUpdateDevice(newItem, true);
-
-    QListWidgetItem *listItem = new QListWidgetItem(m_deviceListWidget);
-    listItem->setData(Qt::UserRole, newItem.cameraId);
-    updateDeviceListItemWidget(listItem, newItem);
+    if (!m_deviceListWidget->currentItem() && registered.protocolType == CameraProtocolType::ONVIF_RTSP_STREAM) {
+        m_deviceListWidget->setCurrentItem(listItem);
+    }
 
     if (m_deviceFilterEdit) {
         QString filterKey = m_deviceFilterEdit->text().trimmed().toLower();
@@ -919,7 +842,7 @@ void MainWindow::onDiscoveredCameraAdded(const DiscoveredCameraItem& item) {
 }
 
 void MainWindow::onAddNewDevice() {
-    CameraInfoEditDialog dialog(m_currentConfigPath, "", this, true);
+    CameraInfoEditDialog dialog("", this, true);
     if (dialog.exec() == QDialog::Accepted) {
         DiscoveredCameraItem newItem = dialog.getUpdatedDeviceItem();
         onLogReceived(tr("[DEVICE] 已成功登记新摄像头节点: %1 (%2)").arg(newItem.cameraId).arg(newItem.ipOrSn));
@@ -1070,9 +993,8 @@ void MainWindow::switchActiveCameraSource(const QString& camId) {
     m_statusLabel->setText(tr("已切换设备，请明确选择图像来源。"));
     updateImageCard(m_imgStage1, cv::Mat(), "Original");
     updateImageCard(m_imgStage2, cv::Mat(), "Rectified");
-    updateImageCard(m_imgStage3, cv::Mat(), "Preprocessed");
+    updateImageCard(m_imgStage3, cv::Mat(), "Grayscale Input");
     updateImageCard(m_imgStage4, cv::Mat(), "Recognition");
-    renderIntermediateStepsUI({});
     m_currentFrame.release();
     m_lastCapturedFrame.release();
     m_currentImagePath.clear();
@@ -1092,38 +1014,57 @@ void MainWindow::switchActiveCameraSource(const QString& camId) {
 
 void MainWindow::applyCameraCalibrationAndProfile(const QString& camId) {
     if (!m_discoveredItemsMap.contains(camId)) return;
-    const DiscoveredCameraItem& item = m_discoveredItemsMap[camId];
+    const auto generation = ++m_profileGeneration;
+    const auto profileId = m_discoveredItemsMap[camId].defaultProfileId.isEmpty()
+        ? QStringLiteral("PRESSURE_GAUGE_1.6MPA") : m_discoveredItemsMap[camId].defaultProfileId;
+    m_profileReady = false;
+    m_calibrateBtn->setEnabled(false);
+    m_cfgRange->setText(tr("量程范围：正在读取数据库模板…"));
+    using ProfileReply = QPair<QJsonObject, QString>;
+    auto* watcher = new QFutureWatcher<ProfileReply>(this);
+    connect(watcher, &QFutureWatcher<ProfileReply>::finished, this, [this, watcher, camId, generation]() {
+        const auto reply = watcher->result(); watcher->deleteLater();
+        if (generation != m_profileGeneration || makeSingleTask().device.cameraId != camId) return;
+        if (!reply.second.isEmpty() || !m_profile.loadFromJson(reply.first)) {
+            m_cfgRange->setText(tr("量程范围：数据库模板加载失败"));
+            onLogReceived(tr("[TEMPLATE] %1").arg(reply.second));
+            return;
+        }
+        const auto item = m_discoveredItemsMap.value(camId);
+        // Overlay the selected device's identity and calibration.
+        m_profile.gauge_id = camId.toStdString();
+        m_profile.location.substation = item.substation.toStdString();
+        m_profile.location.area = item.area.toStdString();
+        m_profile.location.device_name = item.customName.toStdString();
+        m_profile.location.device_tag = item.deviceTag.toStdString();
+        m_profile.spec.gauge_type = item.gaugeType.toStdString();
+        m_profile.spec.manufacturer = item.manufacturer.toStdString();
+        m_profile.spec.model_name = item.modelName.toStdString();
+        m_profile.spec.accuracy_class = item.accuracyClass.toStdString();
 
-    // 1. Load meter profile algorithm specs from gauge_profile.json
-    QString profileId = item.defaultProfileId.isEmpty() ? "PRESSURE_GAUGE_1.6MPA" : item.defaultProfileId;
-    m_profile.loadFromFile(m_currentConfigPath.toStdString(), profileId.toStdString());
-
-    // 2. Set node identity and asset metadata from camera item
-    m_profile.gauge_id = camId.toStdString();
-    m_profile.location.substation = item.substation.toStdString();
-    m_profile.location.area = item.area.toStdString();
-    m_profile.location.device_name = item.customName.toStdString();
-    m_profile.location.device_tag = item.deviceTag.toStdString();
-    m_profile.spec.gauge_type = item.gaugeType.toStdString();
-    m_profile.spec.manufacturer = item.manufacturer.toStdString();
-    m_profile.spec.model_name = item.modelName.toStdString();
-    m_profile.spec.accuracy_class = item.accuracyClass.toStdString();
-
-    // 3. Overlay camera's physical perspective calibration from devices.json
-    m_profile.perspective_correction_enabled = item.perspectiveEnabled;
-    m_profile.perspective_pts = {
+        // Apply the database device archive calibration.
+        m_profile.perspective_correction_enabled = item.perspectiveEnabled;
+        m_profile.perspective_pts = {
         cv::Point2f(static_cast<float>(item.pt0_x), static_cast<float>(item.pt0_y)),
         cv::Point2f(static_cast<float>(item.pt1_x), static_cast<float>(item.pt1_y)),
         cv::Point2f(static_cast<float>(item.pt2_x), static_cast<float>(item.pt2_y)),
         cv::Point2f(static_cast<float>(item.pt3_x), static_cast<float>(item.pt3_y))
-    };
-    m_profile.center = cv::Point2f(static_cast<float>(item.centerX), static_cast<float>(item.centerY));
-    m_profile.pointerBaseRadius = item.pointerBaseRadius;
-    m_profile.calibrated_width = item.calibratedWidth;
-    m_profile.calibrated_height = item.calibratedHeight;
-    m_profile.auto_detect_roi = false;
+        };
+        m_profile.center = cv::Point2f(static_cast<float>(item.centerX), static_cast<float>(item.centerY));
+        m_profile.pointerBaseRadius = item.pointerBaseRadius;
+        m_profile.calibrated_width = item.calibratedWidth;
+        m_profile.calibrated_height = item.calibratedHeight;
+        m_profile.auto_detect_roi = false;
+        m_profileReady = true;
+        m_calibrateBtn->setEnabled(true);
+        m_cfgRange->setText(tr("量程范围：%1 ～ %2 %3").arg(m_profile.min_val).arg(m_profile.max_val).arg(QString::fromStdString(m_profile.unit)));
+        m_cfgAngleRange->setText(tr("刻度角度：%1° → %2°").arg(m_profile.min_angle_deg).arg(m_profile.max_angle_deg));
+    });
+    watcher->setFuture(QtConcurrent::run([profileId]() -> ProfileReply {
+        try { return {MySqlRepository().loadTemplate(profileId).definition, QString()}; }
+        catch (const std::exception& error) { return {QJsonObject(), QString::fromUtf8(error.what())}; }
+    }));
 }
-
 void MainWindow::onToggleLiveStream() {
     m_isLiveStreaming = !m_isLiveStreaming;
     if (m_isLiveStreaming) {
@@ -1144,6 +1085,14 @@ void MainWindow::onCaptureCameraSnapshot() {
     auto task = makeSingleTask();
     task.inputKind = InspectionInputKind::CameraSnapshot;
     task.captureOnly = true;
+    const auto frame = m_previewService->snapshot(task.device.cameraId);
+    if (!frame.ok()) {
+        onLogReceived(tr("[CAPTURE] 当前没有有效的实时帧，请开启实时预览并等待画面更新后再抓拍。"));
+        return;
+    }
+    task.previewSnapshot = frame.frame;
+    task.previewCapturedAt = QDateTime::fromMSecsSinceEpoch(
+        std::chrono::duration_cast<std::chrono::milliseconds>(frame.capturedAt.time_since_epoch()).count(), Qt::UTC);
     submitSingleTask(task);
 }
 
@@ -1208,24 +1157,23 @@ void MainWindow::onSelectImage() {
     submitSingleTask(task);
 }
 
-void MainWindow::onLoadConfig() {
-    QString fileName = QFileDialog::getOpenFileName(this, tr("选择配置文件"), "", tr("JSON Files (*.json)"));
-    if (!fileName.isEmpty()) {
-        m_currentConfigPath = fileName;
-        m_configPathEdit->setText(m_currentConfigPath);
-        updateCameraListFromConfig(m_currentConfigPath);
-        onRunRecognition();
-    }
+void MainWindow::onManageGaugeTemplates() {
+    GaugeTemplateDialog dialog(this);
+    connect(&dialog, &GaugeTemplateDialog::templatesChanged, this, [this]() {
+        const auto id = makeSingleTask().device.cameraId;
+        if (m_discoveredItemsMap.contains(id)) applyCameraCalibrationAndProfile(id);
+        onLogReceived(tr("[TEMPLATE] 模板已保存到数据库，后续任务将读取更新后的参数。"));
+    });
+    dialog.exec();
 }
-
 void MainWindow::onCalibrateCardinalPoints() {
     const QString activeCam = makeSingleTask().device.cameraId;
-    if (!m_hasAnalysisInput || m_currentFrame.empty() || m_analysisInput.device.cameraId != activeCam) {
+    if (!m_profileReady || !m_hasAnalysisInput || m_currentFrame.empty() || m_analysisInput.device.cameraId != activeCam) {
         QMessageBox::warning(this, tr("标定图像未指定"), tr("请为当前设备明确选择本地图像或成功抓拍；不能使用其他设备的图像标定。"));
         return;
     }
 
-    CardinalSelectorDialog dialog(m_currentFrame, m_profile, m_currentConfigPath, activeCam, this);
+    CardinalSelectorDialog dialog(m_currentFrame, m_profile, activeCam, this);
     if (dialog.exec() == QDialog::Accepted) {
         DeviceConfigManager::instance().load();
         if (m_discoveredItemsMap.contains(activeCam)) {
@@ -1245,7 +1193,7 @@ void MainWindow::onEditCameraInfo(QListWidgetItem *item) {
     QString camId = item->data(Qt::UserRole).toString();
     if (camId.isEmpty()) return;
 
-    CameraInfoEditDialog dialog(m_currentConfigPath, camId, this, false);
+    CameraInfoEditDialog dialog(camId, this, false);
     if (dialog.exec() == QDialog::Accepted) {
         QString newCamId = dialog.getUpdatedCameraId();
         onLogReceived(tr("[CAMERA] 已成功更新摄像头节点 [%1] 网络连接与属性档案。").arg(newCamId));
@@ -1273,12 +1221,9 @@ InspectionTask MainWindow::makeSingleTask() const {
 
 void MainWindow::submitSingleTask(InspectionTask task) {
     if (m_singleService->isRunning()) return;
-    task.profilePath = m_currentConfigPath;
     task.outputDirectory = QCoreApplication::applicationDirPath() + "/inspection_snapshots";
     task.runMode = static_cast<GaugeRunMode>(m_runModeCombo->currentData().toInt());
     task.returnImages = true;
-    task.overridePreprocessing = true;
-    task.enablePreprocessing = m_enableSteps4To9Check->isChecked();
     m_singleSubmittedTask = task;
     m_startTime = std::chrono::high_resolution_clock::now();
     if (!m_singleService->start({task})) return;
@@ -1304,13 +1249,18 @@ void MainWindow::onRecognitionFinished() {
     auto tEnd = std::chrono::high_resolution_clock::now();
     double elapsedMs = std::chrono::duration<double, std::milli>(tEnd - m_startTime).count();
 
-    m_exportStepsBtn->setEnabled(!m_latestResult.intermediateSteps.empty());
     m_runBtn->setEnabled(true);
 
-    // Always update 4 pipeline stage cards and intermediate steps so user can inspect intermediate results
+    m_confidenceLabel->setToolTip(qualitySummary(m_latestResult.recognitionQuality) + "\n" + QString::fromUtf8(QJsonDocument(m_latestResult.recognitionQuality).toJson()));
+    if (auto label = findChild<QLabel*>("recognitionQuality")) {
+        label->setText(qualitySummary(m_latestResult.recognitionQuality));
+        label->setToolTip(qualityDetails(m_latestResult.recognitionQuality));
+    }
+    onLogReceived(qualitySummary(m_latestResult.recognitionQuality));
+    // Show the core images, including the actual grayscale detector input.
     updateImageCard(m_imgStage1, m_latestResult.step1_original, "1. Original Stream Frame");
     updateImageCard(m_imgStage2, m_latestResult.step2_rectified, "2. FOV Rectified Image");
-    updateImageCard(m_imgStage3, m_latestResult.step3_preprocessed, "3. Preprocessed Image");
+    updateImageCard(m_imgStage3, m_latestResult.step3_gray, "3. Grayscale Input Image");
     updateImageCard(m_imgStage4, m_latestResult.step4_recognition, "4. Final Recognition Result");
 
     // Clear diagnostics from a preceding debug run when the current mode omits them.
@@ -1326,8 +1276,6 @@ void MainWindow::onRecognitionFinished() {
         }
     }
 
-    // Render full 12 intermediate steps UI
-    renderIntermediateStepsUI(m_latestResult.intermediateSteps);
 
     m_timeLabel->setText(QString(tr("算法耗时: %.2f ms")).arg(elapsedMs));
 
@@ -1373,194 +1321,10 @@ void MainWindow::onRecognitionFinished() {
                 onLogReceived(QString("    %1").arg(line));
             }
         }
-        onLogReceived(tr("💡 提示: 请点击卡片图像或【放大调试视图】查看全套 12 步中间图像排查反光/阈值问题"));
+        onLogReceived(tr("💡 提示: 请查看检测输入灰度图、识别结果和指针算法诊断信息排查问题"));
         onLogReceived(tr("--------------------------------------------------"));
     }
 
-}
-
-void MainWindow::renderIntermediateStepsUI(const std::vector<ProcessingStepImage>& steps) {
-    if (!m_allStepsGridLayout) return;
-
-    // Clear previous widgets
-    QLayoutItem *item;
-    while ((item = m_allStepsGridLayout->takeAt(0)) != nullptr) {
-        if (item->widget()) delete item->widget();
-        delete item;
-    }
-
-    m_imgStepLabels.clear();
-    m_titleStepLabels.clear();
-    m_descStepLabels.clear();
-
-    int cols = 3;
-    for (size_t i = 0; i < steps.size(); ++i) {
-        const auto& step = steps[i];
-        int row = static_cast<int>(i) / cols;
-        int col = static_cast<int>(i) % cols;
-
-        QGroupBox *cardBox = new QGroupBox(m_allStepsGridContainer);
-        cardBox->setStyleSheet(
-            "QGroupBox { background-color: #171822; border: 1px solid #2b2e3e; border-radius: 6px; margin-top: 6px; font-weight: bold; color: #00e5ff; }"
-            "QGroupBox::title { subcontrol-origin: margin; subcontrol-position: top left; padding: 2px 8px; background-color: #171822; }"
-        );
-
-        QVBoxLayout *cardLayout = new QVBoxLayout(cardBox);
-        cardLayout->setContentsMargins(8, 8, 8, 8);
-        cardLayout->setSpacing(6);
-
-        // Header Title Badge
-        QHBoxLayout *titleLayout = new QHBoxLayout();
-        QLabel *numBadge = new QLabel(QString("Step %1").arg(step.stepNumber, 2, 10, QChar('0')), cardBox);
-        numBadge->setStyleSheet("background-color: #005c99; color: #ffffff; font-weight: bold; padding: 2px 6px; border-radius: 3px; font-size: 11px;");
-        
-        QLabel *titleLabel = new QLabel(QString::fromStdString(step.title), cardBox);
-        titleLabel->setStyleSheet("color: #00e5ff; font-weight: bold; font-size: 12px;");
-        titleLayout->addWidget(numBadge);
-        titleLayout->addWidget(titleLabel, 1);
-        cardLayout->addLayout(titleLayout);
-
-        // Image Card Label
-        QLabel *imgLabel = new QLabel(cardBox);
-        imgLabel->setAlignment(Qt::AlignCenter);
-        imgLabel->setMinimumSize(320, 240);
-        imgLabel->setCursor(Qt::PointingHandCursor);
-        imgLabel->setStyleSheet("background-color: #0c0d12; border: 1px solid #232635; border-radius: 4px;");
-
-        if (!step.image.empty()) {
-            QImage qimg = cvMatToQImage(step.image);
-            QPixmap pix = QPixmap::fromImage(qimg);
-            imgLabel->setPixmap(pix.scaled(320, 240, Qt::KeepAspectRatio, Qt::FastTransformation));
-        }
-
-        cardLayout->addWidget(imgLabel);
-
-        // Description Label
-        QLabel *descLabel = new QLabel(QString::fromStdString(step.description), cardBox);
-        descLabel->setWordWrap(true);
-        descLabel->setStyleSheet("color: #a0a5b5; font-size: 11px; padding: 2px;");
-        cardLayout->addWidget(descLabel);
-
-        // Zoom & Diagnostic Buttons
-        QHBoxLayout *btnBox = new QHBoxLayout();
-        QPushButton *zoomBtn = new QPushButton(tr("🔍 放大查看细节"), cardBox);
-        zoomBtn->setStyleSheet("QPushButton { background-color: #232736; color: #00e5ff; border: 1px solid #363b50; padding: 5px; border-radius: 4px; font-size: 12px; font-weight: bold; }"
-                               "QPushButton:hover { background-color: #2f3448; border-color: #00e5ff; }");
-        btnBox->addWidget(zoomBtn);
-
-        int stepNum = step.stepNumber;
-        if (stepNum == 12) {
-            QPushButton *diagBtn = new QPushButton(tr("📊 独立窗口查看诊断信息"), cardBox);
-            diagBtn->setStyleSheet("QPushButton { background-color: #1a365d; color: #63b3ed; border: 1px solid #2b6cb0; padding: 5px; border-radius: 4px; font-size: 12px; font-weight: bold; }"
-                                   "QPushButton:hover { background-color: #2b6cb0; color: #ffffff; }");
-            connect(diagBtn, &QPushButton::clicked, this, &MainWindow::onShowDiagnosticWindow);
-            btnBox->addWidget(diagBtn);
-        }
-        cardLayout->addLayout(btnBox);
-
-        connect(zoomBtn, &QPushButton::clicked, this, [this, stepNum]() {
-            onShowEnlargedStepImage(stepNum);
-        });
-
-        m_allStepsGridLayout->addWidget(cardBox, row, col);
-    }
-}
-
-void MainWindow::onShowEnlargedStepImage(int stepNumber) {
-    if (m_latestResult.intermediateSteps.empty()) return;
-
-    const ProcessingStepImage* targetStep = nullptr;
-    for (const auto& step : m_latestResult.intermediateSteps) {
-        if (step.stepNumber == stepNumber) {
-            targetStep = &step;
-            break;
-        }
-    }
-
-    if (!targetStep || targetStep->image.empty()) return;
-
-    QDialog dlg(this);
-    dlg.setWindowTitle(QString("步骤 %1 放大调试视图 - %2").arg(stepNumber).arg(QString::fromStdString(targetStep->title)));
-    dlg.resize(980, 750);
-    dlg.setStyleSheet("QDialog { background-color: #101117; color: #ffffff; }");
-
-    QVBoxLayout *layout = new QVBoxLayout(&dlg);
-
-    QLabel *headLabel = new QLabel(QString("[%1] %2").arg(stepNumber).arg(QString::fromStdString(targetStep->title)), &dlg);
-    headLabel->setStyleSheet("font-size: 16px; font-weight: bold; color: #00e5ff; padding: 4px;");
-    layout->addWidget(headLabel);
-
-    QLabel *descLabel = new QLabel(QString::fromStdString(targetStep->description), &dlg);
-    descLabel->setStyleSheet("font-size: 13px; color: #b0b5c5; padding-bottom: 6px;");
-    layout->addWidget(descLabel);
-
-    QScrollArea *scrollArea = new QScrollArea(&dlg);
-    scrollArea->setWidgetResizable(true);
-    scrollArea->setStyleSheet("QScrollArea { border: 1px solid #2d3142; background-color: #0a0b0e; }");
-
-    QLabel *imgLabel = new QLabel(scrollArea);
-    imgLabel->setAlignment(Qt::AlignCenter);
-
-    QImage qimg = cvMatToQImage(targetStep->image);
-    QPixmap pix = QPixmap::fromImage(qimg);
-    imgLabel->setPixmap(pix);
-    scrollArea->setWidget(imgLabel);
-
-    layout->addWidget(scrollArea, 1);
-
-    QHBoxLayout *btnLayout = new QHBoxLayout();
-    if (stepNumber == 12) {
-        QPushButton *diagBtn = new QPushButton(tr("📊 打开指针算法诊断信息独立窗口 (HUD)"), &dlg);
-        diagBtn->setStyleSheet("QPushButton { background-color: #1a365d; color: #63b3ed; padding: 6px 16px; font-weight: bold; border-radius: 4px; border: 1px solid #2b6cb0; }"
-                               "QPushButton:hover { background-color: #2b6cb0; color: #ffffff; }");
-        connect(diagBtn, &QPushButton::clicked, this, &MainWindow::onShowDiagnosticWindow);
-        btnLayout->addWidget(diagBtn);
-    }
-    btnLayout->addStretch();
-    QPushButton *closeBtn = new QPushButton(tr("关闭 (Close)"), &dlg);
-    closeBtn->setStyleSheet("QPushButton { background-color: #0091ea; color: white; padding: 6px 22px; font-weight: bold; border-radius: 4px; }");
-    connect(closeBtn, &QPushButton::clicked, &dlg, &QDialog::accept);
-    btnLayout->addWidget(closeBtn);
-
-    layout->addLayout(btnLayout);
-
-    dlg.exec();
-}
-
-void MainWindow::onExportAllSteps() {
-    if (m_latestResult.intermediateSteps.empty()) {
-        QMessageBox::warning(this, tr("提示"), tr("当前尚无有效的中间处理步骤图像，请先点击【▶ 运行】完成一次识别处理！"));
-        return;
-    }
-
-    QString dirPath = QFileDialog::getExistingDirectory(this, tr("选择导出目标文件夹"), "debug_steps");
-    if (dirPath.isEmpty()) return;
-
-    int exportedCount = 0;
-    for (const auto& stepItem : m_latestResult.intermediateSteps) {
-        if (!stepItem.image.empty()) {
-            char filename[256];
-            snprintf(filename, sizeof(filename), "/step%02d_%s.png", stepItem.stepNumber,
-                     (stepItem.stepNumber == 1 ? "original" :
-                      stepItem.stepNumber == 2 ? "rectified" :
-                      stepItem.stepNumber == 3 ? "gray" :
-                      stepItem.stepNumber == 4 ? "clahe" :
-                      stepItem.stepNumber == 5 ? "gaussian_blur" :
-                      stepItem.stepNumber == 6 ? "otsu_threshold" :
-                      stepItem.stepNumber == 7 ? "blackhat_filter" :
-                      stepItem.stepNumber == 8 ? "shadow_mask" :
-                      stepItem.stepNumber == 9 ? "fused_binary" :
-                      stepItem.stepNumber == 10 ? "hub_location" :
-                      stepItem.stepNumber == 11 ? "trajectory_binary" : "recognition_result"));
-            QString fullPath = dirPath + QString(filename);
-            if (cv::imwrite(fullPath.toStdString(), stepItem.image)) {
-                exportedCount++;
-            }
-        }
-    }
-
-    onLogReceived(tr("[EXPORT] 成功导出全套 %1 张中间处理步骤图像到: %2").arg(exportedCount).arg(dirPath));
-    QMessageBox::information(this, tr("导出成功"), tr("成功将全套 %1 张中间处理步骤图像保存至:\n%2").arg(exportedCount).arg(dirPath));
 }
 
 void MainWindow::updateImageCard(QLabel* label, const cv::Mat& mat, const QString& title) {
@@ -1605,7 +1369,7 @@ QImage MainWindow::cvMatToQImage(const cv::Mat& mat) {
 void MainWindow::onShowDiagnosticWindow() {
     if (!m_diagnosticDialog) {
         m_diagnosticDialog = new QDialog(this);
-        m_diagnosticDialog->setWindowTitle(tr("步骤 12 指针识别算法诊断信息 (Diagnostic HUD)"));
+        m_diagnosticDialog->setWindowTitle(tr("指针识别算法诊断信息 (Diagnostic HUD)"));
         m_diagnosticDialog->resize(620, 520);
         m_diagnosticDialog->setStyleSheet("QDialog { background-color: #0d1117; color: #c9d1d9; }");
 
@@ -1831,7 +1595,6 @@ void MainWindow::onStartAllDevicesInspection() {
         task.device = device;
         if (device.protocolType == CameraProtocolType::LOCAL_FILE) task.inputKind = InspectionInputKind::LocalImage;
         task.runMode = static_cast<GaugeRunMode>(m_runModeCombo->currentData().toInt());
-        task.profilePath = m_currentConfigPath;
         task.localImagePath = m_hasAnalysisInput && m_analysisInput.inputKind == InspectionInputKind::LocalImage
             ? m_analysisInput.localImagePath : QString();
         task.outputDirectory = QCoreApplication::applicationDirPath() + "/inspection_snapshots";
@@ -1866,6 +1629,8 @@ void MainWindow::onInspectionOutcome(const InspectionOutcome& outcome) {
     rec.confidence = res.confidence * 100.0;
     rec.status = !outcome.errorCode.isEmpty() ? tr("失败: %1").arg(outcome.errorCode)
         : (res.success && res.confidence >= 0.40 ? tr("识别成功") : tr("待复核"));
+    if (outcome.errorCode == "NO_FRAME" && outcome.errorMessage.contains("uniform"))
+        rec.status = tr("采集失败：视频仅返回灰色/空白帧");
     rec.step2Path = outcome.rectifiedPath;
     rec.originalPath = outcome.originalPath;
     rec.step4Path = outcome.recognitionPath;
@@ -1876,6 +1641,7 @@ void MainWindow::onInspectionOutcome(const InspectionOutcome& outcome) {
     m_inspectionTable->item(row, 5)->setText(valid ? QString::asprintf("%.1f°", rec.pointerAngle) : "--");
     m_inspectionTable->item(row, 6)->setText(QString::asprintf("%.1f%%", rec.confidence));
     m_inspectionTable->item(row, 7)->setText(rec.status);
+    m_inspectionTable->item(row, 7)->setToolTip(rec.diagnosticText);
     m_inspectionTable->item(row, 8)->setText(rec.timestamp);
     onLogReceived(tr("[PATROL] %1: %2").arg(outcome.cameraId, rec.status));
 }

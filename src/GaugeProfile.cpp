@@ -1,4 +1,7 @@
 #include "GaugeProfile.hpp"
+#include "RecognitionQuality.hpp"
+#include <QJsonDocument>
+#include <QJsonArray>
 #include <fstream>
 #include <iostream>
 #include <sstream>
@@ -61,78 +64,41 @@ bool GaugeProfile::loadFromFile(const std::string& configFilePath, const std::st
     buffer << file.rdbuf();
     std::string content = buffer.str();
     file.close();
+    return loadContent(content, targetCameraId, resolvedPath, true);
+}
 
-    std::string targetBlock = "";
+bool GaugeProfile::loadFromJson(const QJsonObject& definition, const std::string& targetCameraId) {
+    if (definition.isEmpty()) return false;
+    return loadContent(QJsonDocument(definition).toJson(QJsonDocument::Indented).toStdString(),
+                       targetCameraId, "database snapshot", false);
+}
 
-    // 1. If targetCameraId is specified, try to find the specific JSON block containing targetCameraId
-    if (!targetCameraId.empty()) {
-        size_t idPos = content.find("\"" + targetCameraId + "\"");
-        if (idPos != std::string::npos) {
-            size_t blockStart = content.rfind('{', idPos);
-            if (blockStart != std::string::npos) {
-                int depth = 0;
-                size_t blockEnd = std::string::npos;
-                for (size_t i = blockStart; i < content.size(); ++i) {
-                    if (content[i] == '{') depth++;
-                    else if (content[i] == '}') {
-                        depth--;
-                        if (depth == 0) {
-                            blockEnd = i;
-                            break;
-                        }
-                    }
-                }
-                if (blockEnd != std::string::npos) {
-                    targetBlock = content.substr(blockStart, blockEnd - blockStart + 1);
-                }
+bool GaugeProfile::loadContent(const std::string& content, const std::string& targetCameraId,
+                              const std::string& resolvedPath, bool allowFileInheritance) {
+    *this = GaugeProfile();
+
+    std::string targetBlock = content;
+    const auto root = QJsonDocument::fromJson(QByteArray::fromStdString(content)).object();
+    const auto templates = root.contains("profiles") ? root["profiles"] : root["cameras"];
+    if (templates.isArray()) {
+        QJsonObject selected;
+        for (const auto& value : templates.toArray()) {
+            const auto item = value.toObject();
+            const auto id = QString::fromStdString(targetCameraId);
+            if (targetCameraId.empty() || item["gauge_id"].toString() == id ||
+                item["profile_id"].toString() == id || item["camera_id"].toString() == id) {
+                selected = item;
+                break;
             }
         }
-    }
-
-    // 2. Fallback: If no specific block found, check if content has array of "cameras" or "profiles"
-    if (targetBlock.empty()) {
-        size_t arrPos = content.find("\"cameras\"");
-        if (arrPos == std::string::npos) arrPos = content.find("\"profiles\"");
-        if (arrPos != std::string::npos) {
-            size_t blockStart = content.find('{', arrPos);
-            if (blockStart != std::string::npos) {
-                int depth = 0;
-                size_t blockEnd = std::string::npos;
-                for (size_t i = blockStart; i < content.size(); ++i) {
-                    if (content[i] == '{') depth++;
-                    else if (content[i] == '}') {
-                        depth--;
-                        if (depth == 0) {
-                            blockEnd = i;
-                            break;
-                        }
-                    }
-                }
-                if (blockEnd != std::string::npos) {
-                    targetBlock = content.substr(blockStart, blockEnd - blockStart + 1);
-                }
-            }
+        if (selected.isEmpty()) {
+            std::cerr << "[GaugeProfile] Requested template not found: " << targetCameraId << std::endl;
+            return false;
         }
+        targetBlock = QJsonDocument(selected).toJson(QJsonDocument::Indented).toStdString();
     }
-
-    // 3. Fallback: Parse whole content as a single object block
-    if (targetBlock.empty()) {
-        targetBlock = content;
-    }
-
-    // Parse root-level global "use_model" if present
-    std::string globalModel = "";
-    size_t modelPos = content.find("\"use_model\"");
-    if (modelPos != std::string::npos) {
-        size_t colon = content.find(':', modelPos);
-        if (colon != std::string::npos) {
-            size_t q1 = content.find('"', colon);
-            size_t q2 = content.find('"', q1 + 1);
-            if (q1 != std::string::npos && q2 != std::string::npos) {
-                globalModel = content.substr(q1 + 1, q2 - q1 - 1);
-            }
-        }
-    }
+    // Only the root-level model applies globally; individual templates may override it.
+    const std::string globalModel = root["use_model"].toString().toStdString();
 
     // Parse targetBlock key-values line by line
     std::stringstream ss(targetBlock);
@@ -142,7 +108,18 @@ bool GaugeProfile::loadFromFile(const std::string& configFilePath, const std::st
     std::string cameraModel = "";
 
     auto parseBlockKeyValues = [&](const std::string& blockStr) {
-        std::stringstream ss(blockStr);
+        std::string values = blockStr;
+        if (!allowFileInheritance) {
+            const auto object = QJsonDocument::fromJson(QByteArray::fromStdString(blockStr)).object();
+            QJsonObject scalarValues;
+            const auto globals = object["pointer_detector_global_config"].toObject();
+            for (auto it = globals.begin(); it != globals.end(); ++it)
+                if (!it.value().isObject() && !it.value().isArray()) scalarValues[it.key()] = it.value();
+            for (auto it = object.begin(); it != object.end(); ++it)
+                if (!it.value().isObject() && !it.value().isArray()) scalarValues[it.key()] = it.value();
+            values = QJsonDocument(scalarValues).toJson(QJsonDocument::Indented).toStdString();
+        }
+        std::stringstream ss(values);
         std::string line;
         while (std::getline(ss, line)) {
             auto pos = line.find(':');
@@ -240,18 +217,7 @@ bool GaugeProfile::loadFromFile(const std::string& configFilePath, const std::st
             else if (key == "center_y") center.y = std::stof(val);
             else if (key == "radius") radius = std::stof(val);
             else if (key == "center_search_tolerance") center_search_tolerance = std::stof(val);
-            // Image Preprocessing & Anti-Glare Parameters
-            else if (key == "clahe_clip_limit") clahe_clip_limit = std::stod(val);
-            else if (key == "clahe_grid_size") clahe_grid_size = std::stoi(val);
-            else if (key == "gaussian_blur_size") gaussian_blur_size = std::stoi(val);
-            else if (key == "gaussian_blur_sigma") gaussian_blur_sigma = std::stod(val);
-            else if (key == "blackhat_kernel_size") blackhat_kernel_size = std::stoi(val);
-            else if (key == "blackhat_threshold") blackhat_threshold = std::stod(val);
-            else if (key == "local_bg_kernel_size") local_bg_kernel_size = std::stoi(val);
-            else if (key == "adapt_diff_threshold") adapt_diff_threshold = std::stod(val);
-            else if (key == "grad_mag_threshold") grad_mag_threshold = std::stod(val);
-            else if (key == "morph_close_size") morph_close_size = std::stoi(val);
-            else if (key == "enable_steps_4_to_9") enable_steps_4_to_9 = (val == "true" || val == "1");
+            // Optional diagnostic image output
             else if (key == "save_debug_images") save_debug_images = (val == "true" || val == "1");
             else if (key == "auto_detect_roi") auto_detect_roi = (val == "true" || val == "1");
             else if (key == "perspective_correction_enabled") perspective_correction_enabled = (val == "true" || val == "1");
@@ -270,10 +236,14 @@ bool GaugeProfile::loadFromFile(const std::string& configFilePath, const std::st
 
     // 1. Parse root-level global settings (e.g. pointer_detector_global_config) first
     if (!content.empty() && !targetBlock.empty() && targetBlock != content) {
-        parseBlockKeyValues(content);
+        auto globals = QJsonDocument::fromJson(QByteArray::fromStdString(content)).object();
+        globals.remove("profiles");
+        globals.remove("cameras");
+        parseBlockKeyValues(QJsonDocument(globals).toJson(QJsonDocument::Indented).toStdString());
     }
     // 2. Parse target camera block to override global settings if specified
     parseBlockKeyValues(targetBlock);
+    if (!allowFileInheritance && (!cameraModel.empty() || !globalModel.empty())) return false;
 
     if (has_pts && ptsBuf[0] >= 0.0f) {
         perspective_pts.clear();
@@ -344,16 +314,6 @@ bool GaugeProfile::loadFromFile(const std::string& configFilePath, const std::st
             this->require_dark_pointer = parentProfile.require_dark_pointer;
             this->min_pointer_dark_contrast = parentProfile.min_pointer_dark_contrast;
             this->max_pointer_inside_gray = parentProfile.max_pointer_inside_gray;
-            this->clahe_clip_limit = parentProfile.clahe_clip_limit;
-            this->clahe_grid_size = parentProfile.clahe_grid_size;
-            this->gaussian_blur_size = parentProfile.gaussian_blur_size;
-            this->gaussian_blur_sigma = parentProfile.gaussian_blur_sigma;
-            this->blackhat_kernel_size = parentProfile.blackhat_kernel_size;
-            this->blackhat_threshold = parentProfile.blackhat_threshold;
-            this->local_bg_kernel_size = parentProfile.local_bg_kernel_size;
-            this->adapt_diff_threshold = parentProfile.adapt_diff_threshold;
-            this->grad_mag_threshold = parentProfile.grad_mag_threshold;
-            this->morph_close_size = parentProfile.morph_close_size;
             this->w_geom_weight = parentProfile.w_geom_weight;
             this->w_edge_pair_coherence = parentProfile.w_edge_pair_coherence;
             this->w_center_stability = parentProfile.w_center_stability;
@@ -377,7 +337,69 @@ bool GaugeProfile::loadFromFile(const std::string& configFilePath, const std::st
 
     std::cout << "[GaugeProfile] Successfully loaded profile [" << gauge_id 
               << "] (" << min_val << " ~ " << max_val << " " << unit << ") from " << resolvedPath << std::endl;
+    auto rootQuality = QJsonDocument::fromJson(QByteArray::fromStdString(content)).object();
+    auto qualityOverrides = rootQuality["recognition_quality"].toObject();
+    const auto localQuality = QJsonDocument::fromJson(QByteArray::fromStdString(targetBlock)).object()["recognition_quality"].toObject();
+    for (auto it=localQuality.begin(); it!=localQuality.end(); ++it) qualityOverrides[it.key()]=it.value();
+    if (rootQuality.contains("_runtime_quality_config")) qualityOverrides=rootQuality["_runtime_quality_config"].toObject();
+    qualityConfig = resolvedQualityConfig(qualityOverrides);
     return true;
+}
+
+QJsonObject GaugeProfile::toJson() const {
+    QJsonObject result{{"gauge_id", QString::fromStdString(gauge_id)}, {"unit", QString::fromStdString(unit)},
+                       {"recognition_quality", qualityConfig}};
+#define PROFILE_NUMBER(key, member) result[key] = static_cast<double>(member)
+#define PROFILE_FLAG(key, member) result[key] = member
+    PROFILE_NUMBER("min_val", min_val); PROFILE_NUMBER("max_val", max_val);
+    PROFILE_NUMBER("min_angle_deg", min_angle_deg); PROFILE_NUMBER("max_angle_deg", max_angle_deg);
+    PROFILE_FLAG("clockwise", clockwise); PROFILE_FLAG("pointer_invert_direction", pointer_invert_direction);
+    PROFILE_NUMBER("pointerBaseRadius", pointerBaseRadius); PROFILE_NUMBER("pointerMinWidth", pointerMinWidth);
+    PROFILE_NUMBER("pointerMaxWidth", pointerMaxWidth); PROFILE_NUMBER("pointerMinLength", pointerMinLength);
+    PROFILE_NUMBER("coarseAngleStep", coarseAngleStep); PROFILE_NUMBER("fineAngleStep", fineAngleStep);
+    PROFILE_NUMBER("fineAngleRange", fineAngleRange); PROFILE_NUMBER("minValidSectionRatio", minValidSectionRatio);
+    PROFILE_NUMBER("maxAllowedWidthStep", maxAllowedWidthStep); PROFILE_NUMBER("maxCenterlineOffset", maxCenterlineOffset);
+    PROFILE_NUMBER("max_consecutive_gap_samples", maxConsecutiveGapSamples);
+    PROFILE_NUMBER("min_edge_support_density", minEdgeSupportDensity); PROFILE_NUMBER("raw_gradient_threshold", rawGradientThreshold);
+    PROFILE_NUMBER("min_gradient_normal_alignment", minGradientNormalAlignment);
+    PROFILE_NUMBER("min_local_step_contrast", minLocalStepContrast); PROFILE_NUMBER("max_start_base_gap_px", maxStartBaseGapPx);
+    PROFILE_NUMBER("max_parallel_angle_diff_deg", maxParallelAngleDiffDeg); PROFILE_NUMBER("min_common_length_px", minCommonLengthPx);
+    PROFILE_NUMBER("max_line_fit_residual_px", maxLineFitResidualPx); PROFILE_NUMBER("max_occlusion_gap", maxOcclusionGap);
+    PROFILE_NUMBER("corridor_half_width_px", corridorHalfWidthPx); PROFILE_FLAG("enable_tail_detection", enable_tail_detection);
+    PROFILE_NUMBER("tail_max_radius", tail_max_radius); PROFILE_NUMBER("tail_min_width", tail_min_width);
+    PROFILE_NUMBER("tail_max_width", tail_max_width); PROFILE_NUMBER("tail_corridor_half_width", tail_corridor_half_width);
+    PROFILE_NUMBER("tail_min_gradient_normal_alignment", tail_min_gradient_normal_alignment);
+    PROFILE_FLAG("require_dark_pointer", require_dark_pointer); PROFILE_NUMBER("min_pointer_dark_contrast", min_pointer_dark_contrast);
+    PROFILE_NUMBER("max_pointer_inside_gray", max_pointer_inside_gray);
+    PROFILE_NUMBER("w_geom_weight", w_geom_weight); PROFILE_NUMBER("w_edge_pair_coherence", w_edge_pair_coherence);
+    PROFILE_NUMBER("w_center_stability", w_center_stability); PROFILE_NUMBER("w_axis_center", w_axis_center);
+    PROFILE_NUMBER("w_orientation", w_orientation); PROFILE_NUMBER("w_reach", w_reach);
+    PROFILE_NUMBER("w_valid_length", w_valid_length); PROFILE_NUMBER("w_slenderness", w_slenderness);
+    PROFILE_NUMBER("w_persistence", w_persistence); PROFILE_NUMBER("w_width_trend", w_width_trend);
+    PROFILE_NUMBER("w_width_continuity", w_width_continuity); PROFILE_NUMBER("w_edge_strength", w_edge_strength);
+    PROFILE_NUMBER("w_gap_penalty", w_gap_penalty); PROFILE_NUMBER("w_tracking_jump_penalty", w_tracking_jump_penalty);
+    PROFILE_NUMBER("w_tail_score", w_tail_score); PROFILE_NUMBER("w_tail_polarity_boost", w_tail_polarity_boost);
+    PROFILE_NUMBER("confidence_divisor", confidence_divisor);
+    PROFILE_NUMBER("center_x", center.x); PROFILE_NUMBER("center_y", center.y); PROFILE_NUMBER("radius", radius);
+    PROFILE_NUMBER("center_search_tolerance", center_search_tolerance); PROFILE_FLAG("auto_detect_roi", auto_detect_roi);
+    PROFILE_FLAG("perspective_correction_enabled", perspective_correction_enabled);
+    PROFILE_NUMBER("calibrated_width", calibrated_width); PROFILE_NUMBER("calibrated_height", calibrated_height);
+    PROFILE_FLAG("save_debug_images", save_debug_images);
+    for (int i = 0; i < static_cast<int>(perspective_pts.size()) && i < 4; ++i) {
+        result[QString("pt_%1_x").arg(i)] = perspective_pts[i].x;
+        result[QString("pt_%1_y").arg(i)] = perspective_pts[i].y;
+    }
+    result["substation"] = QString::fromStdString(location.substation);
+    result["area"] = QString::fromStdString(location.area);
+    result["device_name"] = QString::fromStdString(location.device_name);
+    result["device_tag"] = QString::fromStdString(location.device_tag);
+    result["gauge_type"] = QString::fromStdString(spec.gauge_type);
+    result["manufacturer"] = QString::fromStdString(spec.manufacturer);
+    result["model_name"] = QString::fromStdString(spec.model_name);
+    result["accuracy_class"] = QString::fromStdString(spec.accuracy_class);
+#undef PROFILE_NUMBER
+#undef PROFILE_FLAG
+    return result;
 }
 
 bool GaugeProfile::saveToFile(const std::string& configFilePath, const std::string& targetCameraId) const {
@@ -646,18 +668,9 @@ bool GaugeProfile::saveToFile(const std::string& configFilePath, const std::stri
     file << "    \"confidence_divisor\": " << confidence_divisor << "\n";
     file << "  },\n";
     file << "  \"perspective_correction_enabled\": " << (perspective_correction_enabled ? "true" : "false") << ",\n";
+    file << "  \"recognition_quality\": " << QJsonDocument(resolvedQualityConfig(qualityConfig)).toJson(QJsonDocument::Compact).toStdString() << ",\n";
     file << "  \"calibrated_width\": " << calibrated_width << ",\n";
-    file << "  \"calibrated_height\": " << calibrated_height << ",\n";
-    file << "  \"clahe_clip_limit\": " << clahe_clip_limit << ",\n";
-    file << "  \"clahe_grid_size\": " << clahe_grid_size << ",\n";
-    file << "  \"gaussian_blur_size\": " << gaussian_blur_size << ",\n";
-    file << "  \"gaussian_blur_sigma\": " << gaussian_blur_sigma << ",\n";
-    file << "  \"blackhat_kernel_size\": " << blackhat_kernel_size << ",\n";
-    file << "  \"blackhat_threshold\": " << blackhat_threshold << ",\n";
-    file << "  \"local_bg_kernel_size\": " << local_bg_kernel_size << ",\n";
-    file << "  \"adapt_diff_threshold\": " << adapt_diff_threshold << ",\n";
-    file << "  \"grad_mag_threshold\": " << grad_mag_threshold << ",\n";
-    file << "  \"morph_close_size\": " << morph_close_size;
+    file << "  \"calibrated_height\": " << calibrated_height;
     
     if (perspective_pts.size() == 4) {
         file << ",\n";

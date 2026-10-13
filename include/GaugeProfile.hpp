@@ -4,6 +4,7 @@
 #include <opencv2/opencv.hpp>
 #include <string>
 #include <vector>
+#include <QJsonObject>
 
 /**
  * @brief Calibration Profile for an Individual Gauge.
@@ -50,6 +51,7 @@ struct GaugeSpecInfo {
  * perspective correction, GIS coordinates, installation location, and meter head specs.
  */
 struct GaugeProfile {
+    QJsonObject qualityConfig;
     std::string gauge_id{"GAUGE_DEFAULT"};
     std::string parent_model_path{""};
     std::string unit{"MPa"};
@@ -142,23 +144,17 @@ struct GaugeProfile {
     int rectified_size{800};                   // Square rectified front-view size
     int rectified_margin{40};                  // Margin padding for rectified dial rim
 
-    // Image Preprocessing & Anti-Glare Parameters
-    double clahe_clip_limit{2.5};             // CLAHE contrast limitation threshold
-    int clahe_grid_size{8};                   // CLAHE grid tile size
-    int gaussian_blur_size{7};                // Gaussian blur kernel size (odd px)
-    double gaussian_blur_sigma{1.5};          // Gaussian blur sigma
-    int blackhat_kernel_size{21};             // Black-Hat morphological kernel size (odd px)
-    double blackhat_threshold{32.0};          // Black-Hat binary thresholding cutoff
-    int local_bg_kernel_size{35};             // Adaptive background estimation kernel size (odd px)
-    double adapt_diff_threshold{35.0};        // Adaptive background difference threshold
-    double grad_mag_threshold{22.0};          // Sobel gradient magnitude threshold
-    int morph_close_size{3};                  // Morphological closing kernel size (odd px)
-    bool enable_steps_4_to_9{false};          // Whether to execute intermediate steps 4-9 (CLAHE, BlackHat, Sobel, Otsu). Default false for high speed.
-    bool save_debug_images{false};            // Whether to synchronously write 17 PNG images to disk on each run (disabled by default for speed)
+    // Optional diagnostic image output
+    bool save_debug_images{false};            // Save core images and HUD to debug_images (disabled by default)
 
     bool loadFromFile(const std::string& configFilePath, const std::string& targetCameraId = "");
+    bool loadFromJson(const QJsonObject& definition, const std::string& targetCameraId = "");
+    QJsonObject toJson() const;
     bool saveToFile(const std::string& configFilePath, const std::string& targetCameraId = "") const;
     static GaugeProfile createDefault();
+private:
+    bool loadContent(const std::string& content, const std::string& targetCameraId,
+                     const std::string& resolvedPath, bool allowFileInheritance);
 };
 
 #endif // GAUGE_PROFILE_HPP

@@ -37,6 +37,12 @@ win32 {
 
 # Header Files
 HEADERS += \
+    $$PWD/include/CameraDiscoveryTargets.hpp \
+    $$PWD/include/GaugeTemplateRecord.hpp \
+    $$PWD/include/MySqlTemplateSchema.hpp \
+    $$PWD/include/SnapshotFrameReader.hpp \
+    $$PWD/include/GaugeTemplateStore.hpp \
+    $$PWD/include/GaugeTemplateDialog.hpp \
     $$PWD/include/MySqlBootstrapSchema.hpp \
     $$PWD/include/MySqlErrorText.hpp \
     $$PWD/include/DatabaseSettingsStore.hpp \
@@ -62,6 +68,9 @@ HEADERS += \
 
 # Source Files
 SOURCES += \
+    $$PWD/src/GaugeTemplateStore.cpp \
+    $$PWD/src/GaugeTemplateDialog.cpp \
+    $$PWD/src/IsolatedCapture.cpp \
     $$PWD/src/MySqlErrorText.cpp \
     $$PWD/src/DatabaseSettingsStore.cpp \
     $$PWD/src/DatabaseConnectionDialog.cpp \

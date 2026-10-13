@@ -2,6 +2,7 @@
 #include "InspectionService.hpp"
 #include <QJsonObject>
 #include <QByteArray>
+#include "GaugeTemplateRecord.hpp"
 
 struct DatabaseSettings {
     bool enabled{true};
@@ -40,6 +41,11 @@ public:
     QString testConnection() const;
     QJsonObject loadRegistry() const;
     void saveRegistry(const QJsonObject& registry) const;
+    QList<GaugeTemplateRecord> loadTemplates() const;
+    GaugeTemplateRecord loadTemplate(const QString& id) const;
+    GaugeTemplateRecord saveTemplate(const QJsonObject& definition, quint64 expectedRevision = 0) const;
+    void deleteTemplate(const QString& id, quint64 expectedRevision) const;
+    int importTemplates(const QList<QJsonObject>& definitions) const;
     void saveInspection(const QJsonObject& envelope) const;
     QList<StoredInspection> history(const QString& cameraId, const QDateTime& from,
                                   const QDateTime& until, int page, int pageSize = 50) const;

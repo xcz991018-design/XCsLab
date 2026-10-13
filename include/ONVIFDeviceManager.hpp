@@ -13,7 +13,7 @@
  * @brief ONVIF Standard Device Metadata & Service Parameters.
  */
 struct ONVIFDeviceInfo {
-    std::string xaddr{"http://192.168.1.101:80/onvif/device_service"};
+    std::string xaddr;
     std::string ipAddress{"192.168.1.101"};
     int port{80};
     std::string manufacturer{"Hikvision Network Camera"};
@@ -21,7 +21,7 @@ struct ONVIFDeviceInfo {
     std::string serialNumber{"HKV-2026-ONVIF-991"};
     std::string firmwareVersion{"V5.7.10"};
     std::string profileToken{"Profile_1_MainStream"};
-    std::string rtspUri{"rtsp://192.168.1.101:554/h264/ch1/main/av_stream"};
+    std::string rtspUri;
     std::string username{""};
     std::string password{""};
 };
@@ -54,6 +54,7 @@ public:
     bool fetchDeviceInformation();
     bool fetchProfiles();
     std::string fetchStreamUri(const std::string& profileToken = "");
+    std::string lastError() const { return m_lastError; }
 
     // Set sample frame image for offline/demo testing
     void setSampleFrame(const cv::Mat& sample);
@@ -62,8 +63,8 @@ public:
     void setDeviceInfo(const ONVIFDeviceInfo& info) { m_info = info; }
     void setDeviceIp(const std::string& ip) {
         m_info.ipAddress = ip;
-        m_info.xaddr = "http://" + ip + ":80/onvif/device_service";
-        m_info.rtspUri = "rtsp://" + ip + ":554/h264/ch1/main/av_stream";
+        m_info.xaddr.clear();
+        m_info.rtspUri.clear();
     }
 
     using LogCallback = std::function<void(const std::string&)>;
@@ -75,6 +76,8 @@ private:
     static bool checkTcpPort(const std::string& ip, int port, int timeoutMs = 300);
 
     ONVIFDeviceInfo m_info;
+    std::string m_mediaEndpoint;
+    std::string m_lastError;
     std::atomic<bool> m_isOpen{false};
     bool m_capAttempted{false};
     std::atomic<bool> m_isRealStreamActive{false};
