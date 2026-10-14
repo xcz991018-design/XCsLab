@@ -63,7 +63,7 @@ int main(int argc, char** argv) {
             socket->disconnectFromHost();
         });
     });
-    auto resolve = [&](bool snapshot = false) {
+    auto resolve = [&](bool snapshot = false, bool required = false) {
         QFutureWatcher<std::pair<std::string, std::string>> watcher;
         QEventLoop loop;
         QTimer deadline;
@@ -79,6 +79,7 @@ int main(int argc, char** argv) {
             ONVIFDeviceManager manager(info);
             if (snapshot) {
                 info.preferHttpSnapshot = true;
+                info.requireHttpSnapshot = required;
                 manager.setDeviceInfo(info);
                 const auto result = manager.captureSnapshot();
                 return std::make_pair(result.ok() && result.frame.cols == 32 && result.frame.rows == 32
@@ -97,8 +98,10 @@ int main(int argc, char** argv) {
         std::cerr << "Resolution failed: uri=" << success.first << " error=" << success.second << " requests=" << requests << " auth=" << authenticated << " token=" << tokenEscaped << "\n"; return 1;
     }
     const auto http = resolve(true);
-    if (http.first != "HTTP_OK" || snapshotDownloads != 1 || !authenticated || !tokenEscaped) return 1;
+    if (http.first != "HTTP_OK" || http.second != "ONVIF_HTTP" || snapshotDownloads != 1 || !authenticated || !tokenEscaped) return 1;
     badImage = true;
+    const auto strict=resolve(true,true);
+    if (!strict.first.empty() || strict.second!="ONVIF HTTP snapshot unavailable") return 1;
     const auto fallback = resolve(true);
     if (!fallback.first.empty() || fallback.second != "Unable to open configured camera stream") return 1;
     badImage = false;

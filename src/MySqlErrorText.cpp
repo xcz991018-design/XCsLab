@@ -23,7 +23,7 @@ QString decodeMySqlError(const QByteArray& bytes, unsigned int localCodePage) {
         MultiByteToWideChar(codePage, 0, bytes.constData(), static_cast<int>(bytes.size()), &text[0], size);
         return QString::fromWCharArray(text.data(), size);
     }
-    return QStringLiteral("无法解码原始错误消息（字节: %1）").arg(QString::fromLatin1(bytes.toHex()));
+    return QStringLiteral(u"\u65e0\u6cd5\u89e3\u7801\u539f\u59cb\u9519\u8bef\u6d88\u606f\uff08\u5b57\u8282: %1\uff09").arg(QString::fromLatin1(bytes.toHex()));
 #else
     Q_UNUSED(localCodePage);
     return QString::fromUtf8(bytes);

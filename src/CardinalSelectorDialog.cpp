@@ -235,8 +235,9 @@ void InteractiveImageLabel::mouseReleaseEvent(QMouseEvent *event) {
 
 // ---------------- CardinalSelectorDialog ----------------
 
-CardinalSelectorDialog::CardinalSelectorDialog(const cv::Mat& frame, GaugeProfile& profile, const QString& cameraId, QWidget *parent)
+CardinalSelectorDialog::CardinalSelectorDialog(const cv::Mat& frame, GaugeProfile& profile, const QString& cameraId, QWidget *parent, bool historicalSession)
     : QDialog(parent), m_frame(frame.clone()), m_profile(profile), m_cameraId(cameraId) {
+    m_historicalSession = historicalSession;
     setupUi();
     
     bool ptsValid = (m_profile.perspective_pts.size() == 4);
@@ -266,6 +267,7 @@ CardinalSelectorDialog::CardinalSelectorDialog(const cv::Mat& frame, GaugeProfil
 
 void CardinalSelectorDialog::setupUi() {
     setWindowTitle(tr("表计标定（透视、中心点与刻度）"));
+    if (m_historicalSession) setWindowTitle(tr("历史原图手动标定（仅用于本次分析）"));
     resize(1200, 780);
     setStyleSheet("QDialog { background-color: #121216; color: #e0e0e0; font-family: Segoe UI, sans-serif; }");
 
@@ -329,7 +331,7 @@ void CardinalSelectorDialog::setupUi() {
     QHBoxLayout *btnLayout = new QHBoxLayout();
     m_autoBtn = new QPushButton(tr("⚡ 自动检测切点"), this);
     m_resetBtn = new QPushButton(tr("🔄 重置切点"), this);
-    m_saveBtn = new QPushButton(tr("💾 确认并保存到数据库"), this);
+    m_saveBtn = new QPushButton(m_historicalSession ? tr("确认标定并分析历史原图") : tr("💾 确认并保存到数据库"), this);
     m_cancelBtn = new QPushButton(tr("取消"), this);
 
     m_saveBtn->setStyleSheet("background-color: #00897b; color: white; font-weight: bold; padding: 8px 16px; border-radius: 4px;");
@@ -366,6 +368,7 @@ void CardinalSelectorDialog::setupUi() {
     m_saveBtn->setEnabled(false);
     m_saveStatus = new QLabel(tr("设备: %1；底图已冻结，请先确认原图四切点，再在矫正图完成后续标定。").arg(m_cameraId), this);
     m_saveStatus->setObjectName("calibrationSaveStatus");
+    if (m_historicalSession) m_saveStatus->setText(tr("请根据这张历史原图重新标定；仅用于本次分析，不更新相机档案。取消后不进行识别。"));
     m_saveStatus->setWordWrap(true);
     mainLayout->addWidget(m_saveStatus);
 
@@ -498,6 +501,16 @@ void CardinalSelectorDialog::onSaveAndApply() {
     calibration["scale_points"] = scales;
     if (!validDeviceCalibration(calibration) || m_cameraId.isEmpty()) {
         m_saveStatus->setText(tr("无法保存：请将四个切点按 12、3、6、9 点钟顺序放在图像内，并设置有效中心点。"));
+        return;
+    }
+    if (m_historicalSession) {
+        m_profile.scalePoints = scales;
+        m_profile.perspective_pts = points;
+        m_profile.perspective_correction_enabled = true;
+        m_profile.center = center; m_profile.pointerBaseRadius = radius;
+        m_profile.auto_detect_roi = false;
+        m_profile.calibrated_width = m_frame.cols; m_profile.calibrated_height = m_frame.rows;
+        accept();
         return;
     }
     m_saving = true;

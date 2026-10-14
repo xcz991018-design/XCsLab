@@ -42,7 +42,7 @@ int main(int argc, char** argv) {
         const QString id = request["camera_id"].toString();
         if (id == "hang") { QThread::sleep(60); return 3; }
         if (id == "crash") return 3;
-        if (id == "healthy" && !request["_prefer_onvif_snapshot"].toBool()) return 3;
+        if (id == "healthy" && (!request["_prefer_onvif_snapshot"].toBool() || !request["_require_onvif_snapshot"].toBool())) return 3;
         const QString folder = QString::fromLocal8Bit(argv[2]);
         cv::Mat frame(24, 24, CV_8UC3, cv::Scalar(40, 90, 120));
         if (!cv::imwrite((folder + "/frame.png").toStdString(), frame)) return 3;
@@ -70,6 +70,7 @@ int main(int argc, char** argv) {
     if (isolatedCapture(task, cancel).failure != CaptureFailure::WorkerFailed) return 1;
     task.device.cameraId = "healthy";
     task.preferOnvifSnapshot = true;
+    task.requireOnvifSnapshot = true;
     const auto healthy = isolatedCapture(task, cancel);
     if (!healthy.ok() || healthy.frame.at<cv::Vec3b>(0, 0) != cv::Vec3b(40, 90, 120)) { fprintf(stderr, "healthy: %s\n", captureFailureName(healthy.failure)); return 1; }
     {
@@ -104,13 +105,13 @@ int main(int argc, char** argv) {
         ++received;
         if (outcome.cameraId == "hang")
             valid &= outcome.errorCode == "CAPTURE_TIMEOUT" && !outcome.recognitionPerformed && outcome.originalPath.isEmpty();
-        else valid &= outcome.errorCode.isEmpty() && !outcome.originalPath.isEmpty();
+        else { if(!outcome.errorCode.isEmpty()) fprintf(stderr,"healthy service: %s %s\n",outcome.errorCode.toUtf8().constData(),outcome.errorMessage.toUtf8().constData()); valid &= outcome.errorCode.isEmpty() && !outcome.originalPath.isEmpty(); }
     });
     QObject::connect(&service, &InspectionService::finished, &loop, [&](bool) { finished = true; loop.quit(); });
     QObject::connect(&guard, &QTimer::timeout, &loop, &QEventLoop::quit);
     if (!output.isValid() || !service.start({hung, task})) return 1;
     guard.start(7000);
     loop.exec();
-    if (!finished || !valid || received != 2) return 1;
+    if (!finished || !valid || received != 2) { fprintf(stderr,"service: finished=%d valid=%d received=%d\n",finished,valid,received); return 1; }
     return 0;
 }

@@ -29,7 +29,8 @@ CameraSourcePtr createSource(const InspectionTask& task) {
         return std::make_shared<FileCameraSource>(task.localImagePath.toStdString());
     if (dev.protocolType == CameraProtocolType::ONVIF_RTSP_STREAM) {
         ONVIFDeviceInfo info;
-        info.preferHttpSnapshot = task.preferOnvifSnapshot;
+        info.preferHttpSnapshot = task.preferOnvifSnapshot || task.requireOnvifSnapshot;
+        info.requireHttpSnapshot = task.requireOnvifSnapshot;
         info.ipAddress = dev.ipOrSn.toStdString();
         info.port = dev.port;
         info.username = dev.username.toStdString();
@@ -64,11 +65,28 @@ CapturedTask capture(const InspectionTask& task, const InspectionService::Source
     data.outcome.deviceSnapshot = deviceToJson(task.device);
     data.outcome.result.runMode = task.runMode;
     if (cancel->load()) return data;
+    if (task.inputKind == InspectionInputKind::HistoricalImage && !task.captureOnly &&
+        !hasSavedDeviceCalibration(task.historicalCalibration)) {
+        data.outcome.errorCode = "HISTORICAL_CALIBRATION_REQUIRED";
+        data.outcome.errorMessage = QStringLiteral(u"请先根据本次历史原图完成手动标定");
+        return data;
+    }
+    auto applyHistoricalCalibration = [&]() {
+        if (task.inputKind != InspectionInputKind::HistoricalImage || task.captureOnly) return;
+        if (task.historicalCalibration["calibrated_width"].toInt() != data.frame.cols ||
+            task.historicalCalibration["calibrated_height"].toInt() != data.frame.rows)
+            throw std::runtime_error("HISTORICAL_CALIBRATION_DIMENSIONS_MISMATCH");
+        auto device = deviceToJson(data.task.device, true);
+        device["calibration"] = task.historicalCalibration;
+        data.task.device = deviceFromJson(device);
+        data.outcome.deviceSnapshot = deviceToJson(data.task.device);
+    };
     // Historical database tasks validate their frozen device after it is loaded.
-    if ((task.databaseOriginalTaskId.isEmpty() || !task.useHistoricalConfiguration) &&
+    if (task.inputKind != InspectionInputKind::HistoricalImage &&
+        (task.databaseOriginalTaskId.isEmpty() || !task.useHistoricalConfiguration) &&
         requiresInspectionCalibration(task)) {
         data.outcome.errorCode = "CALIBRATION_REQUIRED";
-        data.outcome.errorMessage = QStringLiteral("请先完成设备 %1 的表计标定").arg(task.device.cameraId);
+        data.outcome.errorMessage = QStringLiteral(u"请先完成设备 %1 的表计标定").arg(task.device.cameraId);
         return data;
     }
     try {
@@ -86,6 +104,7 @@ CapturedTask capture(const InspectionTask& task, const InspectionService::Source
                 data.task.device = stored.inspection.device;
                 data.task.historicalProfile = stored.inspection.profile;
             }
+            applyHistoricalCalibration();
             data.outcome.deviceSnapshot = deviceToJson(data.task.device);
             data.outcome.capturedAt = stored.inspection.capturedAt;
             data.outcome.capturedFrame = data.frame;
@@ -96,13 +115,13 @@ CapturedTask capture(const InspectionTask& task, const InspectionService::Source
                 (task.inputKind == InspectionInputKind::HistoricalImage &&
                  (task.parentTaskId.isEmpty() || !task.originalCapturedAt.isValid()))) {
                 data.outcome.errorCode = "INVALID_INPUT";
-                data.outcome.errorMessage = QStringLiteral("未指定有效图片或历史任务身份");
+                data.outcome.errorMessage = QStringLiteral(u"未指定有效图片或历史任务身份");
                 return data;
             }
             data.frame = cv::imread(task.localImagePath.toStdString());
             if (data.frame.empty()) {
                 data.outcome.errorCode = "IMAGE_READ_FAILED";
-                data.outcome.errorMessage = QStringLiteral("指定图片无法读取，未使用其他图像替代");
+                data.outcome.errorMessage = QStringLiteral(u"指定图片无法读取，未使用其他图像替代");
             } else {
                 if (task.inputKind == InspectionInputKind::HistoricalImage) {
                     QFile metadata(QFileInfo(task.localImagePath).dir().filePath("result.json"));
@@ -116,10 +135,11 @@ CapturedTask capture(const InspectionTask& task, const InspectionService::Source
                         storedPath != QFileInfo(task.localImagePath).canonicalFilePath()) {
                         data.frame.release();
                         data.outcome.errorCode = "HISTORICAL_IDENTITY_MISMATCH";
-                        data.outcome.errorMessage = QStringLiteral("历史原图与任务、设备或采集时间不匹配");
+                        data.outcome.errorMessage = QStringLiteral(u"历史原图与任务、设备或采集时间不匹配");
                         return data;
                     }
                 }
+                applyHistoricalCalibration();
                 data.outcome.capturedAt = task.inputKind == InspectionInputKind::HistoricalImage
                     ? task.originalCapturedAt.toUTC() : QDateTime::currentDateTimeUtc();
                 data.outcome.capturedFrame = data.frame;
@@ -128,14 +148,19 @@ CapturedTask capture(const InspectionTask& task, const InspectionService::Source
         }
         if (task.device.protocolType == CameraProtocolType::LOCAL_FILE) {
             data.outcome.errorCode = "INVALID_INPUT";
-            data.outcome.errorMessage = QStringLiteral("实时抓拍不能使用本地图像设备");
+            data.outcome.errorMessage = QStringLiteral(u"实时抓拍不能使用本地图像设备");
             return data;
         }
-        if (!task.previewSnapshot.empty()) {
+        if (task.requireOnvifSnapshot && task.device.protocolType!=CameraProtocolType::ONVIF_RTSP_STREAM) {
+            data.outcome.errorCode="UNSUPPORTED_PROTOCOL";
+            data.outcome.errorMessage=QStringLiteral(u"此操作要求设备使用 ONVIF 快照协议，请检查设备配置");
+            return data;
+        }
+        if (!task.requireOnvifSnapshot && !task.previewSnapshot.empty()) {
             const auto age = task.previewCapturedAt.msecsTo(QDateTime::currentDateTimeUtc());
             if (!task.previewCapturedAt.isValid() || age < 0 || age >= 2000) {
                 data.outcome.errorCode = "STALE_FRAME";
-                data.outcome.errorMessage = QStringLiteral("预览帧已过期，请等待实时画面更新后重新抓拍");
+                data.outcome.errorMessage = QStringLiteral(u"预览帧已过期，请等待实时画面更新后重新抓拍");
                 return data;
             }
             data.frame = task.previewSnapshot.clone();
@@ -147,7 +172,7 @@ CapturedTask capture(const InspectionTask& task, const InspectionService::Source
         auto source = isolate ? CameraSourcePtr() : factory(task);
         if (!source && !isolate) {
             data.outcome.errorCode = "UNSUPPORTED_PROTOCOL";
-            data.outcome.errorMessage = QStringLiteral("协议尚未接入生产采集服务");
+            data.outcome.errorMessage = QStringLiteral(u"协议尚未接入生产采集服务");
         } else {
             const auto acquired = isolate ? isolatedCapture(task, cancel) : source->captureSnapshot();
             data.frame = acquired.frame;
@@ -178,7 +203,7 @@ InspectionOutcome recognize(CapturedTask data, const std::shared_ptr<std::atomic
     if (cancel->load() || !out.errorCode.isEmpty()) return out;
     if (requiresInspectionCalibration(data.task)) {
         out.errorCode = "CALIBRATION_REQUIRED";
-        out.errorMessage = QStringLiteral("请先完成设备 %1 的表计标定").arg(data.task.device.cameraId);
+        out.errorMessage = QStringLiteral(u"请先完成设备 %1 的表计标定").arg(data.task.device.cameraId);
         return out;
     }
     try {
@@ -190,7 +215,7 @@ InspectionOutcome recognize(CapturedTask data, const std::shared_ptr<std::atomic
             if (data.task.captureOnly && !DatabaseSettings::fromEnvironment().enabled) return out;
             try {
                 const auto id = data.task.device.defaultProfileId.isEmpty()
-                    ? QStringLiteral("PRESSURE_GAUGE_1.6MPA") : data.task.device.defaultProfileId;
+                    ? QStringLiteral(u"PRESSURE_GAUGE_1.6MPA") : data.task.device.defaultProfileId;
                 const auto record = MySqlRepository().loadTemplate(id);
                 frozen = QJsonObject{{"profiles", QJsonArray{record.definition}},
                                      {"_database_template_id", record.id},
@@ -209,12 +234,12 @@ InspectionOutcome recognize(CapturedTask data, const std::shared_ptr<std::atomic
         const auto& dev = data.task.device;
         if (frozen.isEmpty()) {
             out.errorCode = "PROFILE_INVALID";
-            out.errorMessage = QStringLiteral("无法冻结仪表配置");
+            out.errorMessage = QStringLiteral(u"无法冻结仪表配置");
             return out;
         }
         if (!profile.loadFromJson(frozen, dev.defaultProfileId.toStdString())) {
             out.errorCode = "PROFILE_INVALID";
-            out.errorMessage = QStringLiteral("无法加载仪表配置");
+            out.errorMessage = QStringLiteral(u"无法加载仪表配置");
             return out;
         }
         profile.gauge_id = dev.cameraId.toStdString();
@@ -328,7 +353,7 @@ InspectionOutcome persist(InspectionOutcome out, const InspectionTask& task,
             MySqlRepository().saveInspection(envelope);
             out.databaseSaved = true;
             out.databasePending = false;
-            if (!QFile::remove(pendingPath)) out.databaseError = QStringLiteral("入库成功，待同步文件清理失败；重试不会重复插入");
+            if (!QFile::remove(pendingPath)) out.databaseError = QStringLiteral(u"入库成功，待同步文件清理失败；重试不会重复插入");
         } catch (const std::exception& e) {
             out.databaseError = QString::fromUtf8(e.what());
         }
@@ -430,11 +455,11 @@ void InspectionService::exportImage(const cv::Mat& frame, const QString& path) {
             const QString suffix = QFileInfo(path).suffix();
             std::vector<uchar> bytes;
             if (frame.empty() || !cv::imencode(("." + suffix).toStdString(), frame, bytes))
-                return QStringLiteral("图像编码失败");
+                return QStringLiteral(u"图像编码失败");
             QSaveFile file(path);
             if (!file.open(QIODevice::WriteOnly) ||
                 file.write(reinterpret_cast<const char*>(bytes.data()), qint64(bytes.size())) != qint64(bytes.size()) || !file.commit())
-                return QStringLiteral("图片写入失败");
+                return QStringLiteral(u"图片写入失败");
             return QString();
         } catch (const std::exception& e) { return QString::fromUtf8(e.what()); }
     }));

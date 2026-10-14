@@ -135,15 +135,15 @@ QJsonObject GaugeTemplateStore::defaults() {
 }
 
 QString GaugeTemplateStore::validate(const QJsonObject& profile) {
-    if (profile["gauge_id"].toString().isEmpty()) return QStringLiteral("数据库模板必须填写模板编号");
+    if (profile["gauge_id"].toString().isEmpty()) return QStringLiteral(u"数据库模板必须填写模板编号");
     for (const auto& key : {"use_model", "gauge_profile", "profile_model", "parent_model_path", "default_profile_id"})
-        if (!profile[key].toString().isEmpty()) return QStringLiteral("数据库模板不能引用本地模型文件，请先迁移为独立模板");
+        if (!profile[key].toString().isEmpty()) return QStringLiteral(u"数据库模板不能引用本地模型文件，请先迁移为独立模板");
     const auto id = idOf(profile);
     if (id.trimmed().isEmpty() || id != id.trimmed() || id.size() > 128)
-        return QStringLiteral("模板编号不能为空、含首尾空格或超过 128 个字符");
+        return QStringLiteral(u"模板编号不能为空、含首尾空格或超过 128 个字符");
     for (const auto ch : id) if ((ch.isSpace() && ch != QChar(' ')) || ch == '"' || ch == '\\' || ch.unicode() < 32)
-        return QStringLiteral("模板编号不能包含换行、引号或反斜杠");
-    if (profile["unit"].toString().trimmed().isEmpty()) return QStringLiteral("请填写读数单位");
+        return QStringLiteral(u"模板编号不能包含换行、引号或反斜杠");
+    if (profile["unit"].toString().trimmed().isEmpty()) return QStringLiteral(u"请填写读数单位");
     auto values = defaults();
     for (const auto& field : fields()) {
         QJsonValue value = profile[field.key];
@@ -151,25 +151,25 @@ QString GaugeTemplateStore::validate(const QJsonObject& profile) {
             if (profile.contains(alias)) { value = profile[alias]; break; }
         if (value.isUndefined()) continue;
         if (field.defaultValue.isBool()) {
-            if (!value.isBool()) return QStringLiteral("%1 必须为开关值").arg(field.label);
+            if (!value.isBool()) return QStringLiteral(u"%1 必须为开关值").arg(field.label);
         } else if (!value.isDouble() || !std::isfinite(value.toDouble()) || value.toDouble() < field.minimum ||
                    value.toDouble() > field.maximum || (field.decimals == 0 && std::floor(value.toDouble()) != value.toDouble()))
-            return QStringLiteral("%1 超出有效范围").arg(field.label);
+            return QStringLiteral(u"%1 超出有效范围").arg(field.label);
         values[field.key] = value;
     }
-    if (values["max_val"].toDouble() <= values["min_val"].toDouble()) return QStringLiteral("量程上限必须大于下限");
-    if (values["pointerMaxWidth"].toDouble() < values["pointerMinWidth"].toDouble()) return QStringLiteral("指针最大宽度不能小于最小宽度");
-    if (values["tail_max_width"].toDouble() < values["tail_min_width"].toDouble()) return QStringLiteral("尾部最大宽度不能小于最小宽度");
+    if (values["max_val"].toDouble() <= values["min_val"].toDouble()) return QStringLiteral(u"量程上限必须大于下限");
+    if (values["pointerMaxWidth"].toDouble() < values["pointerMinWidth"].toDouble()) return QStringLiteral(u"指针最大宽度不能小于最小宽度");
+    if (values["tail_max_width"].toDouble() < values["tail_min_width"].toDouble()) return QStringLiteral(u"尾部最大宽度不能小于最小宽度");
     return {};
 }
 
 bool GaugeTemplateStore::saveProfile(const QJsonObject& profile, bool replacing, QString& error) {
     error = validate(profile);
     if (!error.isEmpty()) return false;
-    if (!m_loaded) { error = QStringLiteral("数据库模板库尚未成功加载"); return false; }
+    if (!m_loaded) { error = QStringLiteral(u"数据库模板库尚未成功加载"); return false; }
     const auto id = idOf(profile);
     if (m_records.contains(id) != replacing) {
-        error = replacing ? QStringLiteral("该模板已不存在，请刷新列表") : QStringLiteral("模板编号已存在，请使用不同编号");
+        error = replacing ? QStringLiteral(u"该模板已不存在，请刷新列表") : QStringLiteral(u"模板编号已存在，请使用不同编号");
         return false;
     }
     try {
@@ -183,8 +183,8 @@ bool GaugeTemplateStore::saveProfile(const QJsonObject& profile, bool replacing,
 
 bool GaugeTemplateStore::removeProfile(const QString& id, const QStringList& usedBy, QString& error) {
     error.clear();
-    if (!usedBy.isEmpty()) { error = QStringLiteral("以下设备正在使用此模板，请先在设备档案中更换模板：\n%1").arg(usedBy.join("\n")); return false; }
-    if (!m_loaded || !m_records.contains(id)) { error = QStringLiteral("数据库模板库尚未加载或模板已不存在"); return false; }
+    if (!usedBy.isEmpty()) { error = QStringLiteral(u"以下设备正在使用此模板，请先在设备档案中更换模板：\n%1").arg(usedBy.join("\n")); return false; }
+    if (!m_loaded || !m_records.contains(id)) { error = QStringLiteral(u"数据库模板库尚未加载或模板已不存在"); return false; }
     try {
         m_backend.remove(id, m_records.value(id).revision);
         m_records.remove(id);

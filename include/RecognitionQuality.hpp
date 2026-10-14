@@ -125,20 +125,20 @@ inline QJsonObject evaluateRecognitionQuality(const PointerDetectionResult& resu
     const auto dw=cfg["direction_weights"].toArray();
     const double direction=(relScore*dw[0].toDouble()+absScore*dw[1].toDouble())/(dw[0].toDouble()+dw[1].toDouble());
     const bool available=bodyQuality["available"].toBool();
-    if (!result.valid) reason("NO_VALID_CANDIDATE",QStringLiteral("\u539f\u68c0\u6d4b\u7b97\u6cd5\u672a\u627e\u5230\u6709\u6548\u6307\u9488\u5019\u9009"));
-    if (!available) reason("INSUFFICIENT_BODY_EVIDENCE",QStringLiteral("\u9488\u8eab\u771f\u5b9e\u53cc\u4fa7\u8bc1\u636e\u6216\u8fde\u7eed\u622a\u9762\u4e0d\u8db3"));
-    if (bodyQuality["gap_warning"].toBool()) reason("EXCESSIVE_EDGE_GAP",QStringLiteral("\u9488\u8eab\u6700\u957f\u8fde\u7eed\u8fb9\u7f18\u7f3a\u5931\u8d85\u8fc7\u8b66\u544a\u9608\u503c"));
-    if (available && bodyQuality["score"].toDouble()<cfg["trusted_score"].toDouble()) reason("LOW_BODY_QUALITY",QStringLiteral("\u9488\u8eab\u8d28\u91cf\u5206\u4f4e\u4e8e\u53ef\u4fe1\u95e8\u69db"));
+    if (!result.valid) reason("NO_VALID_CANDIDATE",QStringLiteral(u"\u539f\u68c0\u6d4b\u7b97\u6cd5\u672a\u627e\u5230\u6709\u6548\u6307\u9488\u5019\u9009"));
+    if (!available) reason("INSUFFICIENT_BODY_EVIDENCE",QStringLiteral(u"\u9488\u8eab\u771f\u5b9e\u53cc\u4fa7\u8bc1\u636e\u6216\u8fde\u7eed\u622a\u9762\u4e0d\u8db3"));
+    if (bodyQuality["gap_warning"].toBool()) reason("EXCESSIVE_EDGE_GAP",QStringLiteral(u"\u9488\u8eab\u6700\u957f\u8fde\u7eed\u8fb9\u7f18\u7f3a\u5931\u8d85\u8fc7\u8b66\u544a\u9608\u503c"));
+    if (available && bodyQuality["score"].toDouble()<cfg["trusted_score"].toDouble()) reason("LOW_BODY_QUALITY",QStringLiteral(u"\u9488\u8eab\u8d28\u91cf\u5206\u4f4e\u4e8e\u53ef\u4fe1\u95e8\u69db"));
     const auto bodyScores=bodyQuality["scores"].toObject();
     for (const auto& key : {QString("support"),QString("coverage"),QString("continuous"),QString("shape"),QString("width")}) {
         if (available && bodyScores[key].toDouble()<cfg["trusted_score"].toDouble())
-            reason("BODY_"+key.toUpper()+"_LOW",QStringLiteral("\u9488\u8eab\u5206\u9879 %1 \u504f\u4f4e").arg(key));
+            reason("BODY_"+key.toUpper()+"_LOW",QStringLiteral(u"\u9488\u8eab\u5206\u9879 %1 \u504f\u4f4e").arg(key));
     }
-    if (direction<cfg["trusted_score"].toDouble()) reason("DIRECTION_AMBIGUOUS",QStringLiteral("\u6b63\u53cd\u65b9\u5411\u9886\u5148\u5e45\u5ea6\u4e0d\u8db3"));
-    if (result.tailDetected && !tailQuality["available"].toBool()) reason("TAIL_EVIDENCE_INSUFFICIENT",QStringLiteral("\u9488\u5c3e\u8bc1\u636e\u4e0d\u8db3\uff0c\u5df2\u6709\u65b9\u5411\u52a0\u5206\u9700\u590d\u6838"));
+    if (direction<cfg["trusted_score"].toDouble()) reason("DIRECTION_AMBIGUOUS",QStringLiteral(u"\u6b63\u53cd\u65b9\u5411\u9886\u5148\u5e45\u5ea6\u4e0d\u8db3"));
+    if (result.tailDetected && !tailQuality["available"].toBool()) reason("TAIL_EVIDENCE_INSUFFICIENT",QStringLiteral(u"\u9488\u5c3e\u8bc1\u636e\u4e0d\u8db3\uff0c\u5df2\u6709\u65b9\u5411\u52a0\u5206\u9700\u590d\u6838"));
     if (result.tailDetected && tailQuality["available"].toBool() &&
         (tailQuality["score"].toDouble()<cfg["trusted_score"].toDouble() || tailQuality["gap_warning"].toBool()))
-        reason("TAIL_QUALITY_LOW",QStringLiteral("\u9488\u5c3e\u8d28\u91cf\u4e0d\u8db3\uff0c\u5df2\u6709\u65b9\u5411\u52a0\u5206\u9700\u590d\u6838"));
+        reason("TAIL_QUALITY_LOW",QStringLiteral(u"\u9488\u5c3e\u8d28\u91cf\u4e0d\u8db3\uff0c\u5df2\u6709\u65b9\u5411\u52a0\u5206\u9700\u590d\u6838"));
     const double overall=available ? std::min(bodyQuality["score"].toDouble(),direction) : 0;
     const bool reviewRequired=overall<cfg["trusted_score"].toDouble() || bodyQuality["gap_warning"].toBool() ||
         (result.tailDetected && (!tailQuality["available"].toBool() || tailQuality["score"].toDouble()<cfg["trusted_score"].toDouble() || tailQuality["gap_warning"].toBool()));
@@ -151,11 +151,11 @@ inline QJsonObject evaluateRecognitionQuality(const PointerDetectionResult& resu
         {"reasons",reasons},{"config",cfg}};
 }
 inline QString qualitySummary(const QJsonObject& quality) {
-    if (quality.isEmpty()) return QStringLiteral("\u8d28\u91cf\uff1a\u672a\u8bc4\u4f30");
-    auto score=[](const QJsonObject& item) { return item["score"].isDouble() ? QString::number(item["score"].toDouble(),'f',1) : QStringLiteral("\u4e0d\u53ef\u8bc4\u4f30"); };
+    if (quality.isEmpty()) return QStringLiteral(u"\u8d28\u91cf\uff1a\u672a\u8bc4\u4f30");
+    auto score=[](const QJsonObject& item) { return item["score"].isDouble() ? QString::number(item["score"].toDouble(),'f',1) : QStringLiteral(u"\u4e0d\u53ef\u8bc4\u4f30"); };
     const auto status=quality["status"].toString();
-    QString text=QStringLiteral("\u65c1\u8def\u8d28\u91cf\uff1a%1 | \u9488\u8eab %2 | \u9488\u5c3e %3 | \u671d\u5411 %4")
-        .arg(status=="trusted" ? QStringLiteral("\u53ef\u4fe1") : status=="review" ? QStringLiteral("\u9700\u590d\u6838") : QStringLiteral("\u4e0d\u53ef\u8bc4\u4f30"))
+    QString text=QStringLiteral(u"\u65c1\u8def\u8d28\u91cf\uff1a%1 | \u9488\u8eab %2 | \u9488\u5c3e %3 | \u671d\u5411 %4")
+        .arg(status=="trusted" ? QStringLiteral(u"\u53ef\u4fe1") : status=="review" ? QStringLiteral(u"\u9700\u590d\u6838") : QStringLiteral(u"\u4e0d\u53ef\u8bc4\u4f30"))
         .arg(score(quality["body"].toObject()),score(quality["tail"].toObject()),score(quality["direction"].toObject()));
     for (const auto& r : quality["reasons"].toArray()) text+="\n"+r.toObject()["message"].toString();
     return text;
@@ -166,11 +166,11 @@ inline QString qualityDetails(const QJsonObject& quality) {
         const auto part=quality[name].toObject();
         const auto m=part["metrics"].toObject(), s=part["scores"].toObject();
         if (m.isEmpty()) continue;
-        text+=QStringLiteral("\n%1\u5206\u9879\uff1a\u652f\u6301 %2 / \u8986\u76d6 %3 / \u8fde\u7eed %4 / \u5f62\u72b6 %5 / \u5bbd\u5ea6 %6")
-            .arg(name=="body" ? QStringLiteral("\u9488\u8eab") : QStringLiteral("\u9488\u5c3e"))
+        text+=QStringLiteral(u"\n%1\u5206\u9879\uff1a\u652f\u6301 %2 / \u8986\u76d6 %3 / \u8fde\u7eed %4 / \u5f62\u72b6 %5 / \u5bbd\u5ea6 %6")
+            .arg(name=="body" ? QStringLiteral(u"\u9488\u8eab") : QStringLiteral(u"\u9488\u5c3e"))
             .arg(s["support"].toDouble(),0,'f',1).arg(s["coverage"].toDouble(),0,'f',1)
             .arg(s["continuous"].toDouble(),0,'f',1).arg(s["shape"].toDouble(),0,'f',1).arg(s["width"].toDouble(),0,'f',1);
-        text+=QStringLiteral("\n\u53cc\u4fa7\u771f\u5b9e\u652f\u6301 %1%\uff0c\u6709\u6548\u8986\u76d6 %2%\uff0c\u6700\u957f\u7f3a\u5931 %3%")
+        text+=QStringLiteral(u"\n\u53cc\u4fa7\u771f\u5b9e\u652f\u6301 %1%\uff0c\u6709\u6548\u8986\u76d6 %2%\uff0c\u6700\u957f\u7f3a\u5931 %3%")
             .arg(100*m["pair_support"].toDouble(),0,'f',1).arg(100*m["coverage"].toDouble(),0,'f',1)
             .arg(100*m["max_gap_ratio"].toDouble(),0,'f',1);
     }

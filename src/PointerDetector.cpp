@@ -763,6 +763,7 @@ PointerCandidateRegion PointerDetector::evaluateCandidateRegion(
     double sumInside = 0.0;
     double sumOutside = 0.0;
     int sliceCount = 0;
+    int adjacentDarkerSections = 0;
     std::vector<double> sliceInVals;
 
     double rad = thetaDeg * M_PI / 180.0;
@@ -794,6 +795,25 @@ PointerCandidateRegion PointerDetector::evaluateCandidateRegion(
                 float valOutR = sampleBilinear(gray, static_cast<float>(P_r.x + v.x * (tR + 3.5)), static_cast<float>(P_r.y + v.y * (tR + 3.5)));
                 double sliceOut = (valOutL + valOutR) * 0.5;
 
+                // A cast shadow can have two coherent edges too. Compare its
+                // interior against nearby robust stripe samples, over the full
+                // radial span; isolated dark letters cannot satisfy persistence.
+                if (m_config.requireDarkPointer) {
+                    double darkestStripe = sliceIn;
+                    const double span = std::max(20.0, 2.0 * w);
+                    for (double t = tC - span; t <= tC + span; t += 2.0) {
+                        double stripe = 0;
+                        for (int offset = -1; offset <= 1; ++offset) {
+                            const auto q = P_r + v * (t + offset);
+                            stripe += sampleBilinear(gray, static_cast<float>(q.x), static_cast<float>(q.y));
+                        }
+                        darkestStripe = std::min(darkestStripe, stripe / 3.0);
+                    }
+                    const double difference = sliceIn - darkestStripe;
+                    if (difference >= std::max(18.0, m_config.minPointerDarkContrast * 1.5) &&
+                        difference > 0.45 * std::max(1.0, sliceOut - darkestStripe)) ++adjacentDarkerSections;
+                }
+
                 sliceInVals.push_back(sliceIn);
                 sumInside += sliceIn;
                 sumOutside += sliceOut;
@@ -816,6 +836,13 @@ PointerCandidateRegion PointerDetector::evaluateCandidateRegion(
         region.meanInsideGray = sortedIns[pIdx];
         region.meanOutsideGray = sumOutside / sliceCount;
         region.entityContrast = region.meanOutsideGray - region.meanInsideGray;
+        region.adjacentDarkerRatio = double(adjacentDarkerSections) / sliceCount;
+        if (m_config.requireDarkPointer && region.commonLength >= 80 && region.adjacentDarkerRatio >= 0.55) {
+            region.darkEntityValid = false;
+            region.geometryValid = false;
+            region.bodyScore = 0;
+            return region;
+        }
     }
 
     // Optical polarity & dark entity hard gate

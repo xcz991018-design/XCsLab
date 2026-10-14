@@ -451,8 +451,13 @@ bool CameraInfoEditDialog::saveCameraInfo() {
     if (!m_isNewDevice && newCamId != m_originalCameraId) {
         DeviceConfigManager::instance().removeDevice(m_originalCameraId, false);
     }
-    DeviceConfigManager::instance().addOrUpdateDevice(item, true);
-
-    QMessageBox::information(this, tr("保存成功"), tr("摄像头网络参数与设备档案已成功更新至 devices.json！"));
+    DeviceConfigManager::instance().addOrUpdateDevice(item, false);
+    if (!DeviceConfigManager::instance().save()) {
+        QMessageBox::warning(this, tr("档案保存失败"), DeviceConfigManager::instance().lastError());
+        return false;
+    }
+    QMessageBox::information(this, tr("档案已保存"),
+        tr("摄像头网络参数已保存至 %1；数据库启用时，档案已提交后台同步，结果见日志。")
+            .arg(DeviceConfigManager::instance().getConfigPath()));
     return true;
 }

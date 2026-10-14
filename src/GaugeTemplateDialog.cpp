@@ -218,7 +218,7 @@ QStringList GaugeTemplateDialog::usedBy(const QString& id) const {
     if (m_usageLookup) return m_usageLookup(id);
     QStringList devices = m_store.usedBy(id);
     for (const auto& device : DeviceConfigManager::instance().getAllDevices())
-        if ((device.defaultProfileId.isEmpty() ? QStringLiteral("PRESSURE_GAUGE_1.6MPA") : device.defaultProfileId) == id)
+        if ((device.defaultProfileId.isEmpty() ? QStringLiteral(u"PRESSURE_GAUGE_1.6MPA") : device.defaultProfileId) == id)
             devices.append(device.cameraId);
     devices.removeDuplicates(); return devices;
 }

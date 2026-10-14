@@ -81,7 +81,7 @@ std::vector<ONVIFDeviceInfo> ONVIFDeviceManager::probeDevicesWSDiscovery(int tim
         socket.writeDatagram(probeData, QHostAddress(QString(ipStr)), port);
     }
 
-    // Also send on active physical network interfaces (multicast + broadcast + subnet sweep)
+    // Also send multicast and directed broadcasts on active physical interfaces.
     QList<QNetworkInterface> interfaces = QNetworkInterface::allInterfaces();
     for (const auto& iface : interfaces) {
         if (iface.flags().testFlag(QNetworkInterface::IsUp) &&
@@ -102,23 +102,13 @@ std::vector<ONVIFDeviceInfo> ONVIFDeviceManager::probeDevicesWSDiscovery(int tim
             socket.writeDatagram(probeData, multicastAddr, port);
             socket.writeDatagram(probeData, QHostAddress::Broadcast, port);
 
-            // Broadcast & Unicast sweep on each interface's IPv4 subnet
+            // Directed subnet broadcast; avoid a 254-host unicast sweep.
             QList<QNetworkAddressEntry> entries = iface.addressEntries();
             for (const auto& entry : entries) {
                 if (entry.ip().protocol() == QAbstractSocket::IPv4Protocol) {
                     QHostAddress bcast = entry.broadcast();
                     if (!bcast.isNull()) {
                         socket.writeDatagram(probeData, bcast, port);
-                    }
-
-                    // Perform fast 1..254 unicast UDP probe sweep on adapter subnet
-                    QString ipStr = entry.ip().toString();
-                    int lastDot = ipStr.lastIndexOf('.');
-                    if (lastDot != -1) {
-                        QString prefix = ipStr.left(lastDot + 1); // e.g. "192.168.1."
-                        for (int i = 1; i <= 254; ++i) {
-                            socket.writeDatagram(probeData, QHostAddress(prefix + QString::number(i)), port);
-                        }
                     }
                 }
             }
@@ -540,9 +530,9 @@ FrameCaptureResult ONVIFDeviceManager::captureHttpSnapshot() {
 }
 
 FrameCaptureResult ONVIFDeviceManager::captureSnapshot() {
-    if (m_info.preferHttpSnapshot) {
+    if (m_info.preferHttpSnapshot || m_info.requireHttpSnapshot) {
         auto snapshot = captureHttpSnapshot();
-        if (snapshot.ok()) return snapshot;
+        if (snapshot.ok() || m_info.requireHttpSnapshot) return snapshot;
         logMessage("ONVIF HTTP snapshot failed; falling back to RTSP");
     }
     auto cached = readFrame();

@@ -10,6 +10,12 @@
 #include <QList>
 #include <memory>
 #include <QFuture>
+#include <QElapsedTimer>
+#include <QThreadPool>
+#include <QTcpSocket>
+#include <QPointer>
+#include <atomic>
+#include "CameraHealthSchedule.hpp"
 #include "ICameraSource.hpp"
 #include "GB28181StreamManager.hpp"
 #include "ONVIFDeviceManager.hpp"
@@ -77,8 +83,11 @@ public:
     explicit AutoCameraDiscoveryService(QObject *parent = nullptr);
     ~AutoCameraDiscoveryService() override;
 
-    void startAutoScan(int intervalMs = 15000);
+    void startAutoScan(int intervalMs = 300000);
     void stopAutoScan();
+    void recordCaptureState(const QString& cameraId, bool online);
+    void deferHealthForCapture(const QString& cameraId);
+    void recordInspectionState(const QString& cameraId, const QString& errorCode, bool captured);
 
 public slots:
     void triggerScanNow();
@@ -91,15 +100,26 @@ signals:
 
 private slots:
     void onScanTimerTimeout();
+    void pollHealth();
 
 private:
-    void executeDiscoveryProcess();
+    void executeDiscoveryProcess(bool manual);
+    void startDiscovery(bool manual);
+    void publishHealth(const QString& cameraId, bool online, bool changed);
 
     QTimer *m_scanTimer{nullptr};
     QMutex m_mutex;
     bool m_isScanning{false};
-    QList<DiscoveredCameraItem> m_knownCameras;
     QFuture<void> m_scanFuture;
+    QThreadPool m_discoveryPool;
+    QTimer* m_healthTimer{nullptr};
+    QElapsedTimer m_clock;
+    CameraHealthSchedule m_health;
+    QHash<QString, QPointer<QTcpSocket>> m_healthSockets;
+    int m_healthCursor{0};
+    qint64 m_healthWindow{-1};
+    int m_healthStarted{0};
+    std::atomic<bool> m_stopping{false};
 };
 
 #endif // AUTO_CAMERA_DISCOVERY_SERVICE_HPP

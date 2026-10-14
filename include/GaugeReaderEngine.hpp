@@ -85,7 +85,8 @@ public:
     /**
      * @brief Locate circular dial ROI in the image.
      */
-    static bool locateDialCircle(const cv::Mat& gray, cv::Point2f& center, float& radius);
+    static bool locateDialCircle(const cv::Mat& gray, cv::Point2f& center, float& radius,
+        bool* hubDetected = nullptr, const cv::Point2f* expectedHub = nullptr);
 
     void drawOverlay(cv::Mat& canvas, const GaugeProfile& profile, const GaugeResult& res, const cv::Mat& invH, double minAngle, double maxAngle);
     static double normalizeAngle(double angleDeg);

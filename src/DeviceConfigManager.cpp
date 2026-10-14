@@ -14,6 +14,7 @@
 #include <QDebug>
 #include <QUrl>
 #include <QHostAddress>
+#include <QStandardPaths>
 
 namespace {
 QString networkAddress(const QJsonObject& device) {
@@ -96,22 +97,25 @@ DeviceConfigManager::DeviceConfigManager() {
 DeviceConfigManager::~DeviceConfigManager() { waitForDatabaseWrites(); }
 void DeviceConfigManager::waitForDatabaseWrites() { m_databasePool.waitForDone(); }
 QString DeviceConfigManager::lastError() const { QMutexLocker lock(&m_mutex); return m_lastError; }
+bool DeviceConfigManager::hasPendingRegistrySave() const { QMutexLocker lock(&m_mutex); return m_registrySavePending; }
 void DeviceConfigManager::retryDatabaseSync() {
     if (!DatabaseSettings::fromEnvironment().enabled || m_databaseFuture.isRunning()) return;
     m_databaseFuture = QtConcurrent::run(&m_databasePool, [this]() {
         const auto error = MySqlRepository::retryPending(QString());
-        { QMutexLocker lock(&m_mutex); m_lastError = error; }
+        // A background success must not erase an unsaved local-file failure.
+        { QMutexLocker lock(&m_mutex); if (!m_registrySavePending) m_lastError = error; }
         emit databaseStatus(error);
     });
 }
 
 QString DeviceConfigManager::resolveConfigPath(const QString& preferredPath) {
     if (!preferredPath.isEmpty()) {
-        if (QFileInfo::exists(preferredPath)) return preferredPath;
+        return QFileInfo(preferredPath).absoluteFilePath();
     }
 
     QString appDir = QCoreApplication::applicationDirPath();
     QStringList candidates = {
+        QStandardPaths::writableLocation(QStandardPaths::AppLocalDataLocation) + "/credentials/devices.json",
         appDir + "/config/devices.json",
         "config/devices.json",
         "../config/devices.json",
@@ -121,7 +125,7 @@ QString DeviceConfigManager::resolveConfigPath(const QString& preferredPath) {
 
     for (const auto& cand : candidates) {
         if (QFileInfo::exists(cand)) {
-            return cand;
+            return QFileInfo(cand).absoluteFilePath();
         }
     }
 
@@ -185,8 +189,7 @@ bool DeviceConfigManager::load(const QString& configPath) {
     } else if (!hasLocal) {
         m_devices.clear();
         locker.unlock();
-        save(path);
-        return true;
+        return save(path);
     }
 
     QJsonDocument doc = QJsonDocument::fromJson(data);
@@ -215,19 +218,19 @@ bool DeviceConfigManager::load(const QString& configPath) {
         locker.unlock();
         return save(path);
     }
+    m_lastError.clear();
     return true;
 }
 
 bool DeviceConfigManager::save(const QString& configPath) {
     QMutexLocker locker(&m_mutex);
+    m_registrySavePending = true;
 
     QString path = configPath.isEmpty() ? m_currentFilePath : configPath;
     if (path.isEmpty()) {
         path = resolveConfigPath();
     }
-    m_currentFilePath = path;
-
-    QDir().mkpath(QFileInfo(path).absolutePath());
+    path = QFileInfo(path).absoluteFilePath();
 
     QJsonObject root;
     QJsonObject sys;
@@ -241,24 +244,72 @@ bool DeviceConfigManager::save(const QString& configPath) {
     }
     root["devices"] = devArr;
 
-    QSaveFile file(path);
-    if (!file.open(QIODevice::WriteOnly)) {
-        qWarning() << "[DeviceConfigManager] Failed to write device registry to:" << path;
-        return false;
-    }
-
     QJsonDocument doc(root);
     const auto bytes = doc.toJson(QJsonDocument::Indented);
-    if (file.write(bytes) != bytes.size() || !file.commit()) return false;
+    QString stage, reason;
+    const auto writeLocal = [&](const QString& target) {
+        const bool directoryReady = QDir().mkpath(QFileInfo(target).absolutePath());
+        QSaveFile file(target);
+        if (!file.open(QIODevice::WriteOnly)) {
+            stage = directoryReady ? "LOCAL_ARCHIVE_OPEN_FAILED" : "LOCAL_ARCHIVE_DIRECTORY_FAILED";
+            reason = file.errorString();
+            return false;
+        }
+        const auto written = file.write(bytes);
+        if (written != bytes.size()) {
+            stage = "LOCAL_ARCHIVE_WRITE_FAILED";
+            reason = tr("%1（期望 %2 字节，写入 %3 字节）").arg(file.errorString()).arg(bytes.size()).arg(written);
+            file.cancelWriting();
+            return false;
+        }
+        if (!file.commit()) {
+            stage = "LOCAL_ARCHIVE_COMMIT_FAILED";
+            reason = file.errorString();
+            return false;
+        }
+        return true;
+    };
+    QList<QStringList> failures;
+    QString recoveredFrom;
+    if (!writeLocal(path)) {
+        failures.append({stage, path, reason});
+        // Preserve atomic writes; do not truncate a locked or protected credentials file.
+        const auto fallback = QStandardPaths::writableLocation(QStandardPaths::AppLocalDataLocation) + "/credentials/devices.json";
+        if (configPath.isEmpty() && DatabaseSettings::fromEnvironment().enabled && path != fallback) {
+            recoveredFrom = path;
+            path = QFileInfo(fallback).absoluteFilePath();
+            if (!writeLocal(path)) { failures.append({stage, path, reason}); recoveredFrom.clear(); }
+        }
+        if (recoveredFrom.isEmpty()) {
+            m_lastError = tr("%1 | 文件: %2 | 原因: %3").arg(stage, path, reason);
+            locker.unlock();
+            for (const auto& failure : failures) {
+                qWarning().noquote() << failure.join(" | ");
+                emit archiveSaveFailed(failure[0], failure[1], failure[2]);
+            }
+            return false;
+        }
+    }
+    m_currentFilePath = path;
+    m_lastError.clear();
+    QString queueError;
     if (DatabaseSettings::fromEnvironment().enabled) {
         try {
             MySqlRepository::queueRegistry(root);
         } catch (const std::exception& e) {
-            m_lastError = QString::fromUtf8(e.what());
-            emit databaseStatus(m_lastError);
+            queueError = QString::fromUtf8(e.what());
+            m_lastError = tr("REGISTRY_QUEUE_FAILED | 文件: %1 | 原因: %2")
+                .arg(QFileInfo(QDir(MySqlRepository::registryQueueDirectory()).filePath("latest.json")).absoluteFilePath(), queueError);
+        }
+        if (queueError.isEmpty()) m_registrySavePending = false;
+        locker.unlock();
+        for (const auto& failure : failures) emit archiveSaveFailed(failure[0], failure[1], failure[2]);
+        if (!recoveredFrom.isEmpty()) emit archiveSaveRecovered(recoveredFrom, path);
+        if (!queueError.isEmpty()) {
+            emit archiveSaveFailed("REGISTRY_QUEUE_FAILED",
+                QFileInfo(QDir(MySqlRepository::registryQueueDirectory()).filePath("latest.json")).absoluteFilePath(), queueError);
             return false;
         }
-        locker.unlock();
         retryDatabaseSync();
         // Database mode uses this one file as the local credential cache only.
         return true;
@@ -284,12 +335,20 @@ bool DeviceConfigManager::save(const QString& configPath) {
         }
     }
 
+    m_registrySavePending = false;
     return true;
 }
 
 QList<DiscoveredCameraItem> DeviceConfigManager::getAllDevices() const {
     QMutexLocker locker(&m_mutex);
     return m_devices.values();
+}
+
+bool DeviceConfigManager::tryGetAllDevices(QList<DiscoveredCameraItem>& devices) const {
+    if (!m_mutex.tryLock()) return false;
+    devices = m_devices.values();
+    m_mutex.unlock();
+    return true;
 }
 
 DiscoveredCameraItem DeviceConfigManager::getDevice(const QString& cameraId) const {
@@ -304,6 +363,8 @@ bool DeviceConfigManager::hasDevice(const QString& cameraId) const {
 
 DiscoveredCameraItem DeviceConfigManager::registerDiscoveredDevice(const DiscoveredCameraItem& item, bool autoSave) {
     DiscoveredCameraItem registered = item;
+    bool newDevice = false;
+    bool needsSave = false;
     {
         QMutexLocker locker(&m_mutex);
         const auto address = networkAddress(deviceToJson(item, false));
@@ -318,15 +379,13 @@ DiscoveredCameraItem DeviceConfigManager::registerDiscoveredDevice(const Discove
             // Discovery refreshes reachability without replacing configured connection or calibration.
             registered.isOnline = item.isOnline;
             registered.lastSeenTime = item.lastSeenTime;
-        }
+        } else newDevice = true;
         if (registered.lastSeenTime.isEmpty())
             registered.lastSeenTime = QDateTime::currentDateTime().toString("yyyy-MM-dd HH:mm:ss");
         m_devices.insert(registered.cameraId, registered);
+        needsSave = newDevice || m_registrySavePending;
     }
-    if (autoSave && !save()) {
-        { QMutexLocker locker(&m_mutex); if (m_lastError.isEmpty()) m_lastError = "DEVICE_REGISTRATION_SAVE_FAILED"; }
-        emit databaseStatus(lastError());
-    }
+    if (autoSave && needsSave) save();
     return registered;
 }
 

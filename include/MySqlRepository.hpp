@@ -6,12 +6,12 @@
 
 struct DatabaseSettings {
     bool enabled{true};
-    QString host{QStringLiteral("127.0.0.1")};
-    QString database{QStringLiteral("BYS_GaugeReaderDB")};
-    QString user{QStringLiteral("root")};
+    QString host{QStringLiteral(u"127.0.0.1")};
+    QString database{QStringLiteral(u"BYS_GaugeReaderDB")};
+    QString user{QStringLiteral(u"root")};
     QString password;
     unsigned int port{3306};
-    QString tlsMode{QStringLiteral("required")};
+    QString tlsMode{QStringLiteral(u"required")};
     QString caFile;
     QString configurationError;
     int maxImageBytes{32 * 1024 * 1024};

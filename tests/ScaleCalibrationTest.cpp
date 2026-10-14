@@ -106,6 +106,23 @@ int main(int argc,char** argv) {
         require(correctedImage->getScalePoints().size()==2,"Corrected scale clicks failed");
         QMetaObject::invokeMethod(&dialog,"onConfirmPerspective",Qt::DirectConnection);
         require(originalImage->isEnabled() && !correctedImage->isEnabled() && correctedImage->getScalePoints().isEmpty(),"Returning to perspective preserved stale annotations");
+        GaugeProfile historicalProfile; historicalProfile.perspective_pts=dialogProfile.perspective_pts;
+        const auto beforeCancel=historicalProfile.toJson();
+        CardinalSelectorDialog cancelled(dial,historicalProfile,"test",nullptr,true);
+        cancelled.reject();
+        require(cancelled.result()==QDialog::Rejected && historicalProfile.toJson()==beforeCancel,"History cancel changed calibration");
+        CardinalSelectorDialog historical(dial,historicalProfile,"test",nullptr,true);
+        QMetaObject::invokeMethod(&historical,"onSaveAndApply",Qt::DirectConnection);
+        require(historicalProfile.scalePoints.isEmpty(),"History accepted without manual calibration");
+        QMetaObject::invokeMethod(&historical,"onConfirmPerspective",Qt::DirectConnection);
+        auto* historyImage=historical.findChild<InteractiveImageLabel*>("rectifiedCalibrationImage");
+        historyImage->resize(800,800);
+        QApplication::sendEvent(historyImage,&centerClick);
+        historyImage->selectScaleRatio(0); QApplication::sendEvent(historyImage,&click);
+        historyImage->selectScaleRatio(1); QApplication::sendEvent(historyImage,&clickMax);
+        QMetaObject::invokeMethod(&historical,"onSaveAndApply",Qt::DirectConnection);
+        require(historical.result()==QDialog::Accepted && historicalProfile.scalePoints.size()==2,
+                "Session calibration required database or failed to apply");
         std::cout<<"Scale calibration checks passed\n";
     } catch(const std::exception& e) { std::cerr<<e.what()<<'\n';return 1; }
 }

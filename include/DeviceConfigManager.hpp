@@ -25,6 +25,7 @@ public:
     bool save(const QString& configPath = "");
 
     QList<DiscoveredCameraItem> getAllDevices() const;
+    bool tryGetAllDevices(QList<DiscoveredCameraItem>& devices) const;
     DiscoveredCameraItem getDevice(const QString& cameraId) const;
     bool hasDevice(const QString& cameraId) const;
 
@@ -50,10 +51,13 @@ public:
     QString getConfigPath() const { return m_currentFilePath; }
     static QString resolveConfigPath(const QString& preferredPath = "");
     QString lastError() const;
+    bool hasPendingRegistrySave() const;
     void retryDatabaseSync();
     void waitForDatabaseWrites();
 signals:
     void databaseStatus(const QString& error);
+    void archiveSaveFailed(const QString& stage, const QString& path, const QString& reason);
+    void archiveSaveRecovered(const QString& failedPath, const QString& savedPath);
 
 private:
     DeviceConfigManager();
@@ -65,6 +69,7 @@ private:
     QMap<QString, DiscoveredCameraItem> m_devices;
     QString m_currentFilePath;
     QString m_lastError;
+    bool m_registrySavePending{false};
     QThreadPool m_databasePool;
     QFuture<void> m_databaseFuture;
 };

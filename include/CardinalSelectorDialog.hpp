@@ -65,7 +65,7 @@ class CardinalSelectorDialog : public QDialog {
     Q_OBJECT
 
 public:
-    CardinalSelectorDialog(const cv::Mat& frame, GaugeProfile& profile, const QString& cameraId = "", QWidget *parent = nullptr);
+    CardinalSelectorDialog(const cv::Mat& frame, GaugeProfile& profile, const QString& cameraId = "", QWidget *parent = nullptr, bool historicalSession = false);
     ~CardinalSelectorDialog() override = default;
     void reject() override;
 
@@ -102,6 +102,7 @@ private:
     QWidget* m_scaleControls{nullptr};
     QLabel* m_scaleStatus{nullptr};
     bool m_saving{false};
+    bool m_historicalSession{false};
 };
 
 #endif // CARDINAL_SELECTOR_DIALOG_HPP

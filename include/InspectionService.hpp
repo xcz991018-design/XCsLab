@@ -31,6 +31,7 @@ struct InspectionTask {
     QString parentTaskId;
     QDateTime originalCapturedAt;
     bool captureOnly{false};
+    bool requireOnvifSnapshot{false}; // HTTP snapshot only; never reuse preview or fall back to RTSP.
     bool preferOnvifSnapshot{false}; // Batch inspection prefers HTTP; preview stays RTSP.
     // Owned copy of the live preview frame selected by the snapshot button.
     cv::Mat previewSnapshot;
@@ -39,6 +40,7 @@ struct InspectionTask {
     bool returnImages{false};
     QString databaseOriginalTaskId;
     QJsonObject historicalProfile;
+    QJsonObject historicalCalibration; // Explicit per-analysis geometry; never saved to camera archives.
     bool useHistoricalConfiguration{true};
 };
 

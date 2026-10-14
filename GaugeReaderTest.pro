@@ -7,6 +7,8 @@ QT       += core gui widgets concurrent network
 CONFIG   += c++17
 CONFIG   += utf8_source
 
+# MSVC2017: QStringLiteral arguments must use u"..."; mixing u"" and
+# narrow UTF-8 literals corrupts Chinese even with /utf-8.
 # Force MSVC compiler to use UTF-8 source and execution charset
 win32-msvc {
     QMAKE_CXXFLAGS += /utf-8
@@ -37,6 +39,7 @@ win32 {
 
 # Header Files
 HEADERS += \
+    $$PWD/include/CameraHealthSchedule.hpp \
     $$PWD/include/DeviceCalibration.hpp \
     $$PWD/include/InspectionCalibration.hpp \
     $$PWD/include/CameraDiscoveryTargets.hpp \

@@ -274,6 +274,7 @@ struct PointerCandidateRegion {
     double meanOutsideGray{0.0};    // Average intensity outside candidate region edges
     double entityContrast{0.0};     // meanOutsideGray - meanInsideGray (positive for dark entity)
     bool darkEntityValid{false};    // Meets dark entity contrast & interior gray threshold
+    double adjacentDarkerRatio{0.0}; // Persistent darker parallel structure suggests a cast shadow.
 
     bool geometryValid{false};      // Passes long parallel geometry gate
 };

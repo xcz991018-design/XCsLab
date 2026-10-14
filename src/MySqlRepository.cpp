@@ -232,7 +232,13 @@ const QByteArray historySelect = "SELECT h.task_id,h.camera_id,h.parent_task_id,
     " FROM inspection_history h JOIN camera_config_versions v ON v.config_id=h.config_id";
 void writeAtomic(const QString& path, const QJsonObject& object) {
     QSaveFile file(path); const auto bytes = json(object);
-    if (!file.open(QIODevice::WriteOnly) || file.write(bytes) != bytes.size() || !file.commit()) fail("OUTBOX_WRITE_FAILED");
+    const auto describe = [&](const QString& operation) {
+        fail(QString("OUTBOX_WRITE_FAILED | %1 | 文件: %2 | 原因: %3")
+            .arg(operation, QFileInfo(path).absoluteFilePath(), file.errorString()));
+    };
+    if (!file.open(QIODevice::WriteOnly)) describe(QStringLiteral(u"\u6253\u5f00"));
+    if (file.write(bytes) != bytes.size()) { describe(QStringLiteral(u"\u5199\u5165")); }
+    if (!file.commit()) describe(QStringLiteral(u"\u539f\u5b50\u63d0\u4ea4"));
 }
 }
 
@@ -258,8 +264,8 @@ QString MySqlRepository::testConnection() const {
     const auto result=c.exec("SELECT COUNT(*) FROM information_schema.tables WHERE table_schema=?"
         " AND table_name IN ('camera_archives','camera_config_versions','inspection_history','inspection_evidence',"
         "'reading_reviews','image_blobs','runtime_settings','gauge_templates')", {m_settings.database.toUtf8()});
-    return str(result[0][0]).toInt()==8 ? QStringLiteral("连接成功，数据库所需表已存在。")
-        : QStringLiteral("连接成功，但数据库表结构尚未准备齐全。请先执行 database/mysql 中的迁移脚本（001–004）。");
+    return str(result[0][0]).toInt()==8 ? QStringLiteral(u"\u8fde\u63a5\u6210\u529f\uff0c\u6570\u636e\u5e93\u6240\u9700\u8868\u5df2\u5b58\u5728\u3002")
+        : QStringLiteral(u"\u8fde\u63a5\u6210\u529f\uff0c\u4f46\u6570\u636e\u5e93\u8868\u7ed3\u6784\u5c1a\u672a\u51c6\u5907\u9f50\u5168\u3002\u8bf7\u5148\u6267\u884c database/mysql \u4e2d\u7684\u8fc1\u79fb\u811a\u672c\uff08001\u2013004\uff09\u3002");
 }
 QJsonObject MySqlRepository::sanitizedRegistry(QJsonObject registry) {
     QJsonArray devices;
@@ -310,7 +316,7 @@ void MySqlRepository::saveRegistry(const QJsonObject& registry) const {
     templates.sort();
     for (const auto& id : templates)
         if (c.exec("SELECT template_id FROM gauge_templates WHERE template_id=? AND deleted_at IS NULL FOR UPDATE", {id.toUtf8()}).empty())
-            fail(QStringLiteral("设备选择的数据库模板不存在：%1").arg(id));
+            fail(QStringLiteral(u"\u8bbe\u5907\u9009\u62e9\u7684\u6570\u636e\u5e93\u6a21\u677f\u4e0d\u5b58\u5728\uff1a%1").arg(id));
     // This desktop registry is a complete snapshot; only its serialized writer submits it.
     c.exec("SELECT camera_id FROM camera_archives FOR UPDATE");
     for (const auto& value : registry["devices"].toArray()) {
@@ -369,7 +375,7 @@ QList<GaugeTemplateRecord> MySqlRepository::loadTemplates() const {
 GaugeTemplateRecord MySqlRepository::loadTemplate(const QString& id) const {
     Connection c(m_settings);
     const auto rows = c.exec("SELECT template_id,definition,revision FROM gauge_templates WHERE template_id=? AND deleted_at IS NULL", {id.toUtf8()});
-    if (rows.empty()) fail(QStringLiteral("数据库模板不存在或已删除：%1").arg(id));
+    if (rows.empty()) fail(QStringLiteral(u"\u6570\u636e\u5e93\u6a21\u677f\u4e0d\u5b58\u5728\u6216\u5df2\u5220\u9664\uff1a%1").arg(id));
     auto record = templateRecord(rows.front());
     validateTemplate(record.definition);
     return record;
@@ -381,9 +387,9 @@ GaugeTemplateRecord MySqlRepository::saveTemplate(const QJsonObject& input, quin
     const auto id = definition["gauge_id"].toString();
     Connection c(m_settings); Transaction tx(c);
     const auto rows = c.exec("SELECT revision,deleted_at FROM gauge_templates WHERE template_id=? FOR UPDATE", {id.toUtf8()});
-    if (!expectedRevision && !rows.empty()) fail(QStringLiteral("模板编号已存在（含已删除模板），请使用不同编号"));
+    if (!expectedRevision && !rows.empty()) fail(QStringLiteral(u"\u6a21\u677f\u7f16\u53f7\u5df2\u5b58\u5728\uff08\u542b\u5df2\u5220\u9664\u6a21\u677f\uff09\uff0c\u8bf7\u4f7f\u7528\u4e0d\u540c\u7f16\u53f7"));
     if (expectedRevision && (rows.empty() || rows.front()[1] || str(rows.front()[0]).toULongLong() != expectedRevision))
-        fail(QStringLiteral("模板已被其他操作修改或删除，请刷新列表后重试"));
+        fail(QStringLiteral(u"\u6a21\u677f\u5df2\u88ab\u5176\u4ed6\u64cd\u4f5c\u4fee\u6539\u6216\u5220\u9664\uff0c\u8bf7\u5237\u65b0\u5217\u8868\u540e\u91cd\u8bd5"));
     const auto now = time(QDateTime::currentDateTimeUtc());
     const auto revision = expectedRevision + 1;
     if (!expectedRevision) c.exec("INSERT INTO gauge_templates(template_id,definition,revision,created_at,updated_at) VALUES(?,?,1,?,?)",
@@ -398,12 +404,12 @@ void MySqlRepository::deleteTemplate(const QString& id, quint64 expectedRevision
     Connection c(m_settings); Transaction tx(c);
     const auto rows = c.exec("SELECT revision,deleted_at FROM gauge_templates WHERE template_id=? FOR UPDATE", {id.toUtf8()});
     if (!expectedRevision || rows.empty() || rows.front()[1] || str(rows.front()[0]).toULongLong() != expectedRevision)
-        fail(QStringLiteral("模板已被其他操作修改或删除，请刷新列表后重试"));
+        fail(QStringLiteral(u"\u6a21\u677f\u5df2\u88ab\u5176\u4ed6\u64cd\u4f5c\u4fee\u6539\u6216\u5220\u9664\uff0c\u8bf7\u5237\u65b0\u5217\u8868\u540e\u91cd\u8bd5"));
     const auto references = c.exec(templateReferences + " FOR UPDATE", {id.toUtf8()});
     if (!references.empty()) {
         QStringList devices;
         for (const auto& row : references) devices.append(str(row[0]));
-        fail(QStringLiteral("模板正在被设备使用，请先更换设备模板：%1").arg(devices.join("、")));
+        fail(QStringLiteral(u"\u6a21\u677f\u6b63\u5728\u88ab\u8bbe\u5907\u4f7f\u7528\uff0c\u8bf7\u5148\u66f4\u6362\u8bbe\u5907\u6a21\u677f\uff1a%1").arg(devices.join("、")));
     }
     const auto now = time(QDateTime::currentDateTimeUtc());
     c.exec("UPDATE gauge_templates SET deleted_at=?,updated_at=?,revision=revision+1 WHERE template_id=?", {now, now, id.toUtf8()});
@@ -415,7 +421,7 @@ int MySqlRepository::importTemplates(const QList<QJsonObject>& definitions) cons
     for (const auto& definition : definitions) {
         validateTemplate(definition);
         const auto id = definition["gauge_id"].toString();
-        if (unique.contains(id)) fail(QStringLiteral("迁移文件中的模板编号重复：%1").arg(id));
+        if (unique.contains(id)) fail(QStringLiteral(u"\u8fc1\u79fb\u6587\u4ef6\u4e2d\u7684\u6a21\u677f\u7f16\u53f7\u91cd\u590d\uff1a%1").arg(id));
         auto cleaned=definition; cleaned.remove("min_angle_deg"); cleaned.remove("max_angle_deg");
         unique[id] = cleaned;
     }
@@ -576,9 +582,20 @@ QString MySqlRepository::registryQueueDirectory() {
     return qEnvironmentVariable("GAUGE_MYSQL_OUTBOX",QStandardPaths::writableLocation(QStandardPaths::AppLocalDataLocation)+"/mysql_registry_outbox");
 }
 QString MySqlRepository::queueRegistry(const QJsonObject& registry) {
-    const auto folder=registryQueueDirectory(); if (!QDir().mkpath(folder)) fail("OUTBOX_DIRECTORY_FAILED");
+    const auto folder=QFileInfo(registryQueueDirectory()).absoluteFilePath();
+    if (!QDir().mkpath(folder)) {
+        QSaveFile probe(QDir(folder).filePath("latest.json")); probe.open(QIODevice::WriteOnly);
+        fail(QString("OUTBOX_DIRECTORY_FAILED | 目录: %1 | 原因: %2").arg(folder, probe.errorString()));
+    }
     const auto path=QDir(folder).filePath("latest.json");
-    QLockFile lock(folder+"/registry.lock"); if (!lock.tryLock(1000)) fail("REGISTRY_OUTBOX_BUSY");
+    QLockFile lock(folder+"/registry.lock");
+    if (!lock.tryLock(1000)) {
+        const auto reason = lock.error() == QLockFile::LockFailedError ? QStringLiteral(u"\u540c\u6b65\u961f\u5217\u5df2\u88ab\u5176\u4ed6\u8fdb\u7a0b\u9501\u5b9a")
+            : lock.error() == QLockFile::PermissionError ? QStringLiteral(u"\u6ca1\u6709\u521b\u5efa\u540c\u6b65\u961f\u5217\u9501\u6587\u4ef6\u7684\u6743\u9650")
+            : QStringLiteral(u"\u540c\u6b65\u961f\u5217\u9501\u6587\u4ef6\u53d1\u751f I/O \u9519\u8bef");
+        fail(QString("REGISTRY_OUTBOX_BUSY | 锁文件: %1 | 原因: %2 | 错误码: %3")
+            .arg(folder+"/registry.lock", reason).arg(int(lock.error())));
+    }
     writeAtomic(path,sanitizedRegistry(registry)); return path;
 }
 QString MySqlRepository::retryPending(const QString& directory,int limit) {

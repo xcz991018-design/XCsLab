@@ -13,6 +13,7 @@
  * @brief ONVIF Standard Device Metadata & Service Parameters.
  */
 struct ONVIFDeviceInfo {
+    bool requireHttpSnapshot{false};
     bool preferHttpSnapshot{false};
     std::string xaddr;
     std::string ipAddress{"192.168.1.101"};

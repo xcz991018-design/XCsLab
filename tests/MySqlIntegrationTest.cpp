@@ -1,3 +1,4 @@
+#include <QStandardPaths>
 #include "CardinalSelectorDialog.hpp"
 #include "MySqlRepository.hpp"
 #include "DeviceCodec.hpp"
@@ -114,7 +115,7 @@ int main(int argc,char** argv) {
                 pulse.start(1); timeout.start(10000); loop.exec();
                 require(testButton->isEnabled() && heartbeats>0,"GUI blocked during connection test");
             };
-            waitForConnection(); require(status->text().contains("连接成功"),"GUI connection test failed");
+            waitForConnection(); require(status->text()==QStringLiteral(u"\u8fde\u63a5\u6210\u529f\uff0c\u6570\u636e\u5e93\u6240\u9700\u8868\u5df2\u5b58\u5728\u3002"),"GUI connection success text was corrupted");
             connectionDialog.findChild<QLineEdit*>("mysqlUser")->setText("missing_user_"+QUuid::createUuid().toString(QUuid::WithoutBraces));
             waitForConnection(); require(status->text().contains("连接失败"),"GUI failed connection not reported");
         }
@@ -238,6 +239,52 @@ int main(int argc,char** argv) {
         registryFile.write(QJsonDocument(registry).toJson()); registryFile.close();
         auto& manager=DeviceConfigManager::instance();
         require(manager.load(registryPath),"Device manager database load failed");
+        // Queue failures are local storage failures, not MySQL connection failures.
+        manager.waitForDatabaseWrites();
+        const auto originalOutbox=qEnvironmentVariable("GAUGE_MYSQL_OUTBOX");
+        const auto badOutbox=folder.path()+"/blocked-outbox";
+        QFile blockOutbox(badOutbox); require(blockOutbox.open(QIODevice::WriteOnly),"Outbox blocker failed");
+        blockOutbox.write("block directory"); blockOutbox.close();
+        QString failureStage, failurePath, failureReason; int localErrors=0, dbErrors=0, recoveries=0;
+        const auto failureConnection=QObject::connect(&manager,&DeviceConfigManager::archiveSaveFailed,&app,
+            [&](const QString& stage,const QString& path,const QString& reason) {
+                ++localErrors; failureStage=stage; failurePath=path; failureReason=reason;
+            });
+        const auto dbConnection=QObject::connect(&manager,&DeviceConfigManager::databaseStatus,&app,
+            [&](const QString& error){if(!error.isEmpty())++dbErrors;});
+        const auto recoveryConnection=QObject::connect(&manager,&DeviceConfigManager::archiveSaveRecovered,&app,
+            [&](const QString&,const QString&){++recoveries;});
+        qputenv("GAUGE_MYSQL_OUTBOX",badOutbox.toUtf8());
+        require(!manager.save(registryPath) && localErrors==1 && dbErrors==0 &&
+                failureStage=="REGISTRY_QUEUE_FAILED" && failurePath==badOutbox+"/latest.json" &&
+                failureReason.contains("OUTBOX_DIRECTORY_FAILED"), "Queue failure was misclassified or lacked path/reason");
+        qputenv("GAUGE_MYSQL_OUTBOX",originalOutbox.toUtf8());
+        require(manager.save(registryPath),"Queue save retry failed"); manager.waitForDatabaseWrites();
+        // An inaccessible default credentials path recovers atomically to a fresh user cache.
+        const auto oldAppName=app.applicationName();
+        app.setApplicationName("gauge_storage_test_"+QUuid::createUuid().toString(QUuid::WithoutBraces));
+        const auto fallback=QStandardPaths::writableLocation(QStandardPaths::AppLocalDataLocation)+"/credentials/devices.json";
+        QFile heldCredentials(registryPath);
+        require(heldCredentials.open(QIODevice::ReadOnly),"Hold credentials file open failed");
+        require(manager.load(registryPath),"Prepare default path fallback failed");
+        manager.addOrUpdateDevice(device,false);
+        require(manager.save() && recoveries==1 && manager.getConfigPath()==fallback &&
+                QFile::exists(fallback),"Writable credentials fallback failed");
+        manager.waitForDatabaseWrites();
+        heldCredentials.close();
+        require(failureStage=="LOCAL_ARCHIVE_COMMIT_FAILED" && failurePath==registryPath && !failureReason.isEmpty(),
+                "Locked credentials error lacked stage/path/reason");
+        QFile credentialFile(fallback); require(credentialFile.open(QIODevice::ReadOnly),"Fallback credentials read failed");
+        const auto fallbackArchive=QJsonDocument::fromJson(credentialFile.readAll()).object(); credentialFile.close();
+        require(fallbackArchive["devices"].toArray()[0].toObject()["password"].toString()==device.password,
+                "Credentials lost during fallback");
+        require(DeviceConfigManager::resolveConfigPath()==fallback,"Restart did not select recovered cache");
+        QObject::disconnect(failureConnection); QObject::disconnect(dbConnection); QObject::disconnect(recoveryConnection);
+        require(QFile::remove(fallback),"Fallback test file cleanup failed");
+        QDir().rmdir(QFileInfo(fallback).absolutePath()); QDir().rmdir(QFileInfo(fallback).dir().absolutePath()+"/..");
+        app.setApplicationName(oldAppName);
+        require(manager.load(registryPath),"Restore credentials path failed");
+
         // A missing template in a pending registry must recover after migration,
         // without erasing the existing database archives or pending changes.
         auto pendingRegistry = registry;

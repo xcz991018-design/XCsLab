@@ -112,7 +112,7 @@ private slots:
 
 private:
     InspectionTask makeSingleTask() const;
-    void submitSingleTask(InspectionTask task);
+    void submitSingleTask(InspectionTask task, bool historicalCalibrated = false);
     void setupUi();
     void createTopBanner(QVBoxLayout *rootLayout);
     QWidget* createLeftSidebar(QWidget *parent);
@@ -132,12 +132,17 @@ private:
     void applyCameraCalibrationAndProfile(const QString& camId);
     void checkCameraCalibration(const QString& camId);
     void tryOpenCameraCalibration();
+    void requestCalibrationSnapshot(const QString& cameraId);
     QSet<QString> m_calibrationChecked;
     QSet<QString> m_calibrationQueries;
     QString m_pendingCalibrationCamera;
     quint64 m_cameraConnectionGeneration{0};
     bool m_calibrationDialogOpen{false};
+    bool m_historicalCalibrationPending{false};
     bool m_cameraHasFrame{false};
+    FrameCaptureResult m_calibrationSnapshot;
+    QString m_calibrationSnapshotCamera;
+    bool m_calibrationSnapshotLoading{false};
 
     // Top Status Bar Badges
     QLabel *m_statusChannelBadge{nullptr};

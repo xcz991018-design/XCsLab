@@ -152,6 +152,40 @@ int main(int argc, char** argv) {
     if (savedRoot["system"].toObject().contains("last_active_device_id") || savedRoot["system"].toObject().contains("auto_connect_on_startup")) return fail(__LINE__);
     for (const auto& value:savedRoot["devices"].toArray()) if(value.toObject().contains("is_auto_connect")) return fail(__LINE__);
     if (!manager.load(registryPath) || manager.getAllDevices().size() != 4) return fail(__LINE__);
+    savedRegistry.close();
+    int localFailures=0, mysqlFailures=0;
+    QString failurePath, failureReason, failureStage;
+    const auto localSignal=QObject::connect(&manager,&DeviceConfigManager::archiveSaveFailed,&app,
+        [&](const QString& stage,const QString& path,const QString& reason) {
+            ++localFailures; failureStage=stage; failurePath=path; failureReason=reason;
+        });
+    const auto dbSignal=QObject::connect(&manager,&DeviceConfigManager::databaseStatus,&app,
+        [&](const QString& error) { if(!error.isEmpty()) ++mysqlFailures; });
+    const auto blocked=directory.path()+"/blocked";
+    QFile blocker(blocked); if(!blocker.open(QIODevice::WriteOnly)) return fail(__LINE__);
+    blocker.write("block directory creation"); blocker.close();
+    const auto blockedTarget=blocked+"/devices.json";
+    if(manager.save(blockedTarget) || localFailures!=1 || mysqlFailures!=0 ||
+       failurePath!=blockedTarget || failureReason.isEmpty() ||
+       !failureStage.startsWith("LOCAL_ARCHIVE_") || !manager.lastError().contains(blockedTarget)) return fail(__LINE__);
+    // A good retry clears stale errors and pins relative paths to their absolute location.
+    if(!manager.save(registryPath) || !manager.lastError().isEmpty()) return fail(__LINE__);
+#ifdef Q_OS_WIN
+    // A Windows reader that holds the destination open prevents atomic replacement.
+    QFile heldRegistry(registryPath);
+    if(!heldRegistry.open(QIODevice::ReadOnly)) return fail(__LINE__);
+    if(manager.save(registryPath) || failureStage!="LOCAL_ARCHIVE_COMMIT_FAILED" ||
+       failurePath!=registryPath || failureReason.isEmpty() || mysqlFailures!=0) return fail(__LINE__);
+    heldRegistry.close();
+    manager.registerDiscoveredDevice(configured,true);
+    if(manager.hasPendingRegistrySave() || !manager.lastError().isEmpty()) return fail(__LINE__);
+#endif
+    const auto oldWorkingDirectory=QDir::currentPath();
+    if(!manager.save("relative-devices.json")) return fail(__LINE__);
+    if(manager.getConfigPath()!=oldWorkingDirectory+"/relative-devices.json") return fail(__LINE__);
+    if(!QDir::setCurrent(oldWorkingDirectory) || !manager.save() || !manager.lastError().isEmpty()) return fail(__LINE__);
+    QObject::disconnect(localSignal); QObject::disconnect(dbSignal);
+
     }
     int acquisitions = 0;
     InspectionService service(nullptr, 1, [&](const InspectionTask& task) {
@@ -213,6 +247,28 @@ int main(int argc, char** argv) {
     const auto history = run(task);
     if (!history.errorCode.isEmpty() || history.parentTaskId != live.taskId || history.capturedAt != live.capturedAt || acquisitions != initialAcquisitions) return fail(__LINE__);
     if (cv::norm(live.capturedFrame, history.capturedFrame, cv::NORM_INF) != 0) return fail(__LINE__);
+    auto uncalibratedHistory = task; uncalibratedHistory.captureOnly = false;
+    const auto historyDenied = run(uncalibratedHistory);
+    if (historyDenied.errorCode != "HISTORICAL_CALIBRATION_REQUIRED" || historyDenied.recognitionPerformed ||
+        !historyDenied.originalPath.isEmpty() || acquisitions != initialAcquisitions) return fail(__LINE__);
+    uncalibratedHistory.historicalCalibration=QJsonObject{{"calibration_confirmed",true}};
+    const auto invalidHistoryCalibration=run(uncalibratedHistory);
+    if (invalidHistoryCalibration.errorCode!="HISTORICAL_CALIBRATION_REQUIRED" || invalidHistoryCalibration.recognitionPerformed) return fail(__LINE__);
+    QJsonObject historyCalibration{{"calibration_confirmed",true},{"perspective_correction_enabled",true},
+        {"calibrated_width",24},{"calibrated_height",24},{"center_x",12},{"center_y",12},{"pointer_base_radius",2},
+        {"scale_points",QJsonArray{QJsonObject{{"x",3},{"y",20},{"ratio",0}},QJsonObject{{"x",20},{"y",20},{"ratio",1}}}}};
+    const double historyRim[8]={12,1,23,12,12,23,1,12};
+    for(int i=0;i<4;++i) {historyCalibration[QString("pt_%1_x").arg(i)]=historyRim[i*2];historyCalibration[QString("pt_%1_y").arg(i)]=historyRim[i*2+1];}
+    uncalibratedHistory.historicalCalibration=historyCalibration;
+    uncalibratedHistory.historicalProfile=GaugeProfile::createDefault().toJson();
+    const auto calibratedHistory=run(uncalibratedHistory);
+    if (calibratedHistory.deviceSnapshot["calibration"].toObject()["center_x"].toDouble()!=12 ||
+        calibratedHistory.errorCode=="CALIBRATION_REQUIRED" || calibratedHistory.errorCode=="HISTORICAL_CALIBRATION_REQUIRED" ||
+        acquisitions!=initialAcquisitions || task.device.centerX==12) return fail(__LINE__);
+    uncalibratedHistory.historicalCalibration["calibrated_width"]=25;
+    const auto wrongHistorySize=run(uncalibratedHistory);
+    if (wrongHistorySize.errorMessage!="HISTORICAL_CALIBRATION_DIMENSIONS_MISMATCH" || wrongHistorySize.recognitionPerformed ||
+        !wrongHistorySize.originalPath.isEmpty()) return fail(__LINE__);
     task.parentTaskId = "wrong-task";
     const auto wrongIdentity = run(task);
     if (wrongIdentity.errorCode != "HISTORICAL_IDENTITY_MISMATCH" || !wrongIdentity.originalPath.isEmpty() || acquisitions != initialAcquisitions) return fail(__LINE__);

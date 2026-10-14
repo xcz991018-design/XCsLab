@@ -45,7 +45,7 @@ int main(int argc,char** argv) {
             require(password && password->echoMode()==QLineEdit::Password && password->text()==s.password,"Password field not masked or not restored");
             auto* database=dialog.findChild<QLineEdit*>("mysqlDatabase"); database->clear();
             dialog.findChild<QPushButton*>("mysqlTestConnection")->click();
-            require(dialog.findChild<QLabel*>("mysqlConnectionStatus")->text()==QStringLiteral("\u8bf7\u586b\u5199\u670d\u52a1\u5668\u5730\u5740\u3001\u6570\u636e\u5e93\u540d\u548c\u8d26\u53f7\u3002"),"Incomplete test connection not rejected");
+            require(dialog.findChild<QLabel*>("mysqlConnectionStatus")->text()==QStringLiteral(u"\u8bf7\u586b\u5199\u670d\u52a1\u5668\u5730\u5740\u3001\u6570\u636e\u5e93\u540d\u548c\u8d26\u53f7\u3002"),"Incomplete test connection not rejected");
             database->setText("ui_saved_database"); dialog.findChild<QSpinBox*>("mysqlPort")->setValue(3310);
             auto* save=dialog.findChild<QPushButton*>("mysqlSaveConfiguration"); save->click();
             require(!save->isEnabled(),"Save did not start asynchronously");

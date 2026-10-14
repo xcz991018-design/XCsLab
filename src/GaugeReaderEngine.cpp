@@ -20,7 +20,9 @@ double GaugeReaderEngine::normalizeAngle(double angleDeg) {
 
 
 
-bool GaugeReaderEngine::locateDialCircle(const cv::Mat& gray, cv::Point2f& center, float& radius) {
+bool GaugeReaderEngine::locateDialCircle(const cv::Mat& gray, cv::Point2f& center, float& radius,
+    bool* hubDetected, const cv::Point2f* expectedHub) {
+    if (hubDetected) *hubDetected = false;
     cv::Mat blurred;
     cv::GaussianBlur(gray, blurred, cv::Size(9, 9), 2.0);
 
@@ -54,11 +56,12 @@ bool GaugeReaderEngine::locateDialCircle(const cv::Mat& gray, cv::Point2f& cente
     }
 
     // Refine center by finding the needle rotation axis (central hub pin/rivet cap)
+    const auto hubAnchor = expectedHub ? *expectedHub : bestCenter;
     int roiR = static_cast<int>(bestRadius * 0.25f);
-    int x1 = std::max(0, static_cast<int>(bestCenter.x) - roiR);
-    int y1 = std::max(0, static_cast<int>(bestCenter.y) - roiR);
-    int x2 = std::min(gray.cols, static_cast<int>(bestCenter.x) + roiR);
-    int y2 = std::min(gray.rows, static_cast<int>(bestCenter.y) + roiR);
+    int x1 = std::max(0, static_cast<int>(hubAnchor.x) - roiR);
+    int y1 = std::max(0, static_cast<int>(hubAnchor.y) - roiR);
+    int x2 = std::min(gray.cols, static_cast<int>(hubAnchor.x) + roiR);
+    int y2 = std::min(gray.rows, static_cast<int>(hubAnchor.y) + roiR);
 
     cv::Point2f refinedCenter = bestCenter;
 
@@ -74,7 +77,34 @@ bool GaugeReaderEngine::locateDialCircle(const cv::Mat& gray, cv::Point2f& cente
         cv::HoughCircles(roiBlur, pinCircles, cv::HOUGH_GRADIENT, 1.0, 20, 50, 20, pinMinR, pinMaxR);
 
         if (!pinCircles.empty()) {
-            refinedCenter = cv::Point2f(x1 + pinCircles[0][0], y1 + pinCircles[0][1]);
+            cv::Mat gradX,gradY;
+            cv::Scharr(roi,gradX,CV_32F,1,0); cv::Scharr(roi,gradY,CV_32F,0,1);
+            double bestScore=-1, bestSupport=0;
+            cv::Vec3f bestPin=pinCircles.front();
+            for (const auto& pin : pinCircles) {
+                int positive=0,negative=0;
+                for (int angle=0;angle<360;angle+=10) {
+                    const double nx=std::cos(angle*M_PI/180), ny=std::sin(angle*M_PI/180);
+                    bool pos=false,neg=false;
+                    for (int offset=-2;offset<=2;++offset) {
+                        const int x=cvRound(pin[0]+(pin[2]+offset)*nx), y=cvRound(pin[1]+(pin[2]+offset)*ny);
+                        if(x<0||y<0||x>=roi.cols||y>=roi.rows) continue;
+                        const double gx=gradX.at<float>(y,x), gy=gradY.at<float>(y,x);
+                        const double magnitude=std::hypot(gx,gy), normal=gx*nx+gy*ny;
+                        pos |= magnitude>=60 && normal>=0.7*magnitude;
+                        neg |= magnitude>=60 && normal<=-0.7*magnitude;
+                    }
+                    positive+=pos; negative+=neg;
+                }
+                const double support=double(std::max(positive,negative))/36;
+                const double score=support-0.005*cv::norm(cv::Point2f(x1+pin[0],y1+pin[1])-hubAnchor);
+                if(score>bestScore) {bestScore=score;bestPin=pin;bestSupport=support;}
+            }
+            // Text arcs and cast-shadow intersections lack a coherent circular rim.
+            if(bestSupport>=0.75) {
+                refinedCenter=cv::Point2f(x1+bestPin[0],y1+bestPin[1]);
+                if(hubDetected) *hubDetected=true;
+            }
         }
     }
 
@@ -353,6 +383,32 @@ GaugeResult GaugeReaderEngine::process(const cv::Mat& frame, GaugeProfile& profi
         }
     }
 
+    // A displaced manual hub can force the radial search onto a cast shadow.
+    // Require a detected pin/rivet (not a dial-circle fallback) before rejecting.
+    cv::Point2f checkedCenter;
+    float checkedRadius = 0;
+    bool confirmedHub = false;
+    locateDialCircle(gray, checkedCenter, checkedRadius, &confirmedHub, &res.center);
+    const double checkedOffset = cv::norm(checkedCenter - res.center);
+    const double centerTolerance = profile.center_search_tolerance > 0 ? profile.center_search_tolerance : 35;
+    if (!profile.auto_detect_roi && confirmedHub && checkedOffset > centerTolerance) {
+        res.centerInconsistent = true;
+        res.centerOffsetDist = checkedOffset;
+        res.errorStep = "轴心标定检查";
+        res.errorMessage = "轴心标定与实际轴帽中心不一致（偏差 " + std::to_string(checkedOffset) +
+            " px），请重新完成视场切点标定中的中心点；未输出识别读数";
+        res.warningMessage = res.errorMessage;
+        if (evidence) {
+            res.step4_recognition = workFrame.clone();
+            cv::circle(res.step4_recognition, res.center, 8, cv::Scalar(0,165,255), 2);
+            cv::circle(res.step4_recognition, checkedCenter, 8, cv::Scalar(0,255,0), 2);
+            cv::line(res.step4_recognition, res.center, checkedCenter, cv::Scalar(0,165,255), 2);
+            cv::putText(res.step4_recognition, "CALIBRATION CENTER MISMATCH - NO READING", {15,30},
+                cv::FONT_HERSHEY_SIMPLEX, 0.55, cv::Scalar(0,165,255), 2);
+        }
+        finish(); return res;
+    }
+
     // Transform all device scale points with the same homography as the hub.
     ScaleCalibration::Mapping scaleMapping;
     double minAngle=0, maxAngle=0;
@@ -516,7 +572,8 @@ GaugeResult GaugeReaderEngine::process(const cv::Mat& frame, GaugeProfile& profi
     // Check calibration against the independently located hub.
     cv::Point2f autoCenter;
     float autoRadius{0.0f};
-    locateDialCircle(gray, autoCenter, autoRadius);
+    autoCenter = checkedCenter;
+    autoRadius = checkedRadius;
 
     cv::Point2f expectedCenter = res.center;
     if (!profile.auto_detect_roi && profile.center.x > 0 && profile.center.y > 0 && !invH.empty()) {
