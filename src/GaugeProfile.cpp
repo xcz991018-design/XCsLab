@@ -15,8 +15,6 @@ GaugeProfile GaugeProfile::createDefault() {
     prof.unit = "MPa";
     prof.min_val = 0.0;
     prof.max_val = 1.0;
-    prof.min_angle_deg = 135.0; // Lower left (~ 7:30 o'clock)
-    prof.max_angle_deg = 45.0;  // Lower right (~ 4:30 o'clock)
     prof.clockwise = true;
     prof.pointer_invert_direction = true;
     prof.auto_detect_roi = false;
@@ -143,8 +141,6 @@ bool GaugeProfile::loadContent(const std::string& content, const std::string& ta
             else if (key == "unit") { unit = val; spec.unit = val; }
             else if (key == "min_val") { min_val = std::stod(val); spec.range_min = min_val; }
             else if (key == "max_val") { max_val = std::stod(val); spec.range_max = max_val; }
-            else if (key == "min_angle_deg") min_angle_deg = std::stod(val);
-            else if (key == "max_angle_deg") max_angle_deg = std::stod(val);
             else if (key == "clockwise") clockwise = (val == "true" || val == "1");
             else if (key == "pointer_invert_direction") pointer_invert_direction = (val == "true" || val == "1");
             // PointerDetector Parameters
@@ -280,8 +276,6 @@ bool GaugeProfile::loadContent(const std::string& content, const std::string& ta
             this->unit = parentProfile.unit;
             this->min_val = parentProfile.min_val;
             this->max_val = parentProfile.max_val;
-            this->min_angle_deg = parentProfile.min_angle_deg;
-            this->max_angle_deg = parentProfile.max_angle_deg;
             this->clockwise = parentProfile.clockwise;
             this->pointer_invert_direction = parentProfile.pointer_invert_direction;
             this->pointerBaseRadius = parentProfile.pointerBaseRadius;
@@ -352,7 +346,6 @@ QJsonObject GaugeProfile::toJson() const {
 #define PROFILE_NUMBER(key, member) result[key] = static_cast<double>(member)
 #define PROFILE_FLAG(key, member) result[key] = member
     PROFILE_NUMBER("min_val", min_val); PROFILE_NUMBER("max_val", max_val);
-    PROFILE_NUMBER("min_angle_deg", min_angle_deg); PROFILE_NUMBER("max_angle_deg", max_angle_deg);
     PROFILE_FLAG("clockwise", clockwise); PROFILE_FLAG("pointer_invert_direction", pointer_invert_direction);
     PROFILE_NUMBER("pointerBaseRadius", pointerBaseRadius); PROFILE_NUMBER("pointerMinWidth", pointerMinWidth);
     PROFILE_NUMBER("pointerMaxWidth", pointerMaxWidth); PROFILE_NUMBER("pointerMinLength", pointerMinLength);
@@ -616,8 +609,6 @@ bool GaugeProfile::saveToFile(const std::string& configFilePath, const std::stri
     file << "  \"unit\": \"" << unit << "\",\n";
     file << "  \"min_val\": " << min_val << ",\n";
     file << "  \"max_val\": " << max_val << ",\n";
-    file << "  \"min_angle_deg\": " << min_angle_deg << ",\n";
-    file << "  \"max_angle_deg\": " << max_angle_deg << ",\n";
     file << "  \"clockwise\": " << (clockwise ? "true" : "false") << ",\n";
     file << "  \"pointer_invert_direction\": " << (pointer_invert_direction ? "true" : "false") << ",\n";
     file << "  \"auto_detect_roi\": " << (auto_detect_roi ? "true" : "false") << ",\n";

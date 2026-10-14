@@ -3,6 +3,7 @@
 #include "FileCameraSource.hpp"
 #include "MySqlRepository.hpp"
 #include "DeviceCodec.hpp"
+#include "InspectionCalibration.hpp"
 #include <QFutureWatcher>
 #include <QtConcurrent/QtConcurrent>
 #include <QDir>
@@ -18,12 +19,17 @@
 #include <stdexcept>
 
 namespace {
+using TimingClock = std::chrono::steady_clock;
+double elapsedMs(TimingClock::time_point start) {
+    return std::chrono::duration<double, std::milli>(TimingClock::now() - start).count();
+}
 CameraSourcePtr createSource(const InspectionTask& task) {
     const auto& dev = task.device;
     if (dev.protocolType == CameraProtocolType::LOCAL_FILE)
         return std::make_shared<FileCameraSource>(task.localImagePath.toStdString());
     if (dev.protocolType == CameraProtocolType::ONVIF_RTSP_STREAM) {
         ONVIFDeviceInfo info;
+        info.preferHttpSnapshot = task.preferOnvifSnapshot;
         info.ipAddress = dev.ipOrSn.toStdString();
         info.port = dev.port;
         info.username = dev.username.toStdString();
@@ -58,6 +64,13 @@ CapturedTask capture(const InspectionTask& task, const InspectionService::Source
     data.outcome.deviceSnapshot = deviceToJson(task.device);
     data.outcome.result.runMode = task.runMode;
     if (cancel->load()) return data;
+    // Historical database tasks validate their frozen device after it is loaded.
+    if ((task.databaseOriginalTaskId.isEmpty() || !task.useHistoricalConfiguration) &&
+        requiresInspectionCalibration(task)) {
+        data.outcome.errorCode = "CALIBRATION_REQUIRED";
+        data.outcome.errorMessage = QStringLiteral("请先完成设备 %1 的表计标定").arg(task.device.cameraId);
+        return data;
+    }
     try {
         if (!task.databaseOriginalTaskId.isEmpty()) {
             if (task.inputKind != InspectionInputKind::HistoricalImage || task.parentTaskId != task.databaseOriginalTaskId)
@@ -138,6 +151,8 @@ CapturedTask capture(const InspectionTask& task, const InspectionService::Source
         } else {
             const auto acquired = isolate ? isolatedCapture(task, cancel) : source->captureSnapshot();
             data.frame = acquired.frame;
+            data.outcome.captureMethod = acquired.message == "ONVIF_HTTP" ? "ONVIF_HTTP"
+                : task.device.protocolType == CameraProtocolType::ONVIF_RTSP_STREAM ? "RTSP" : "OTHER";
             if (source) source->close();
             if (!acquired.ok()) {
                 data.frame.release();
@@ -161,7 +176,13 @@ CapturedTask capture(const InspectionTask& task, const InspectionService::Source
 InspectionOutcome recognize(CapturedTask data, const std::shared_ptr<std::atomic<bool>>& cancel) {
     auto& out = data.outcome;
     if (cancel->load() || !out.errorCode.isEmpty()) return out;
+    if (requiresInspectionCalibration(data.task)) {
+        out.errorCode = "CALIBRATION_REQUIRED";
+        out.errorMessage = QStringLiteral("请先完成设备 %1 的表计标定").arg(data.task.device.cameraId);
+        return out;
+    }
     try {
+        const auto templateStarted = TimingClock::now();
         QJsonObject frozen = data.task.historicalProfile;
         if (frozen.isEmpty()) {
             // Capturing without recognition is still possible with no database,
@@ -180,6 +201,8 @@ InspectionOutcome recognize(CapturedTask data, const std::shared_ptr<std::atomic
                 return out;
             }
         }
+        out.timings["template_load_ms"] = elapsedMs(templateStarted);
+        const auto profileStarted = TimingClock::now();
         out.profileSnapshot = frozen;
         if (data.task.captureOnly) return out;
         GaugeProfile profile;
@@ -200,14 +223,17 @@ InspectionOutcome recognize(CapturedTask data, const std::shared_ptr<std::atomic
             cv::Point2f(dev.pt0_x, dev.pt0_y), cv::Point2f(dev.pt1_x, dev.pt1_y),
             cv::Point2f(dev.pt2_x, dev.pt2_y), cv::Point2f(dev.pt3_x, dev.pt3_y)};
         profile.center = cv::Point2f(dev.centerX, dev.centerY);
+        profile.scalePoints = dev.scalePoints;
         profile.pointerBaseRadius = dev.pointerBaseRadius;
         profile.calibrated_width = dev.calibratedWidth;
         profile.calibrated_height = dev.calibratedHeight;
         profile.auto_detect_roi = false;
         profile.save_debug_images = false; // Shared debug filenames are unsafe under concurrency.
+        out.timings["profile_setup_ms"] = elapsedMs(profileStarted);
         GaugeReaderEngine engine;
         out.recognitionPerformed = true;
         out.result = engine.process(data.frame, profile, data.task.runMode);
+        out.timings["engine_steps"] = out.result.stageTimings;
         out.profileSnapshot["_runtime_quality_config"] = out.result.recognitionQuality["config"];
         if (!out.result.success) {
             out.errorCode = "RECOGNITION_FAILED";
@@ -223,6 +249,7 @@ InspectionOutcome recognize(CapturedTask data, const std::shared_ptr<std::atomic
 InspectionOutcome persist(InspectionOutcome out, const InspectionTask& task,
                           const std::shared_ptr<std::atomic<bool>>& cancel) {
     if (cancel->load()) return out;
+    const auto imageStarted = TimingClock::now();
     try {
         // UUID folder prevents overwrites and path traversal through device IDs.
         const QString folder = QDir(task.outputDirectory).filePath(out.taskId);
@@ -249,7 +276,10 @@ InspectionOutcome persist(InspectionOutcome out, const InspectionTask& task,
             QString hudPath;
             saveImage(out.result.diagnosticHudImage, "diagnostic_hud.png", hudPath);
         }
+        out.timings["image_save_ms"] = elapsedMs(imageStarted);
         QJsonObject record;
+        record["capture_method"] = out.captureMethod;
+        record["timings_path"] = QDir(folder).filePath("timings.json");
         record["mode"] = gaugeRunModeName(task.runMode);
         record["input_kind"] = inspectionInputName(task.inputKind);
         record["parent_task_id"] = task.parentTaskId;
@@ -272,18 +302,24 @@ InspectionOutcome persist(InspectionOutcome out, const InspectionTask& task,
         record["value"] = out.result.success ? QJsonValue(out.result.value) : QJsonValue(QJsonValue::Null);
         record["unit"] = QString::fromStdString(out.result.unit);
         record["confidence"] = out.result.confidence;
+        record["recognition_timings_ms"] = out.result.stageTimings;
         record["recognition_quality"] = out.result.recognitionQuality;
         record["error_code"] = out.errorCode;
         record["error_message"] = out.errorMessage.isEmpty() ? QString::fromStdString(out.result.errorMessage) : out.errorMessage;
+        const auto resultSaveStarted = TimingClock::now();
         const QByteArray json = QJsonDocument(record).toJson();
         QSaveFile file(QDir(folder).filePath("result.json"));
         if (!file.open(QIODevice::WriteOnly) || file.write(json) != json.size() || !file.commit())
             throw std::runtime_error("Result write failed");
+        out.timings["result_save_ms"] = elapsedMs(resultSaveStarted);
     } catch (const std::exception& e) {
         out.errorCode = "STORAGE_FAILED";
         out.errorMessage = QString::fromUtf8(e.what());
     }
-    if (DatabaseSettings::fromEnvironment().enabled && out.errorCode != "STORAGE_FAILED") {
+    if (!out.timings.contains("image_save_ms")) out.timings["image_save_ms"] = elapsedMs(imageStarted);
+    const auto databaseStarted = TimingClock::now();
+    const bool databaseAttempted = DatabaseSettings::fromEnvironment().enabled && out.errorCode != "STORAGE_FAILED";
+    if (databaseAttempted) {
         QString pendingPath;
         try {
             const auto envelope = MySqlRepository::inspectionEnvelope(task, out);
@@ -297,6 +333,18 @@ InspectionOutcome persist(InspectionOutcome out, const InspectionTask& task,
             out.databaseError = QString::fromUtf8(e.what());
         }
     }
+    out.timings["database_write_ms"] = databaseAttempted ? QJsonValue(elapsedMs(databaseStarted)) : QJsonValue(QJsonValue::Null);
+    out.timings["total_ms"] = elapsedMs(task.queuedAt);
+    // Separate final metrics are written after the durable result and database attempt.
+    // This keeps failed database writes measurable without rewriting evidence.
+    if (out.errorCode != "STORAGE_FAILED") {
+        QSaveFile timingFile(QDir(task.outputDirectory).filePath(out.taskId + "/timings.json"));
+        const auto bytes = QJsonDocument(QJsonObject{{"task_id", out.taskId}, {"camera_id", out.cameraId},
+                                                   {"timings_ms", out.timings}}).toJson();
+        if (!timingFile.open(QIODevice::WriteOnly) || timingFile.write(bytes) != bytes.size() || !timingFile.commit()) {
+            out.timings["metrics_save_failed"] = true;
+        }
+    }
     // Evidence is on disk; retain scalar results rather than full per-device pipelines.
     if (task.returnImages) return out; // A single GUI task may display its outputs; patrol remains compact.
     GaugeResult compact;
@@ -306,6 +354,7 @@ InspectionOutcome persist(InspectionOutcome out, const InspectionTask& task,
     compact.unit = out.result.unit;
     compact.pointer_angle_deg = out.result.pointer_angle_deg;
     compact.confidence = out.result.confidence;
+    compact.stageTimings = out.result.stageTimings;
     compact.recognitionQuality = out.result.recognitionQuality;
     compact.centerInconsistent = out.result.centerInconsistent;
     compact.centerOffsetDist = out.result.centerOffsetDist;
@@ -341,7 +390,11 @@ InspectionService::~InspectionService() {
 bool InspectionService::start(const QList<InspectionTask>& tasks) {
     if (m_running || tasks.isEmpty()) return false;
     m_tasks = tasks;
-    for (auto& task : m_tasks) task.taskId = QUuid::createUuid().toString(QUuid::WithoutBraces);
+    const auto queuedAt = TimingClock::now();
+    for (auto& task : m_tasks) {
+        task.taskId = QUuid::createUuid().toString(QUuid::WithoutBraces);
+        task.queuedAt = queuedAt;
+    }
     m_next = m_active = m_completed = 0;
     m_cancel = std::make_shared<std::atomic<bool>>(false);
     m_running = true;
@@ -409,17 +462,28 @@ void InspectionService::dispatch() {
                     storageWatcher->deleteLater();
                     complete(std::move(outcome));
                 });
-                storageWatcher->setFuture(QtConcurrent::run(&m_storagePool, [outcome, task, cancel]() {
+                const auto storageQueued = TimingClock::now();
+                storageWatcher->setFuture(QtConcurrent::run(&m_storagePool, [outcome, task, cancel, storageQueued]() mutable {
+                    outcome.timings["storage_queue_ms"] = elapsedMs(storageQueued);
                     return persist(outcome, task, cancel);
                 }));
             });
-            recognitionWatcher->setFuture(QtConcurrent::run(&m_recognitionPool, [captured, cancel]() {
-                return recognize(captured, cancel);
+            const auto recognitionQueued = TimingClock::now();
+            recognitionWatcher->setFuture(QtConcurrent::run(&m_recognitionPool, [captured, cancel, recognitionQueued]() {
+                const auto started = TimingClock::now();
+                auto outcome = recognize(captured, cancel);
+                outcome.timings["recognition_queue_ms"] = std::chrono::duration<double, std::milli>(started - recognitionQueued).count();
+                outcome.timings["recognition_ms"] = elapsedMs(started);
+                return outcome;
             }));
         });
         const auto factory = m_factory;
         captureWatcher->setFuture(QtConcurrent::run(&m_capturePool, [task, factory, cancel, isolate = m_isolateCapture]() {
-            return capture(task, factory, cancel, isolate);
+            const auto started = TimingClock::now();
+            auto captured = capture(task, factory, cancel, isolate);
+            captured.outcome.timings["queue_ms"] = std::chrono::duration<double, std::milli>(started - task.queuedAt).count();
+            captured.outcome.timings["capture_ms"] = elapsedMs(started);
+            return captured;
         }));
     }
     if (m_active == 0 && (m_cancel->load() || m_next == m_tasks.size())) {

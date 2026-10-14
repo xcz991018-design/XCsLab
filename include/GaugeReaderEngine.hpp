@@ -57,6 +57,7 @@ struct GaugeResult {
     std::string errorStep;               // Pipeline step where error occurred
     std::string detailedDebugInfo;       // Detailed debug diagnostic text
     double confidence{0.0};
+    QJsonObject stageTimings; // Monotonic elapsed milliseconds, independent of run mode.
     QJsonObject recognitionQuality; // Advisory; never changes success/value/confidence.
 };
 
@@ -86,13 +87,7 @@ public:
      */
     static bool locateDialCircle(const cv::Mat& gray, cv::Point2f& center, float& radius);
 
-    /**
-     * @brief Detect pointer angle within valid scale angular range.
-     */
-    double detectPointerAngleRobust(const cv::Mat& gray, const cv::Point2f& center, float radius, const GaugeProfile& profile, cv::Mat* outScanVis = nullptr);
-
-private:
-    void drawOverlay(cv::Mat& canvas, const GaugeProfile& profile, const GaugeResult& res, const cv::Mat& invH);
+    void drawOverlay(cv::Mat& canvas, const GaugeProfile& profile, const GaugeResult& res, const cv::Mat& invH, double minAngle, double maxAngle);
     static double normalizeAngle(double angleDeg);
 };
 

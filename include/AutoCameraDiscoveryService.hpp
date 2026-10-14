@@ -6,6 +6,7 @@
 #include <QMutex>
 #include <QTimer>
 #include <QString>
+#include <QJsonArray>
 #include <QList>
 #include <memory>
 #include <QFuture>
@@ -30,7 +31,6 @@ struct DiscoveredCameraItem {
     QString password{""};
     bool isOnline{true};
     QString defaultProfileId{"PRESSURE_GAUGE_1.6MPA"};
-    bool isAutoConnect{false};
     QString lastSeenTime;
 
     // Asset & Physical Installation Metadata (no defaults, requires explicit input)
@@ -43,19 +43,21 @@ struct DiscoveredCameraItem {
     QString accuracyClass;
 
     // Field Installation & Perspective Geometry Calibration
-    bool perspectiveEnabled{true};
-    int calibratedWidth{800};
-    int calibratedHeight{448};
-    double pt0_x{404.444};
-    double pt0_y{19.2593};
-    double pt1_x{644.444};
-    double pt1_y{306.667};
-    double pt2_x{392.593};
-    double pt2_y{408.889};
-    double pt3_x{139.259};
-    double pt3_y{339.259};
-    double centerX{407.407};
-    double centerY{327.407};
+    QJsonArray scalePoints; // Original-frame x/y and normalized scale ratio.
+    bool hasCalibration{false};
+    bool perspectiveEnabled{false};
+    int calibratedWidth{0};
+    int calibratedHeight{0};
+    double pt0_x{-1.0};
+    double pt0_y{-1.0};
+    double pt1_x{-1.0};
+    double pt1_y{-1.0};
+    double pt2_x{-1.0};
+    double pt2_y{-1.0};
+    double pt3_x{-1.0};
+    double pt3_y{-1.0};
+    double centerX{-1.0};
+    double centerY{-1.0};
     double pointerBaseRadius{47.0};
 };
 

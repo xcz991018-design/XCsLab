@@ -54,7 +54,6 @@ private:
     QLineEdit *m_rtspUrlEdit{nullptr};
     QLineEdit *m_usernameEdit{nullptr};
     QLineEdit *m_passwordEdit{nullptr};
-    QCheckBox *m_autoConnectCheck{nullptr};
 
     // Gauge Profile & Location Parameters
     QComboBox *m_gaugeProfileCombo{nullptr};

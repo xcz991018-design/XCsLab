@@ -147,7 +147,9 @@ FrameCaptureResult isolatedCapture(const InspectionTask& task,
             worker.waitForStarted(25);
         } else worker.waitForFinished(25);
         if (!requestSent && worker.state() == QProcess::Running) {
-            worker.write(QJsonDocument(deviceToJson(task.device, true)).toJson(QJsonDocument::Compact));
+            auto request = deviceToJson(task.device, true);
+            request["_prefer_onvif_snapshot"] = task.preferOnvifSnapshot;
+            worker.write(QJsonDocument(request).toJson(QJsonDocument::Compact));
             worker.closeWriteChannel();
             requestSent = true;
         }
@@ -179,6 +181,7 @@ int runCaptureWorker(int argc, char** argv) {
     if (!document.isObject()) return 2;
     InspectionTask task;
     task.device = deviceFromJson(document.object());
+    task.preferOnvifSnapshot = !preview && document.object()["_prefer_onvif_snapshot"].toBool();
     FrameCaptureResult result;
     try {
         auto source = InspectionService::createCameraSource(task);

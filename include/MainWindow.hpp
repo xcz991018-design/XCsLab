@@ -16,6 +16,7 @@
 #include <QSplitter>
 #include <QTimer>
 #include <QCheckBox>
+#include <QSet>
 
 #include <QTabWidget>
 #include <QTableWidget>
@@ -88,7 +89,6 @@ private slots:
     void onLogReceived(const QString& logMsg);
     void onAddNewDevice();
     void onRemoveSelectedDevice();
-    void onSetDeviceAsDefaultAutoConnect();
     void onDeviceCustomContextMenu(const QPoint& pos);
 
     // Pointer diagnostic window
@@ -130,6 +130,14 @@ private:
     static QImage cvMatToQImage(const cv::Mat& mat);
     void switchActiveCameraSource(const QString& camId);
     void applyCameraCalibrationAndProfile(const QString& camId);
+    void checkCameraCalibration(const QString& camId);
+    void tryOpenCameraCalibration();
+    QSet<QString> m_calibrationChecked;
+    QSet<QString> m_calibrationQueries;
+    QString m_pendingCalibrationCamera;
+    quint64 m_cameraConnectionGeneration{0};
+    bool m_calibrationDialogOpen{false};
+    bool m_cameraHasFrame{false};
 
     // Top Status Bar Badges
     QLabel *m_statusChannelBadge{nullptr};
@@ -145,8 +153,6 @@ private:
     QListWidget *m_deviceListWidget{nullptr};
     QLineEdit *m_imagePathEdit{nullptr};
     QPushButton *m_browseImgBtn{nullptr};
-    QPushButton *m_browseCfgBtn{nullptr};
-    QPushButton *m_calibrateBtn{nullptr};
     QPushButton *m_snapAndRunBtn{nullptr};
     QPushButton *m_batchPatrolBtn{nullptr};
     QComboBox *m_runModeCombo{nullptr};
@@ -163,7 +169,6 @@ private:
     // Config Details Labels
     QLabel *m_cfgGaugeId{nullptr};
     QLabel *m_cfgRange{nullptr};
-    QLabel *m_cfgAngleRange{nullptr};
     QLabel *m_cfgGisInfo{nullptr};
     QLabel *m_cfgLocationInfo{nullptr};
     QLabel *m_cfgGaugeSpec{nullptr};

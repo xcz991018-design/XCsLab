@@ -1,5 +1,6 @@
 #include "DeviceCodec.hpp"
 #include <QUrl>
+#include "DeviceCalibration.hpp"
 static QString protocolToString(CameraProtocolType type) {
     switch (type) {
     case CameraProtocolType::LOCAL_FILE: return "LOCAL_FILE";
@@ -36,7 +37,6 @@ DiscoveredCameraItem deviceFromJson(const QJsonObject& obj) {
     item.username = obj.value("username").toString("");
     item.password = obj.value("password").toString("");
     item.defaultProfileId = obj.value("default_profile_id").toString("PRESSURE_GAUGE_1.6MPA");
-    item.isAutoConnect = obj.value("is_auto_connect").toBool(false);
     item.isOnline = obj.value("is_online").toBool(true);
     item.lastSeenTime = obj.value("last_seen_time").toString();
 
@@ -51,19 +51,21 @@ DiscoveredCameraItem deviceFromJson(const QJsonObject& obj) {
 
     // Load Calibration Parameters (supports direct fields or calibration sub-object)
     QJsonObject calObj = obj.contains("calibration") ? obj["calibration"].toObject() : obj;
-    item.perspectiveEnabled = calObj.value("perspective_correction_enabled").toBool(true);
-    item.calibratedWidth = calObj.value("calibrated_width").toInt(800);
-    item.calibratedHeight = calObj.value("calibrated_height").toInt(448);
-    item.pt0_x = calObj.value("pt_0_x").toDouble(404.444);
-    item.pt0_y = calObj.value("pt_0_y").toDouble(19.2593);
-    item.pt1_x = calObj.value("pt_1_x").toDouble(644.444);
-    item.pt1_y = calObj.value("pt_1_y").toDouble(306.667);
-    item.pt2_x = calObj.value("pt_2_x").toDouble(392.593);
-    item.pt2_y = calObj.value("pt_2_y").toDouble(408.889);
-    item.pt3_x = calObj.value("pt_3_x").toDouble(139.259);
-    item.pt3_y = calObj.value("pt_3_y").toDouble(339.259);
-    item.centerX = calObj.value("center_x").toDouble(407.407);
-    item.centerY = calObj.value("center_y").toDouble(327.407);
+    item.hasCalibration = hasSavedDeviceCalibration(calObj);
+    item.scalePoints = calObj["scale_points"].toArray();
+    item.perspectiveEnabled = calObj.value("perspective_correction_enabled").toBool(false);
+    item.calibratedWidth = calObj.value("calibrated_width").toInt(0);
+    item.calibratedHeight = calObj.value("calibrated_height").toInt(0);
+    item.pt0_x = calObj.value("pt_0_x").toDouble(-1.0);
+    item.pt0_y = calObj.value("pt_0_y").toDouble(-1.0);
+    item.pt1_x = calObj.value("pt_1_x").toDouble(-1.0);
+    item.pt1_y = calObj.value("pt_1_y").toDouble(-1.0);
+    item.pt2_x = calObj.value("pt_2_x").toDouble(-1.0);
+    item.pt2_y = calObj.value("pt_2_y").toDouble(-1.0);
+    item.pt3_x = calObj.value("pt_3_x").toDouble(-1.0);
+    item.pt3_y = calObj.value("pt_3_y").toDouble(-1.0);
+    item.centerX = calObj.value("center_x").toDouble(-1.0);
+    item.centerY = calObj.value("center_y").toDouble(-1.0);
     item.pointerBaseRadius = calObj.value("pointer_base_radius").toDouble(calObj.value("radius").toDouble(47.0));
 
     return item;
@@ -82,7 +84,6 @@ QJsonObject deviceToJson(const DiscoveredCameraItem& item, bool includeSecrets) 
     obj["username"] = item.username;
     obj["password"] = item.password;
     obj["default_profile_id"] = item.defaultProfileId;
-    obj["is_auto_connect"] = item.isAutoConnect;
     obj["is_online"] = item.isOnline;
     obj["last_seen_time"] = item.lastSeenTime;
 
@@ -111,7 +112,9 @@ QJsonObject deviceToJson(const DiscoveredCameraItem& item, bool includeSecrets) 
     calObj["center_x"] = item.centerX;
     calObj["center_y"] = item.centerY;
     calObj["pointer_base_radius"] = item.pointerBaseRadius;
-    obj["calibration"] = calObj;
+    calObj["calibration_confirmed"] = item.hasCalibration;
+    if (!item.scalePoints.isEmpty()) calObj["scale_points"] = item.scalePoints;
+    if (item.hasCalibration) obj["calibration"] = calObj;
 
     if (!includeSecrets) {
     obj.remove("password");

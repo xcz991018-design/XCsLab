@@ -41,6 +41,8 @@ public:
     QString testConnection() const;
     QJsonObject loadRegistry() const;
     void saveRegistry(const QJsonObject& registry) const;
+    DiscoveredCameraItem loadDevice(const QString& cameraId) const;
+    DiscoveredCameraItem saveCalibration(const QString& cameraId, const QJsonObject& calibration) const;
     QList<GaugeTemplateRecord> loadTemplates() const;
     GaugeTemplateRecord loadTemplate(const QString& id) const;
     GaugeTemplateRecord saveTemplate(const QJsonObject& definition, quint64 expectedRevision = 0) const;

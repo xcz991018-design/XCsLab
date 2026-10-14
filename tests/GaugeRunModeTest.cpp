@@ -1,4 +1,5 @@
 #include "GaugeReaderEngine.hpp"
+#include "RecognitionQuality.hpp"
 #include <QCoreApplication>
 #include <QTemporaryDir>
 #include <QDir>
@@ -39,6 +40,7 @@ int main(int argc, char** argv) {
     profile.auto_detect_roi = false;
     profile.center = cv::Point2f(160, 160);
     profile.radius = 135;
+    profile.scalePoints=QJsonArray{QJsonObject{{"x",80},{"y",240},{"ratio",0}},QJsonObject{{"x",240},{"y",240},{"ratio",1}}};
     profile.pointerBaseRadius = 18;
     profile.pointerMinLength = 40;
     profile.coarseAngleStep = 1;
@@ -60,11 +62,17 @@ int main(int argc, char** argv) {
         cv::cvtColor(frame, expectedGray, cv::COLOR_BGR2GRAY);
         cv::cvtColor(evidence.step3_gray, actualGray, cv::COLOR_BGR2GRAY);
         if (cv::norm(expectedGray, actualGray, cv::NORM_INF) != 0) return fail(__LINE__);
+        const auto diagnostic=QString::fromUtf8(evidence.detailedDebugInfo.data(),static_cast<int>(evidence.detailedDebugInfo.size()));
+        if (!diagnostic.endsWith(qualitySummary(evidence.recognitionQuality)) || diagnostic.contains(QChar(0xfffd))) return fail(__LINE__);
         if (!evidence.success) return fail(__LINE__);
         // Green measurement strokes must be present alongside the axis overlay.
         cv::Mat widthStrokes;
         cv::inRange(evidence.step4_recognition, cv::Scalar(0, 240, 0), cv::Scalar(20, 255, 20), widthStrokes);
         if (cv::countNonZero(widthStrokes) < 10) return fail(__LINE__);
+        for (const auto* key : {"perspective_ms", "grayscale_ms", "pointer_detection_ms", "quality_ms", "rendering_ms", "center_check_ms", "engine_total_ms"})
+            if (!production.stageTimings[key].isDouble() || production.stageTimings[key].toDouble()<0 ||
+                !evidence.stageTimings[key].isDouble() || evidence.stageTimings[key].toDouble()<0) return fail(__LINE__);
+        if (production.stageTimings["engine_total_ms"].toDouble() < production.stageTimings["pointer_detection_ms"].toDouble()) return fail(__LINE__);
         if (!sameReading(production, evidence)) return fail(__LINE__);
         if (!QDir(output.path()).entryList(QDir::Files | QDir::Dirs | QDir::NoDotAndDotDot).empty()) return fail(__LINE__);
         p = profile;

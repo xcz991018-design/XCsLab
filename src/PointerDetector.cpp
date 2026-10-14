@@ -1,4 +1,5 @@
 #include "PointerDetector.hpp"
+#include <chrono>
 #include <cmath>
 #include <iostream>
 #include <numeric>
@@ -2153,6 +2154,12 @@ double PointerDetector::evaluateTipLikelihood(
 // -------------------------------------------------------------------------
 PointerDetectionResult PointerDetector::detect(const cv::Mat& gray, const cv::Point2d& dialCenter, cv::Mat* debugVis) {
     PointerDetectionResult res;
+    auto lastStage = std::chrono::steady_clock::now();
+    auto mark = [&](const char* name) {
+        const auto now = std::chrono::steady_clock::now();
+        res.stageTimings[name] = std::chrono::duration<double, std::milli>(now-lastStage).count();
+        lastStage = now;
+    };
     res.success = false;
 
     if (gray.empty()) {
@@ -2175,6 +2182,7 @@ PointerDetectionResult PointerDetector::detect(const cv::Mat& gray, const cv::Po
     // Global single-pass Scharr gradient calculation
     GradientFeatureMap features = computeGradientFeatures(grayImg);
 
+    mark("gradient_preprocessing_ms");
     // Phase 1 Non-directional axis search theta in [0, 180°)
     double angleStep = std::max(0.5, m_config.angleStep > 0.0 ? m_config.angleStep : 1.0);
     int numSteps = static_cast<int>(std::round(180.0 / angleStep));
@@ -2271,6 +2279,7 @@ PointerDetectionResult PointerDetector::detect(const cv::Mat& gray, const cv::Po
         }
     }
 
+    mark("coarse_search_ms");
     // Top-10 candidate retention and formatted debug table
     std::vector<PointerAxisCandidate> sortedCandidates = allCandidates;
     std::sort(sortedCandidates.begin(), sortedCandidates.end(), [](const PointerAxisCandidate& a, const PointerAxisCandidate& b) {
@@ -2307,6 +2316,7 @@ PointerDetectionResult PointerDetector::detect(const cv::Mat& gray, const cv::Po
     }
     std::cout << "================================================================================================================================================================================================\n" << std::endl;
 
+    mark("candidate_diagnostics_ms");
     // Fine angular refinement around bestCoarseTheta
     double fineRange = 1.5;
     double fineStep = 0.05;
@@ -2404,6 +2414,7 @@ PointerDetectionResult PointerDetector::detect(const cv::Mat& gray, const cv::Po
 
     res.axisAngle = bestFineTheta;
 
+    mark("fine_search_ms");
     // Phase 2 Bidirectional Direction Analysis (+axis vs -axis)
     RadialDirectionProfile profA = evaluateRadialDirectionProfile(grayImg, features, effectivePivot, bestFineTheta);
     RadialDirectionProfile profB = evaluateRadialDirectionProfile(grayImg, features, effectivePivot, bestFineTheta + 180.0);
@@ -2617,11 +2628,13 @@ PointerDetectionResult PointerDetector::detect(const cv::Mat& gray, const cv::Po
               << "Confidence: " << (res.confidence * 100.0) << "%" << std::endl;
 
     // Full visual debug diagnostics rendering
+    mark("direction_scoring_ms");
     if (debugVis != nullptr) {
         renderDebugVisualization(*debugVis, effectivePivot, res);
         res.debugImage = debugVis->clone();
     }
 
+    mark("debug_rendering_ms");
     return res;
 }
 

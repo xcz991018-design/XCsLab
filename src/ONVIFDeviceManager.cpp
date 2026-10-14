@@ -487,7 +487,64 @@ bool ONVIFDeviceManager::grabFrame(cv::Mat& frame) {
     return result.ok();
 }
 
+FrameCaptureResult ONVIFDeviceManager::captureHttpSnapshot() {
+    FrameCaptureResult result;
+    result.failure = CaptureFailure::ReadFailed;
+    result.message = "ONVIF HTTP snapshot unavailable";
+    if (m_mediaEndpoint.empty() && !fetchProfiles()) return result;
+    QString error;
+    const auto xml = OnvifSoap::request(QUrl(QString::fromStdString(m_mediaEndpoint)),
+        "http://www.onvif.org/ver10/media/wsdl/GetSnapshotUri",
+        QString("<trt:GetSnapshotUri><trt:ProfileToken>%1</trt:ProfileToken></trt:GetSnapshotUri>")
+            .arg(OnvifSoap::escape(QString::fromStdString(m_info.profileToken))),
+        QString::fromStdString(m_info.username), QString::fromStdString(m_info.password), error);
+    const auto address = OnvifSoap::element(xml, "Uri");
+    QUrl uri = QUrl(QString::fromStdString(m_mediaEndpoint)).resolved(QUrl(address));
+    if (address.isEmpty() || !uri.isValid() || uri.host() != QString::fromStdString(m_info.ipAddress) ||
+        (uri.scheme() != "http" && uri.scheme() != "https")) return result;
+    uri.setUserInfo(QString());
+    QNetworkAccessManager manager;
+    int authAttempts = 0;
+    QObject::connect(&manager, &QNetworkAccessManager::authenticationRequired,
+        [&](QNetworkReply*, QAuthenticator* auth) {
+            if (++authAttempts == 1) {
+                auth->setUser(QString::fromStdString(m_info.username));
+                auth->setPassword(QString::fromStdString(m_info.password));
+            }
+        });
+    QNetworkRequest request(uri);
+    request.setAttribute(QNetworkRequest::RedirectPolicyAttribute, QNetworkRequest::ManualRedirectPolicy);
+    request.setRawHeader("Cache-Control", "no-cache");
+    auto* reply = manager.get(request);
+    QEventLoop loop;
+    QTimer timeout;
+    timeout.setSingleShot(true);
+    QObject::connect(reply, &QNetworkReply::finished, &loop, &QEventLoop::quit);
+    QObject::connect(&timeout, &QTimer::timeout, &loop, [&]() { reply->abort(); loop.quit(); });
+    QObject::connect(reply, &QNetworkReply::readyRead, [&]() {
+        if (reply->bytesAvailable() > 16 * 1024 * 1024) reply->abort();
+    });
+    // Reserve time for RTSP fallback inside the existing capture-worker deadline.
+    timeout.start(2000);
+    loop.exec();
+    const auto bytes = reply->readAll();
+    const int status = reply->attribute(QNetworkRequest::HttpStatusCodeAttribute).toInt();
+    if (reply->error() != QNetworkReply::NoError || status != 200 || bytes.size() > 16 * 1024 * 1024) return result;
+    try { result.frame = cv::imdecode(std::vector<uchar>(bytes.begin(), bytes.end()), cv::IMREAD_COLOR); }
+    catch (...) { result.frame.release(); }
+    if (isUniformSnapshotFrame(result.frame)) { result.frame.release(); return result; }
+    result.failure = CaptureFailure::None;
+    result.capturedAt = std::chrono::system_clock::now();
+    result.message = "ONVIF_HTTP";
+    return result;
+}
+
 FrameCaptureResult ONVIFDeviceManager::captureSnapshot() {
+    if (m_info.preferHttpSnapshot) {
+        auto snapshot = captureHttpSnapshot();
+        if (snapshot.ok()) return snapshot;
+        logMessage("ONVIF HTTP snapshot failed; falling back to RTSP");
+    }
     auto cached = readFrame();
     if (cached.ok() && !isUniformSnapshotFrame(cached.frame)) return cached;
     FrameCaptureResult result;

@@ -9,6 +9,7 @@
 #include <functional>
 #include <QJsonObject>
 #include <QSet>
+#include <chrono>
 
 enum class InspectionInputKind { CameraSnapshot, LocalImage, HistoricalImage };
 inline const char* inspectionInputName(InspectionInputKind kind) {
@@ -21,6 +22,7 @@ inline const char* inspectionInputName(InspectionInputKind kind) {
 }
 struct InspectionTask {
     QString taskId;
+    std::chrono::steady_clock::time_point queuedAt;
     DiscoveredCameraItem device;
     QString localImagePath;
     QString outputDirectory;
@@ -29,6 +31,7 @@ struct InspectionTask {
     QString parentTaskId;
     QDateTime originalCapturedAt;
     bool captureOnly{false};
+    bool preferOnvifSnapshot{false}; // Batch inspection prefers HTTP; preview stays RTSP.
     // Owned copy of the live preview frame selected by the snapshot button.
     cv::Mat previewSnapshot;
     QDateTime previewCapturedAt;
@@ -40,6 +43,8 @@ struct InspectionTask {
 };
 
 struct InspectionOutcome {
+    QString captureMethod;
+    QJsonObject timings; // Milliseconds, measured using a monotonic clock.
     QString taskId;
     QString cameraId;
     QDateTime capturedAt;

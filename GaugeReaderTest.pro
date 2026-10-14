@@ -8,7 +8,7 @@ CONFIG   += c++17
 CONFIG   += utf8_source
 
 # Force MSVC compiler to use UTF-8 source and execution charset
-win32:contains(QMAKE_COMPILER, msvc) {
+win32-msvc {
     QMAKE_CXXFLAGS += /utf-8
     QMAKE_CFLAGS += /utf-8
 }
@@ -37,6 +37,8 @@ win32 {
 
 # Header Files
 HEADERS += \
+    $$PWD/include/DeviceCalibration.hpp \
+    $$PWD/include/InspectionCalibration.hpp \
     $$PWD/include/CameraDiscoveryTargets.hpp \
     $$PWD/include/GaugeTemplateRecord.hpp \
     $$PWD/include/MySqlTemplateSchema.hpp \
@@ -93,7 +95,7 @@ SOURCES += \
     $$PWD/src/DeviceConfigManager.cpp
 
 # Use native, quoted paths: cmd.exe copy rejects forward-slash destinations.
-win32:contains(QMAKE_COMPILER, msvc) {
+win32-msvc {
     CONFIG(debug, debug|release) {
         OPENCV_RUNTIME = C:/openCV/opencv/build/x64/vc16/bin/opencv_world4120d.dll
     } else {
@@ -112,3 +114,7 @@ win32 {
     QMAKE_POST_LINK += $$escape_expand(\n\t) $(COPY_DIR) \"$$CONFIG_IN_PATH\" \"$$CONFIG_OUT_PATH\"
 }
 
+
+HEADERS += $$PWD/include/ScaleCalibration.hpp
+
+HEADERS += $$PWD/include/RecognitionQuality.hpp

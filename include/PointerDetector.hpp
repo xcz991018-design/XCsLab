@@ -4,6 +4,7 @@
 #include <opencv2/opencv.hpp>
 #include <vector>
 #include <string>
+#include <QJsonObject>
 
 struct PointerShapeModel {
     cv::Point2f center{400.0f, 400.0f};
@@ -549,6 +550,7 @@ using DirectionProfile = RadialDirectionProfile;
  * @brief Section I & XIII: Final Detection Result of PointerDetector.
  */
 struct PointerDetectionResult {
+    QJsonObject stageTimings;
     bool success{false};
     std::string failureReason;          // Detailed explanation of detection failure
     std::string detailedDebugText;      // Comprehensive multi-line diagnostic log

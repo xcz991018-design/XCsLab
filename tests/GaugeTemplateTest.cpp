@@ -90,8 +90,11 @@ int main(int argc, char** argv) {
         GaugeTemplateStore store(backend); QString error;
         require(store.load(error) && store.ids().isEmpty(), "Empty database load failed");
         auto first = GaugeTemplateStore::defaults(); first["gauge_id"] = "PRESSURE_TEST"; first["max_val"] = 4;
+        require(!first.contains("min_angle_deg") && !first.contains("max_angle_deg"),"Angle fields remain in template defaults");
+        first["min_angle_deg"]=135; first["max_angle_deg"]=45;
         first["custom_data"] = QJsonObject{{"keep", true}};
         require(store.saveProfile(first, false, error), "Create failed");
+        require(!store.profile("PRESSURE_TEST").contains("min_angle_deg") && !store.profile("PRESSURE_TEST").contains("max_angle_deg"),"Deprecated template angles saved");
         auto second = first; second["gauge_id"] = "TEMPERATURE_TEST"; second["unit"] = "℃"; second["max_val"] = 150;
         require(store.saveProfile(second, false, error), "Second create failed");
         require(!store.saveProfile(first, false, error), "Duplicate accepted");
@@ -126,6 +129,7 @@ int main(int argc, char** argv) {
         list->setCurrentRow(0); remove->click();
         require(changes == 0 && manager.findChild<QLabel*>("gaugeTemplateStatus")->text().contains("DEVICE_1"), "Used template deletion not explained");
         runEditor(add, [](QDialog* editor) {
+            require(!editor->findChild<QDoubleSpinBox*>("template_min_angle_deg") && !editor->findChild<QDoubleSpinBox*>("template_max_angle_deg"),"Template angle controls remain visible");
             auto* id = editor->findChild<QLineEdit*>("templateId");
             auto* maximum = editor->findChild<QDoubleSpinBox*>("template_max_val");
             auto* save = editor->findChild<QPushButton*>("saveTemplate");

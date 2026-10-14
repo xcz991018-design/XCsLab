@@ -1,3 +1,4 @@
+#include "CardinalSelectorDialog.hpp"
 #include "MySqlRepository.hpp"
 #include "DeviceCodec.hpp"
 #include "DatabaseHistoryDialog.hpp"
@@ -120,10 +121,71 @@ int main(int argc,char** argv) {
         DiscoveredCameraItem device; device.cameraId="CAM_DATABASE_1"; device.customName="测试油压表";
         device.protocolType=CameraProtocolType::ONVIF_RTSP_STREAM;
         device.rtspUrl="rtsp://operator:secret@127.0.0.1/live"; device.password="secret"; device.username="operator";
-        device.substation="测试站"; device.area="一区"; device.isAutoConnect=true;
+        device.substation="测试站"; device.area="一区";
         QJsonObject registry; registry["system"]=QJsonObject{{"last_active_device_id",device.cameraId}};
         registry["devices"]=QJsonArray{deviceToJson(device,true)};
         repository.saveRegistry(registry);
+
+        require(!repository.loadDevice(device.cameraId).hasCalibration, "New device has fake calibration");
+        QJsonObject calibration{{"perspective_correction_enabled",true}, {"calibrated_width",800}, {"calibrated_height",448},
+            {"pt_0_x",400}, {"pt_0_y",20}, {"pt_1_x",700}, {"pt_1_y",224},
+            {"pt_2_x",400}, {"pt_2_y",420}, {"pt_3_x",100}, {"pt_3_y",224},
+            {"center_x",400}, {"center_y",224}, {"pointer_base_radius",47}};
+        require(throws([&]{repository.saveCalibration(device.cameraId, calibration);}),"Old calibration without endpoints saved");
+        calibration["scale_points"]=QJsonArray{QJsonObject{{"x",200},{"y",350},{"ratio",0}},QJsonObject{{"x",600},{"y",350},{"ratio",1}}};
+        require(throws([&]{repository.saveCalibration(device.cameraId, QJsonObject());}), "Invalid calibration saved");
+        require(throws([&]{repository.saveCalibration("UNKNOWN_CAMERA", calibration);}), "Missing device calibration created");
+        const auto savedCalibration = repository.saveCalibration(device.cameraId, calibration);
+        const auto reloadedCalibration = repository.loadDevice(device.cameraId);
+        require(savedCalibration.hasCalibration && reloadedCalibration.hasCalibration && reloadedCalibration.centerX==400,
+                "Camera calibration did not persist");
+        require(reloadedCalibration.customName==device.customName && reloadedCalibration.defaultProfileId==device.defaultProfileId &&
+                reloadedCalibration.username==device.username, "Calibration overwrote device archive fields");
+        // Confirm asynchronous dialog saving, and failure retaining the dialog and original profile.
+        auto& calibrationManager = DeviceConfigManager::instance();
+        calibrationManager.addOrUpdateDevice(device, false);
+        GaugeProfile calibrationProfile;
+        calibrationProfile.perspective_pts = {{400,20},{700,224},{400,420},{100,224}};
+        calibrationProfile.center = {400,224}; calibrationProfile.pointerBaseRadius = 47;
+        calibrationProfile.scalePoints = QJsonArray{QJsonObject{{"x",200},{"y",350},{"ratio",0}},QJsonObject{{"x",600},{"y",350},{"ratio",1}}};
+        cv::Mat calibrationFrame(448,800,CV_8UC3); cv::randu(calibrationFrame,0,255);
+        auto saveDialog = [&](const QString& id, bool success) {
+            auto profile = calibrationProfile;
+            CardinalSelectorDialog dialog(calibrationFrame, profile, id);
+            require(QMetaObject::invokeMethod(&dialog,"onConfirmPerspective",Qt::DirectConnection),"Perspective step failed");
+            auto* corrected=dialog.findChild<InteractiveImageLabel*>("rectifiedCalibrationImage");
+            corrected->resize(800,800);
+            const auto center=corrected->getCenterPoint();
+            QMouseEvent centerClick(QEvent::MouseButtonPress,QPointF(center.x,center.y),Qt::LeftButton,Qt::LeftButton,Qt::NoModifier);
+            QApplication::sendEvent(corrected,&centerClick);
+            QEventLoop loop; QTimer poll, timeout; timeout.setSingleShot(true); int ticks=0;
+            QObject::connect(&dialog,&QDialog::accepted,&loop,&QEventLoop::quit);
+            QObject::connect(&poll,&QTimer::timeout,&loop,[&]{
+                ++ticks;
+                if (!success && dialog.findChild<QLabel*>("calibrationSaveStatus")->text().contains("失败")) loop.quit();
+            });
+            QObject::connect(&timeout,&QTimer::timeout,&loop,&QEventLoop::quit);
+            require(QMetaObject::invokeMethod(&dialog,"onSaveAndApply",Qt::DirectConnection),"Calibration save slot failed");
+            require(dialog.result()!=QDialog::Accepted,"Calibration save blocked the GUI");
+            poll.start(0); timeout.start(10000); loop.exec();
+            require(ticks>0,"Calibration database write froze GUI");
+            require(success ? dialog.result()==QDialog::Accepted : dialog.result()!=QDialog::Accepted,
+                    "Calibration dialog reported incorrect save result");
+            if (!success) require(profile.calibrated_width==calibrationProfile.calibrated_width,
+                                  "Failed save modified the live profile");
+        };
+        saveDialog(device.cameraId, true);
+        require(calibrationManager.getDevice(device.cameraId).hasCalibration &&
+                calibrationManager.getDevice(device.cameraId).password==device.password,
+                "Calibration confirmation lost local credentials");
+        const auto persistedPoints=repository.loadDevice(device.cameraId).scalePoints;
+        require(persistedPoints.size()==calibrationProfile.scalePoints.size(),"Scale endpoints were not persisted");
+        for(int i=0;i<persistedPoints.size();++i) {
+            const auto expected=calibrationProfile.scalePoints[i].toObject(), actual=persistedPoints[i].toObject();
+            require(std::abs(expected["x"].toDouble()-actual["x"].toDouble())<0.001 &&
+                std::abs(expected["y"].toDouble()-actual["y"].toDouble())<0.001 && expected["ratio"]==actual["ratio"],"Corrected annotation inverse mapping failed");
+        }
+        saveDialog("UNKNOWN_CAMERA", false);
         const auto usedTemplate = repository.loadTemplate(device.defaultProfileId);
         require(throws([&]{repository.deleteTemplate(usedTemplate.id,usedTemplate.revision);}), "Referenced template deleted");
         auto invalidRegistry = registry;
@@ -208,10 +270,8 @@ int main(int argc,char** argv) {
         manager.registerDiscoveredDevice(discoveredCamera);
         manager.waitForDatabaseWrites();
         require(repository.loadRegistry()["devices"].toArray().size()==2,"Repeated discovery duplicated DB device");
-        manager.setLastActiveDeviceId(addedCamera.cameraId);
         manager.waitForDatabaseWrites();
         require(manager.load(registryPath) && manager.hasDevice(addedCamera.cameraId),"DB restart did not restore discovered camera");
-        require(manager.getLastActiveDeviceId()==addedCamera.cameraId,"DB restart lost last connected device");
         require(!manager.getDevice(addedCamera.cameraId).isOnline,"DB restart reused stale online state");
         auto bad=envelope; bad["task_id"]=QUuid::createUuid().toString(QUuid::WithoutBraces);
         bad["original_path"]=folder.path()+"/missing.png";

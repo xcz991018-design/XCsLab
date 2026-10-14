@@ -27,7 +27,7 @@ QList<QJsonObject> materializeLegacyGaugeTemplates(const QString& path) {
         if (!resolved.loadFromFile(path.toStdString(), id.toStdString())) throw std::runtime_error("LEGACY_TEMPLATE_RESOLVE_FAILED");
         for (const auto& field : GaugeTemplateStore::fields())
             for (const auto& alias : field.aliases) definition.remove(alias);
-        for (const auto& key : {"use_model", "gauge_profile", "profile_model", "parent_model_path", "default_profile_id", "profile_id"}) definition.remove(key);
+        for (const auto& key : {"use_model", "gauge_profile", "profile_model", "parent_model_path", "default_profile_id", "profile_id", "min_angle_deg", "max_angle_deg"}) definition.remove(key);
         const auto effective = resolved.toJson();
         for (auto it = effective.begin(); it != effective.end(); ++it) definition[it.key()] = it.value();
         definition["gauge_id"] = id;

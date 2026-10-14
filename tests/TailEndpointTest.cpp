@@ -1,4 +1,5 @@
 #include "GaugeReaderEngine.hpp"
+#include "ScaleCalibration.hpp"
 #include <iostream>
 
 int main(int argc, char** argv) {
@@ -16,6 +17,12 @@ int main(int argc, char** argv) {
     profile.tail_max_width = 130;
     profile.tail_corridor_half_width = 90;
     GaugeReaderEngine engine;
+    cv::Mat calibrationInverse;
+    engine.rectifyPerspective(frame,profile.perspective_pts,calibrationInverse);
+    std::vector<cv::Point2f> center{profile.center}; cv::perspectiveTransform(center,center,calibrationInverse.inv());
+    QJsonArray rectifiedPoints{QJsonObject{{"x",center[0].x-140},{"y",center[0].y+140},{"ratio",0}},
+        QJsonObject{{"x",center[0].x+140},{"y",center[0].y+140},{"ratio",1}}};
+    profile.scalePoints=ScaleCalibration::transformed(rectifiedPoints,calibrationInverse);
     const auto result = engine.process(frame, profile, GaugeRunMode::Evidence);
     const auto& tail = result.pointerDetectorResult.tailProfile;
     // Independently traced silhouette in the source photograph; tolerance

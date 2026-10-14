@@ -1,3 +1,7 @@
+#include "MySqlRepository.hpp"
+#include "DeviceCalibration.hpp"
+#include <QFutureWatcher>
+#include <QtConcurrent/QtConcurrent>
 #include "CardinalSelectorDialog.hpp"
 #include "GaugeReaderEngine.hpp"
 #include "DeviceConfigManager.hpp"
@@ -5,6 +9,8 @@
 #include <QMessageBox>
 #include <QDebug>
 #include <cmath>
+#include "ScaleCalibration.hpp"
+#include <algorithm>
 
 InteractiveImageLabel::InteractiveImageLabel(QWidget *parent) : QLabel(parent) {
     setMouseTracking(true);
@@ -15,18 +21,12 @@ InteractiveImageLabel::InteractiveImageLabel(QWidget *parent) : QLabel(parent) {
 void InteractiveImageLabel::setImageAndPoints(const cv::Mat& mat, const std::vector<cv::Point2f>& pts, const cv::Point2f& centerPt) {
     m_origImage = mat.clone();
     m_pts = pts;
-    if (m_pts.size() != 4 && !mat.empty()) {
+    if (!m_rectifiedMode && m_pts.size() != 4 && !mat.empty()) {
         m_pts = GaugeReaderEngine::autoDetectCardinalPoints(mat);
     }
 
-    if (centerPt.x > 0 && centerPt.y > 0 && !mat.empty() && centerPt.x < mat.cols && centerPt.y < mat.rows) {
-        m_centerPt = centerPt;
-    } else if (m_pts.size() == 4) {
-        m_centerPt = cv::Point2f((m_pts[0].x + m_pts[1].x + m_pts[2].x + m_pts[3].x) * 0.25f,
-                                (m_pts[0].y + m_pts[1].y + m_pts[2].y + m_pts[3].y) * 0.25f);
-    } else if (!mat.empty()) {
-        m_centerPt = cv::Point2f(mat.cols * 0.5f, mat.rows * 0.5f);
-    }
+    m_centerPt = m_rectifiedMode ? centerPt : cv::Point2f(-1,-1);
+    m_selectedIdx=-1;
     update();
 }
 
@@ -73,6 +73,9 @@ void InteractiveImageLabel::paintEvent(QPaintEvent *event) {
     QImage qimg(m_origImage.data, m_origImage.cols, m_origImage.rows, static_cast<int>(m_origImage.step), QImage::Format_BGR888);
     painter.drawImage(QRect(m_offsetX, m_offsetY, dispW, dispH), qimg);
 
+    QFont labelFont = painter.font();
+    labelFont.setBold(true); labelFont.setPixelSize(11);
+    if (!m_rectifiedMode) {
     if (m_pts.size() != 4) return;
 
     // Map 4 rim points to canvas coordinates
@@ -96,9 +99,7 @@ void InteractiveImageLabel::paintEvent(QPaintEvent *event) {
     };
     QString labels[4] = { "12H (Top)", "3H (Right)", "6H (Bot)", "9H (Left)" };
 
-    QFont labelFont = painter.font();
-    labelFont.setBold(true);
-    labelFont.setPixelSize(11);
+    painter.setFont(labelFont);
 
     for (int i = 0; i < 4; ++i) {
         QPointF cp = canvasPts[i];
@@ -129,6 +130,14 @@ void InteractiveImageLabel::paintEvent(QPaintEvent *event) {
         painter.drawText(cp + QPointF(-20, -10), labels[i]);
     }
 
+    }
+    if (!m_rectifiedMode) return;
+    for (const auto& value : m_scalePoints) {
+        const auto p=value.toObject(); const QPointF cp=mapToCanvas({float(p["x"].toDouble()),float(p["y"].toDouble())});
+        painter.setPen(QPen(QColor(100,255,100),1.5)); painter.setBrush(QColor(100,255,100));
+        painter.drawLine(mapToCanvas(m_centerPt),cp); painter.drawEllipse(cp,5,5);
+        painter.drawText(cp+QPointF(7,-7),tr("%1% 刻度").arg(p["ratio"].toDouble()*100,0,'f',1));
+    }
     // Draw 5th point (Dial Center Pin 🎯)
     if (m_centerPt.x > 0 && m_centerPt.y > 0) {
         QPointF centerCp = mapToCanvas(m_centerPt);
@@ -176,39 +185,44 @@ void InteractiveImageLabel::paintEvent(QPaintEvent *event) {
 }
 
 void InteractiveImageLabel::mousePressEvent(QMouseEvent *event) {
-    if (m_pts.size() != 4) return;
-    QPointF pos = event->localPos();
-
-    float hitRadius = 20.0f;
-    m_selectedIdx = -1;
-
-    // Check 4 rim points
-    for (int i = 0; i < 4; ++i) {
-        QPointF cp = mapToCanvas(m_pts[i]);
-        float dist = std::hypot(pos.x() - cp.x(), pos.y() - cp.y());
-        if (dist < hitRadius) {
-            m_selectedIdx = i;
-            return;
+    if (!isEnabled() || m_origImage.empty() || event->button()!=Qt::LeftButton) return;
+    updateTransformParams();
+    const QPointF pos=event->localPos();
+    m_selectedIdx=-1;
+    if (pos.x()<m_offsetX || pos.y()<m_offsetY || pos.x()>=m_offsetX+m_origImage.cols*m_scale || pos.y()>=m_offsetY+m_origImage.rows*m_scale) return;
+    if (!m_rectifiedMode) {
+        for (int i=0;i<int(m_pts.size());++i) {
+            auto cp=mapToCanvas(m_pts[i]);
+            if (std::hypot(pos.x()-cp.x(),pos.y()-cp.y())<20) { m_selectedIdx=i; return; }
         }
+        return;
     }
-
-    // Check 5th center point (index 4)
-    if (m_centerPt.x > 0 && m_centerPt.y > 0) {
-        QPointF centerCp = mapToCanvas(m_centerPt);
-        float dist = std::hypot(pos.x() - centerCp.x(), pos.y() - centerCp.y());
-        if (dist < hitRadius) {
-            m_selectedIdx = 4;
-        }
+    if (m_pickCenter) {
+        m_centerPt=mapToImage(pos); m_pickCenter=false; unsetCursor();
+        update(); emit centerClicked(); emit pointsChanged(); return;
+    }
+    if (m_pendingRatio>=0) {
+        auto pt=mapToImage(pos);
+        std::vector<QJsonObject> points;
+        for (const auto& value : m_scalePoints) if (value.toObject()["ratio"].toDouble()!=m_pendingRatio) points.push_back(value.toObject());
+        points.push_back(QJsonObject{{"x",pt.x},{"y",pt.y},{"ratio",m_pendingRatio}});
+        std::sort(points.begin(),points.end(),[](const QJsonObject& a,const QJsonObject& b){return a["ratio"].toDouble()<b["ratio"].toDouble();});
+        m_scalePoints={}; for (const auto& p:points) m_scalePoints.append(p);
+        m_pendingRatio=-1; update(); emit pointsChanged(); return;
+    }
+    for (int i=0;i<m_scalePoints.size();++i) {
+        auto p=m_scalePoints[i].toObject(); auto cp=mapToCanvas({float(p["x"].toDouble()),float(p["y"].toDouble())});
+        if (std::hypot(pos.x()-cp.x(),pos.y()-cp.y())<12) { m_selectedIdx=5+i; return; }
     }
 }
 
 void InteractiveImageLabel::mouseMoveEvent(QMouseEvent *event) {
-    if (m_selectedIdx >= 0 && m_selectedIdx < 4) {
+    if (!isEnabled() || !(event->buttons() & Qt::LeftButton)) return;
+    if (m_selectedIdx>=5 && m_selectedIdx-5<m_scalePoints.size()) {
+        auto p=m_scalePoints[m_selectedIdx-5].toObject(); auto pt=mapToImage(event->localPos());
+        p["x"]=pt.x; p["y"]=pt.y; m_scalePoints[m_selectedIdx-5]=p; update(); emit pointsChanged();
+    } else if (m_selectedIdx >= 0 && m_selectedIdx < 4) {
         m_pts[m_selectedIdx] = mapToImage(event->localPos());
-        update();
-        emit pointsChanged();
-    } else if (m_selectedIdx == 4) {
-        m_centerPt = mapToImage(event->localPos());
         update();
         emit pointsChanged();
     }
@@ -222,7 +236,7 @@ void InteractiveImageLabel::mouseReleaseEvent(QMouseEvent *event) {
 // ---------------- CardinalSelectorDialog ----------------
 
 CardinalSelectorDialog::CardinalSelectorDialog(const cv::Mat& frame, GaugeProfile& profile, const QString& cameraId, QWidget *parent)
-    : QDialog(parent), m_frame(frame), m_profile(profile), m_cameraId(cameraId) {
+    : QDialog(parent), m_frame(frame.clone()), m_profile(profile), m_cameraId(cameraId) {
     setupUi();
     
     bool ptsValid = (m_profile.perspective_pts.size() == 4);
@@ -241,14 +255,8 @@ CardinalSelectorDialog::CardinalSelectorDialog(const cv::Mat& frame, GaugeProfil
         m_currentPts = GaugeReaderEngine::autoDetectCardinalPoints(m_frame);
     }
 
-    if (m_profile.center.x > 0 && m_profile.center.y > 0 && m_profile.center.x < m_frame.cols && m_profile.center.y < m_frame.rows) {
-        m_currentCenterPt = m_profile.center;
-    } else {
-        m_currentCenterPt = cv::Point2f((m_currentPts[0].x + m_currentPts[1].x + m_currentPts[2].x + m_currentPts[3].x) * 0.25f,
-                                        (m_currentPts[0].y + m_currentPts[1].y + m_currentPts[2].y + m_currentPts[3].y) * 0.25f);
-    }
-
-    m_interactiveLabel->setImageAndPoints(m_frame, m_currentPts, m_currentCenterPt);
+    m_interactiveLabel->setImageAndPoints(m_frame, m_currentPts);
+    m_interactiveLabel->setObjectName("perspectiveImage");
     m_interactiveLabel->setPointerBaseRadius(m_profile.pointerBaseRadius);
     if (m_baseRadiusSpinBox) {
         m_baseRadiusSpinBox->setValue(m_profile.pointerBaseRadius);
@@ -257,13 +265,14 @@ CardinalSelectorDialog::CardinalSelectorDialog(const cv::Mat& frame, GaugeProfil
 }
 
 void CardinalSelectorDialog::setupUi() {
-    setWindowTitle(tr("表盘 4 极值切点与中心点视场透视矫正配置 (FOV Cardinal & Center Corrector)"));
-    resize(1100, 640);
+    setWindowTitle(tr("表计标定（透视、中心点与刻度）"));
+    resize(1200, 780);
     setStyleSheet("QDialog { background-color: #121216; color: #e0e0e0; font-family: Segoe UI, sans-serif; }");
 
     QVBoxLayout *mainLayout = new QVBoxLayout(this);
 
-    QLabel *tipLabel = new QLabel(tr("💡 请在左侧原图上拖拽圆盘边缘 4 个极值切点（12点钟、3点钟、6点钟、9点钟位置）及 🎯 表盘中心点，调节黄色轴帽避让半径圈，右侧将实时呈现正视矫正效果。"), this);
+    QLabel *tipLabel = new QLabel(tr("第一步：在左侧原图调整四个透视切点并确认。第二步：在右侧矫正图点击指针轴心、最小和最大刻度，再调节轴帽避让半径。"), this);
+    tipLabel->setWordWrap(true);
     tipLabel->setStyleSheet("font-weight: bold; color: #00e5ff; padding: 6px; font-size: 13px;");
     mainLayout->addWidget(tipLabel);
 
@@ -271,15 +280,18 @@ void CardinalSelectorDialog::setupUi() {
 
     // Left: Interactive Selector
     QVBoxLayout *leftLayout = new QVBoxLayout();
-    leftLayout->addWidget(new QLabel(tr("<b>原图切点与中心点标注 (Drag 4 Rim Points & 🎯 Center Pin):</b>"), this));
+    leftLayout->addWidget(new QLabel(tr("<b>第一步：原图四切点标定</b>"), this));
     m_interactiveLabel = new InteractiveImageLabel(this);
     leftLayout->addWidget(m_interactiveLabel, 1);
     contentLayout->addLayout(leftLayout, 1);
 
     // Right: Live Rectified Preview
     QVBoxLayout *rightLayout = new QVBoxLayout();
-    rightLayout->addWidget(new QLabel(tr("<b>正视透视矫正实时预览 (Front View Preview):</b>"), this));
-    m_previewLabel = new QLabel(this);
+    rightLayout->addWidget(new QLabel(tr("<b>第二步：矫正图轴心与刻度标定</b>"), this));
+    m_previewLabel = new InteractiveImageLabel(this);
+    m_previewLabel->setObjectName("rectifiedCalibrationImage");
+    m_previewLabel->setRectifiedMode(true);
+    m_previewLabel->setEnabled(false);
     m_previewLabel->setMinimumSize(400, 400);
     m_previewLabel->setAlignment(Qt::AlignCenter);
     m_previewLabel->setStyleSheet("background-color: #1a1a22; border: 1px solid #333344; border-radius: 4px;");
@@ -288,11 +300,36 @@ void CardinalSelectorDialog::setupUi() {
 
     mainLayout->addLayout(contentLayout, 1);
 
+    m_scaleControls = new QWidget(this);
+    auto* scaleLayout = new QHBoxLayout(m_scaleControls);
+    m_centerBtn = new QPushButton(tr("点击标定轴心"),this);
+    m_centerBtn->setObjectName("pickCenterButton");
+    auto* minBtn = new QPushButton(tr("标定最小刻度"),this);
+    auto* maxBtn = new QPushButton(tr("标定最大刻度"),this);
+    auto* ratioSpin = new QDoubleSpinBox(this);
+    ratioSpin->setRange(0.1,99.9); ratioSpin->setValue(50); ratioSpin->setSuffix(tr("% 量程"));
+    auto* addBtn = new QPushButton(tr("标定中间刻度（可选）"),this);
+    auto* clearBtn = new QPushButton(tr("清除刻度点"),this);
+    scaleLayout->addWidget(m_centerBtn);
+    scaleLayout->addWidget(minBtn); scaleLayout->addWidget(maxBtn); scaleLayout->addWidget(ratioSpin);
+    scaleLayout->addWidget(addBtn); scaleLayout->addWidget(clearBtn);
+    mainLayout->addWidget(m_scaleControls);
+    m_scaleStatus = new QLabel(this); m_scaleStatus->setWordWrap(true); mainLayout->addWidget(m_scaleStatus);
+    auto arm = [this](double ratio) {
+        if (!m_perspectiveConfirmed || !m_centerConfirmed) { m_scaleStatus->setText(tr("请先在矫正图点击指针轴心。")); return; }
+        m_previewLabel->selectScaleRatio(ratio);
+        m_scaleStatus->setText(tr("请在右侧矫正图点击 %1% 量程对应的真实刻度线（不要点击数字）；已有点可拖动。").arg(ratio*100));
+    };
+    connect(m_centerBtn,&QPushButton::clicked,this,[this]{m_previewLabel->selectCenter(); m_scaleStatus->setText(tr("请在右侧矫正图点击指针旋转轴心；重新选择轴心也使用点击。"));});
+    connect(minBtn,&QPushButton::clicked,this,[arm]{arm(0);});
+    connect(maxBtn,&QPushButton::clicked,this,[arm]{arm(1);});
+    connect(addBtn,&QPushButton::clicked,this,[arm,ratioSpin]{arm(ratioSpin->value()/100);});
+    connect(clearBtn,&QPushButton::clicked,this,[this]{m_previewLabel->setScalePoints({}); m_previewLabel->selectScaleRatio(-1); updatePreview();});
     // Bottom Action Bar
     QHBoxLayout *btnLayout = new QHBoxLayout();
     m_autoBtn = new QPushButton(tr("⚡ 自动检测切点"), this);
     m_resetBtn = new QPushButton(tr("🔄 重置切点"), this);
-    m_saveBtn = new QPushButton(tr("💾 确认并保存到 devices.json"), this);
+    m_saveBtn = new QPushButton(tr("💾 确认并保存到数据库"), this);
     m_cancelBtn = new QPushButton(tr("取消"), this);
 
     m_saveBtn->setStyleSheet("background-color: #00897b; color: white; font-weight: bold; padding: 8px 16px; border-radius: 4px;");
@@ -311,6 +348,9 @@ void CardinalSelectorDialog::setupUi() {
     m_baseRadiusSpinBox->setValue(m_profile.pointerBaseRadius > 0 ? m_profile.pointerBaseRadius : 50.0);
     m_baseRadiusSpinBox->setStyleSheet("QDoubleSpinBox { background-color: #1a1a22; color: #ffd700; border: 1px solid #ffd700; border-radius: 4px; padding: 4px 8px; font-weight: bold; }");
 
+    m_confirmPerspectiveBtn=new QPushButton(tr("确认四切点，继续标定"),this);
+    m_confirmPerspectiveBtn->setObjectName("confirmPerspectiveButton");
+    btnLayout->addWidget(m_confirmPerspectiveBtn);
     btnLayout->addWidget(m_autoBtn);
     btnLayout->addWidget(m_resetBtn);
     btnLayout->addSpacing(15);
@@ -321,13 +361,23 @@ void CardinalSelectorDialog::setupUi() {
     btnLayout->addWidget(m_cancelBtn);
 
     mainLayout->addLayout(btnLayout);
+    m_scaleControls->setEnabled(false);
+    m_baseRadiusSpinBox->setEnabled(false);
+    m_saveBtn->setEnabled(false);
+    m_saveStatus = new QLabel(tr("设备: %1；底图已冻结，请先确认原图四切点，再在矫正图完成后续标定。").arg(m_cameraId), this);
+    m_saveStatus->setObjectName("calibrationSaveStatus");
+    m_saveStatus->setWordWrap(true);
+    mainLayout->addWidget(m_saveStatus);
 
     // Signals & Slots
     connect(m_interactiveLabel, &InteractiveImageLabel::pointsChanged, this, &CardinalSelectorDialog::onPointsUpdated);
     connect(m_baseRadiusSpinBox, QOverload<double>::of(&QDoubleSpinBox::valueChanged), this, [this](double val) {
-        m_interactiveLabel->setPointerBaseRadius(val);
+        m_previewLabel->setPointerBaseRadius(val);
         updatePreview();
     });
+    connect(m_confirmPerspectiveBtn,&QPushButton::clicked,this,&CardinalSelectorDialog::onConfirmPerspective);
+    connect(m_previewLabel,&InteractiveImageLabel::pointsChanged,this,&CardinalSelectorDialog::updatePreview);
+    connect(m_previewLabel,&InteractiveImageLabel::centerClicked,this,[this]{m_centerConfirmed=true;});
     connect(m_autoBtn, &QPushButton::clicked, this, &CardinalSelectorDialog::onAutoDetect);
     connect(m_resetBtn, &QPushButton::clicked, this, &CardinalSelectorDialog::onReset);
     connect(m_saveBtn, &QPushButton::clicked, this, &CardinalSelectorDialog::onSaveAndApply);
@@ -335,94 +385,161 @@ void CardinalSelectorDialog::setupUi() {
 }
 
 void CardinalSelectorDialog::onPointsUpdated() {
-    m_currentPts = m_interactiveLabel->getPoints();
-    m_currentCenterPt = m_interactiveLabel->getCenterPoint();
+    m_currentPts=m_interactiveLabel->getPoints();
     updatePreview();
 }
 
-void CardinalSelectorDialog::updatePreview() {
-    if (m_frame.empty() || m_currentPts.size() != 4) return;
-
-    GaugeReaderEngine engine;
-    cv::Mat invH;
-    cv::Mat rectified = engine.rectifyPerspective(m_frame, m_currentPts, invH, 800, 40);
-
-    if (!rectified.empty()) {
-        cv::Point2f origCenter = m_interactiveLabel->getCenterPoint();
-        if (origCenter.x > 0 && origCenter.y > 0 && !invH.empty()) {
-            cv::Mat H = invH.inv();
-            std::vector<cv::Point2f> srcC = { origCenter };
-            std::vector<cv::Point2f> dstC;
-            cv::perspectiveTransform(srcC, dstC, H);
-
-            // Overlay transformed center pin on rectified view
-            cv::circle(rectified, dstC[0], 6, cv::Scalar(0, 0, 255), -1, cv::LINE_AA);
-            cv::drawMarker(rectified, dstC[0], cv::Scalar(0, 255, 255), cv::MARKER_CROSS, 24, 2, cv::LINE_AA);
-
-            // Overlay transformed center hub exclusion circle (pointerBaseRadius)
-            double baseR = m_interactiveLabel->getPointerBaseRadius();
-            if (baseR > 1.0) {
-                cv::circle(rectified, dstC[0], static_cast<int>(baseR), cv::Scalar(255, 220, 0), 2, cv::LINE_AA);
-                cv::putText(rectified, cv::format("Hub Mask: %.0fpx", baseR), dstC[0] + cv::Point2f(10, 22), cv::FONT_HERSHEY_SIMPLEX, 0.45, cv::Scalar(255, 220, 0), 1, cv::LINE_AA);
-            }
-
-            cv::putText(rectified, "Center Pin", dstC[0] + cv::Point2f(10, 5), cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(0, 255, 255), 1, cv::LINE_AA);
-        }
-
-        QImage qimg(rectified.data, rectified.cols, rectified.rows, static_cast<int>(rectified.step), QImage::Format_BGR888);
-        m_previewLabel->setPixmap(QPixmap::fromImage(qimg.copy()).scaled(m_previewLabel->size(), Qt::KeepAspectRatio, Qt::SmoothTransformation));
+void CardinalSelectorDialog::onConfirmPerspective() {
+    if (m_saving) return;
+    if (m_perspectiveConfirmed) {
+        // Changing the warp invalidates every downstream annotation.
+        m_perspectiveConfirmed=false; m_centerConfirmed=false; m_loadExistingPoints=false;
+        m_previewLabel->setScalePoints({});
+        m_previewLabel->selectScaleRatio(-1);
+        m_previewLabel->setEnabled(false); m_interactiveLabel->setEnabled(true);
+        m_scaleControls->setEnabled(false); m_baseRadiusSpinBox->setEnabled(false);
+        m_saveBtn->setEnabled(false); m_autoBtn->setEnabled(true); m_resetBtn->setEnabled(true);
+        m_confirmPerspectiveBtn->setText(tr("确认四切点，继续标定"));
+        updatePreview(); return;
     }
+    m_currentPts=m_interactiveLabel->getPoints();
+    if (m_currentPts.size()!=4 || !cv::isContourConvex(m_currentPts) || std::abs(cv::contourArea(m_currentPts))<=1) {
+        m_saveStatus->setText(tr("请先调整四个切点，使其构成有效凸四边形。")); return;
+    }
+    for (auto pt:m_currentPts) if (!std::isfinite(pt.x) || !std::isfinite(pt.y) || pt.x<0 || pt.y<0 || pt.x>=m_frame.cols || pt.y>=m_frame.rows) return;
+    updatePreview();
+    if (m_inverseHomography.empty()) return;
+    m_perspectiveConfirmed=true; m_centerConfirmed=false;
+    m_interactiveLabel->setEnabled(false); m_previewLabel->setEnabled(true);
+    m_scaleControls->setEnabled(true); m_baseRadiusSpinBox->setEnabled(true);
+    m_autoBtn->setEnabled(false); m_resetBtn->setEnabled(false);
+    m_confirmPerspectiveBtn->setText(tr("返回修改四切点"));
+    m_previewLabel->selectCenter();
+    m_scaleStatus->setText(tr("四切点已确认，请在右侧矫正图点击指针旋转轴心。"));
+    m_saveStatus->setText(tr("第二步：在矫正图完成轴心和刻度标定后保存。"));
+}
+
+void CardinalSelectorDialog::updatePreview() {
+    if (!m_perspectiveConfirmed) {
+        m_inverseHomography.release();
+        if (m_frame.empty() || m_currentPts.size()!=4 || !cv::isContourConvex(m_currentPts) || std::abs(cv::contourArea(m_currentPts))<=1) {
+            m_previewLabel->setImageAndPoints(cv::Mat(),{});
+            m_scaleStatus->setText(tr("四切点无效，请在原图调整后确认。")); return;
+        }
+        GaugeReaderEngine engine;
+        auto rectified=engine.rectifyPerspective(m_frame,m_currentPts,m_inverseHomography,m_profile.rectified_size,m_profile.rectified_margin);
+        cv::Point2f center(-1,-1);
+        QJsonArray scales;
+        if (m_loadExistingPoints && m_profile.center.x>=0 && m_profile.center.y>=0) {
+            std::vector<cv::Point2f> c{m_profile.center};
+            cv::perspectiveTransform(c,c,m_inverseHomography.inv()); center=c[0];
+            scales=ScaleCalibration::transformed(m_profile.scalePoints,m_inverseHomography.inv());
+        }
+        m_previewLabel->setImageAndPoints(rectified,{},center);
+        m_previewLabel->setScalePoints(scales);
+        m_previewLabel->setPointerBaseRadius(m_baseRadiusSpinBox->value());
+        m_scaleStatus->setText(tr("请先确认左侧四切点，再在右侧矫正图标定轴心和刻度。"));
+        return;
+    }
+    auto center=m_previewLabel->getCenterPoint();
+    auto scales=m_previewLabel->getScalePoints();
+    ScaleCalibration::Mapping mapping;
+    const bool valid=m_centerConfirmed && ScaleCalibration::valid(scales,m_profile.rectified_size,m_profile.rectified_size,center) &&
+        ScaleCalibration::build(scales,center,{},m_profile.clockwise,mapping);
+    m_saveBtn->setEnabled(valid && !m_saving);
+    m_scaleStatus->setText(valid ? tr("已标定 %1 个刻度点；量程 %2～%3 %4，方向：%5。请检查矫正图射线后保存。")
+        .arg(scales.size()).arg(m_profile.min_val).arg(m_profile.max_val).arg(QString::fromStdString(m_profile.unit))
+        .arg(m_profile.clockwise?tr("顺时针"):tr("逆时针")) : tr("请在矫正图点击轴心，再标定最小、最大刻度；中间点须按数值增长方向排列。"));
 }
 
 void CardinalSelectorDialog::onAutoDetect() {
-    if (m_frame.empty()) return;
+    if (m_frame.empty() || m_perspectiveConfirmed || m_saving) return;
     m_currentPts = GaugeReaderEngine::autoDetectCardinalPoints(m_frame);
-    m_currentCenterPt = cv::Point2f((m_currentPts[0].x + m_currentPts[1].x + m_currentPts[2].x + m_currentPts[3].x) * 0.25f,
-                                    (m_currentPts[0].y + m_currentPts[1].y + m_currentPts[2].y + m_currentPts[3].y) * 0.25f);
-    m_interactiveLabel->setImageAndPoints(m_frame, m_currentPts, m_currentCenterPt);
+    m_interactiveLabel->setImageAndPoints(m_frame, m_currentPts);
     updatePreview();
 }
 
 void CardinalSelectorDialog::onReset() {
+    m_loadExistingPoints=false;
     onAutoDetect();
 }
 
+void CardinalSelectorDialog::reject() {
+    if (!m_saving) QDialog::reject();
+}
+
 void CardinalSelectorDialog::onSaveAndApply() {
-    m_currentPts = m_interactiveLabel->getPoints();
-    m_profile.perspective_pts = m_currentPts;
-    m_profile.perspective_correction_enabled = true;
-    m_profile.center = m_interactiveLabel->getCenterPoint();
-    m_profile.pointerBaseRadius = m_interactiveLabel->getPointerBaseRadius();
-    m_profile.auto_detect_roi = false;
-    if (!m_frame.empty()) {
-        m_profile.calibrated_width = m_frame.cols;
-        m_profile.calibrated_height = m_frame.rows;
+    if (m_saving) return;
+    if (!m_perspectiveConfirmed || !m_centerConfirmed || m_inverseHomography.empty()) {
+        m_saveStatus->setText(tr("请先确认四切点，并在矫正图点击轴心后完成刻度标定。")); return;
     }
-
-    if (!m_cameraId.isEmpty()) {
-        double p0x = m_currentPts.size() > 0 ? m_currentPts[0].x : 0;
-        double p0y = m_currentPts.size() > 0 ? m_currentPts[0].y : 0;
-        double p1x = m_currentPts.size() > 1 ? m_currentPts[1].x : 0;
-        double p1y = m_currentPts.size() > 1 ? m_currentPts[1].y : 0;
-        double p2x = m_currentPts.size() > 2 ? m_currentPts[2].x : 0;
-        double p2y = m_currentPts.size() > 2 ? m_currentPts[2].y : 0;
-        double p3x = m_currentPts.size() > 3 ? m_currentPts[3].x : 0;
-        double p3y = m_currentPts.size() > 3 ? m_currentPts[3].y : 0;
-        cv::Point2f cp = m_interactiveLabel->getCenterPoint();
-
-        DeviceConfigManager::instance().updateDeviceCalibration(
-            m_cameraId,
-            true,
-            !m_frame.empty() ? m_frame.cols : 800,
-            !m_frame.empty() ? m_frame.rows : 448,
-            p0x, p0y, p1x, p1y, p2x, p2y, p3x, p3y,
-            cp.x, cp.y,
-            m_interactiveLabel->getPointerBaseRadius(),
-            true
-        );
-        QMessageBox::information(this, tr("保存成功"), tr("已成功更新摄像头 [%1] 的 4 切点与透视标定数据并保存到 devices.json！").arg(m_cameraId));
-    } else {
-        QMessageBox::information(this, tr("设置成功"), tr("已在当前内存会话中应用标定参数！"));
+    const auto points=m_interactiveLabel->getPoints();
+    const auto rectifiedCenter=m_previewLabel->getCenterPoint();
+    const auto rectifiedScales=m_previewLabel->getScalePoints();
+    const auto radius=m_previewLabel->getPointerBaseRadius();
+    ScaleCalibration::Mapping mapping;
+    if (!ScaleCalibration::valid(rectifiedScales,m_profile.rectified_size,m_profile.rectified_size,rectifiedCenter) ||
+        !ScaleCalibration::build(rectifiedScales,rectifiedCenter,{},m_profile.clockwise,mapping)) {
+        m_saveStatus->setText(tr("无法保存：请检查矫正图的轴心、刻度点及增长方向。")); return;
     }
-    accept();
+    // Persist inverse-mapped source points to retain the existing device and
+    // historical calibration format. Runtime reapplies this same homography.
+    std::vector<cv::Point2f> sourceCenter{rectifiedCenter};
+    cv::perspectiveTransform(sourceCenter,sourceCenter,m_inverseHomography);
+    const auto center=sourceCenter[0];
+    const auto scales=ScaleCalibration::transformed(rectifiedScales,m_inverseHomography);
+    QJsonObject calibration{{"perspective_correction_enabled", true},
+        {"calibrated_width", m_frame.cols}, {"calibrated_height", m_frame.rows},
+        {"center_x", center.x}, {"center_y", center.y}, {"pointer_base_radius", radius}};
+    for (int i = 0; i < int(points.size()); ++i) {
+        calibration[QString("pt_%1_x").arg(i)] = points[i].x;
+        calibration[QString("pt_%1_y").arg(i)] = points[i].y;
+    }
+    calibration["scale_points"] = scales;
+    if (!validDeviceCalibration(calibration) || m_cameraId.isEmpty()) {
+        m_saveStatus->setText(tr("无法保存：请将四个切点按 12、3、6、9 点钟顺序放在图像内，并设置有效中心点。"));
+        return;
+    }
+    m_saving = true;
+    m_scaleControls->setEnabled(false);
+    m_saveStatus->setText(tr("正在保存设备标定到数据库…"));
+    m_previewLabel->setEnabled(false);
+    m_confirmPerspectiveBtn->setEnabled(false);
+    m_interactiveLabel->setEnabled(false);
+    m_baseRadiusSpinBox->setEnabled(false);
+    m_autoBtn->setEnabled(false); m_resetBtn->setEnabled(false);
+    m_saveBtn->setEnabled(false); m_cancelBtn->setEnabled(false);
+    auto* watcher = new QFutureWatcher<QString>(this);
+    connect(watcher, &QFutureWatcher<QString>::finished, this, [this, watcher, points, center, radius, scales]() {
+        const auto error = watcher->result(); watcher->deleteLater();
+        m_saving = false;
+        if (!error.isEmpty()) {
+            m_saveStatus->setText(tr("数据库保存失败：%1；标定尚未保存，可重试。").arg(error));
+            m_scaleControls->setEnabled(true);
+            m_previewLabel->setEnabled(true); m_baseRadiusSpinBox->setEnabled(true);
+            m_confirmPerspectiveBtn->setEnabled(true);
+            m_saveBtn->setEnabled(true); m_cancelBtn->setEnabled(true);
+            return;
+        }
+        DeviceConfigManager::instance().updateDeviceCalibration(m_cameraId, true, m_frame.cols, m_frame.rows,
+            points[0].x, points[0].y, points[1].x, points[1].y,
+            points[2].x, points[2].y, points[3].x, points[3].y, center.x, center.y, radius, false, scales);
+        m_profile.scalePoints=scales;
+        m_profile.perspective_pts = points;
+        m_profile.perspective_correction_enabled = true;
+        m_profile.center = center; m_profile.pointerBaseRadius = radius;
+        m_profile.auto_detect_roi = false;
+        m_profile.calibrated_width = m_frame.cols; m_profile.calibrated_height = m_frame.rows;
+        accept();
+    });
+    const auto cameraId = m_cameraId;
+    watcher->setFuture(QtConcurrent::run([cameraId, calibration]() -> QString {
+        try {
+            DeviceConfigManager::instance().waitForDatabaseWrites();
+            const auto syncError = MySqlRepository::retryPending(QString());
+            if (!syncError.isEmpty()) return syncError;
+            MySqlRepository().saveCalibration(cameraId, calibration);
+            return {};
+        } catch (const std::exception& error) { return QString::fromUtf8(error.what()); }
+    }));
 }

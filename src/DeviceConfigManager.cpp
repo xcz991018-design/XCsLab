@@ -43,12 +43,10 @@ bool mergeDuplicateDevices(QJsonObject& root) {
         }
         if (match < 0) { retained.append(incoming); continue; }
         auto existing = retained[match].toObject();
-        // Prefer a user-created, calibrated or active archive over a discovery placeholder.
+        // Prefer a user-created or calibrated archive over a discovery placeholder.
         const auto score = [&](const QJsonObject& device) {
             int result = automaticId(device["camera_id"].toString()) ? 0 : 1000;
-            const auto defaults = deviceToJson(DiscoveredCameraItem{}, true).value("calibration");
-            if (device.contains("calibration") && device["calibration"] != defaults) result += 100;
-            if (device["camera_id"] == system["last_active_device_id"]) result += 10;
+            if (deviceFromJson(device).hasCalibration) result += 100;
             if (!device["password"].toString().isEmpty()) result += 1;
             return result;
         };
@@ -58,9 +56,6 @@ bool mergeDuplicateDevices(QJsonObject& root) {
                 (existing[it.key()].isString() && existing[it.key()].toString().isEmpty()))
                 existing[it.key()] = it.value();
         }
-        existing["is_auto_connect"] = existing["is_auto_connect"].toBool() || incoming["is_auto_connect"].toBool();
-        if (system["last_active_device_id"] == incoming["camera_id"])
-            system["last_active_device_id"] = existing["camera_id"];
         retained[match] = existing;
         changed = true;
     }
@@ -78,8 +73,6 @@ bool removeLegacyDemoDevices(QJsonObject& root) {
         if (demoIds.contains(device["camera_id"].toString()) &&
             device["protocol_type"].toString() == "LOCAL_FILE") {
             removed = true;
-            if (system["last_active_device_id"] == device["camera_id"])
-                system["last_active_device_id"] = QString();
         } else retained.append(value);
     }
     if (removed) {
@@ -161,7 +154,7 @@ bool DeviceConfigManager::load(const QString& configPath) {
             const bool neverInitialized = !root.contains("system");
             if (neverInitialized) {
                 // Start from the DB records; do not import stale demo/local devices implicitly.
-                root["system"] = QJsonObject{{"auto_connect_on_startup", true}, {"last_active_device_id", ""}};
+                root["system"] = QJsonObject{};
                 repository.saveRegistry(MySqlRepository::sanitizedRegistry(root));
                 root = repository.loadRegistry();
             }
@@ -191,7 +184,6 @@ bool DeviceConfigManager::load(const QString& configPath) {
         }
     } else if (!hasLocal) {
         m_devices.clear();
-        m_lastActiveDeviceId.clear();
         locker.unlock();
         save(path);
         return true;
@@ -207,12 +199,6 @@ bool DeviceConfigManager::load(const QString& configPath) {
     migrated = removeLegacyDemoDevices(root) || migrated;
     migrated = mergeDuplicateDevices(root) || migrated;
 
-    if (root.contains("system")) {
-        QJsonObject sys = root["system"].toObject();
-        m_autoConnectOnStartup = sys.value("auto_connect_on_startup").toBool(true);
-        m_lastActiveDeviceId = sys.value("last_active_device_id").toString();
-    }
-
     QJsonArray devArr = root.value("devices").toArray();
     for (const auto& v : devArr) {
         if (!v.isObject()) continue;
@@ -223,19 +209,6 @@ bool DeviceConfigManager::load(const QString& configPath) {
         item.isOnline = false; // Current connectivity must be checked after restoring the archive.
 
         m_devices.insert(item.cameraId, item);
-    }
-
-    if (m_lastActiveDeviceId.isEmpty() || !m_devices.contains(m_lastActiveDeviceId)) {
-        m_lastActiveDeviceId.clear();
-        for (const auto& dev : m_devices) {
-            if (dev.isAutoConnect) {
-                m_lastActiveDeviceId = dev.cameraId;
-                break;
-            }
-        }
-        if (m_lastActiveDeviceId.isEmpty() && !m_devices.isEmpty()) {
-            m_lastActiveDeviceId = m_devices.firstKey();
-        }
     }
 
     if (migrated) {
@@ -258,8 +231,6 @@ bool DeviceConfigManager::save(const QString& configPath) {
 
     QJsonObject root;
     QJsonObject sys;
-    sys["auto_connect_on_startup"] = m_autoConnectOnStartup;
-    sys["last_active_device_id"] = m_lastActiveDeviceId;
     sys["updated_at"] = QDateTime::currentDateTime().toString("yyyy-MM-dd HH:mm:ss");
     root["system"] = sys;
 
@@ -363,7 +334,7 @@ void DeviceConfigManager::addOrUpdateDevice(const DiscoveredCameraItem& item, bo
     {
         QMutexLocker locker(&m_mutex);
         if (m_devices.contains(item.cameraId)) {
-            // Merge existing config (preserve user customName, credentials, autoConnect flag)
+            // Merge existing config (preserve user customName, credentials)
             auto& existing = m_devices[item.cameraId];
             if (!item.customName.isEmpty()) existing.customName = item.customName;
             if (!item.ipOrSn.isEmpty()) existing.ipOrSn = item.ipOrSn;
@@ -378,7 +349,6 @@ void DeviceConfigManager::addOrUpdateDevice(const DiscoveredCameraItem& item, bo
             if (!item.username.isEmpty()) existing.username = item.username;
             if (!item.password.isEmpty()) existing.password = item.password;
             if (!item.defaultProfileId.isEmpty()) existing.defaultProfileId = item.defaultProfileId;
-            existing.isAutoConnect = item.isAutoConnect;
             existing.isOnline = item.isOnline;
             existing.lastSeenTime = QDateTime::currentDateTime().toString("yyyy-MM-dd HH:mm:ss");
 
@@ -409,63 +379,12 @@ bool DeviceConfigManager::removeDevice(const QString& cameraId, bool autoSave) {
     {
         QMutexLocker locker(&m_mutex);
         removed = (m_devices.remove(cameraId) > 0);
-        if (m_lastActiveDeviceId == cameraId) {
-            m_lastActiveDeviceId = m_devices.isEmpty() ? "" : m_devices.firstKey();
-        }
+
     }
     if (removed && autoSave) {
         save();
     }
     return removed;
-}
-
-QString DeviceConfigManager::getLastActiveDeviceId() const {
-    QMutexLocker locker(&m_mutex);
-    return m_lastActiveDeviceId;
-}
-
-void DeviceConfigManager::setLastActiveDeviceId(const QString& id, bool autoSave) {
-    {
-        QMutexLocker locker(&m_mutex);
-        m_lastActiveDeviceId = id;
-    }
-    if (autoSave) {
-        save();
-    }
-}
-
-bool DeviceConfigManager::isAutoConnectEnabled() const {
-    QMutexLocker locker(&m_mutex);
-    return m_autoConnectOnStartup;
-}
-
-void DeviceConfigManager::setAutoConnectEnabled(bool enable, bool autoSave) {
-    {
-        QMutexLocker locker(&m_mutex);
-        m_autoConnectOnStartup = enable;
-    }
-    if (autoSave) {
-        save();
-    }
-}
-
-void DeviceConfigManager::setDeviceAutoConnect(const QString& cameraId, bool isAuto, bool autoSave) {
-    {
-        QMutexLocker locker(&m_mutex);
-        if (m_devices.contains(cameraId)) {
-            if (isAuto) {
-                // Clear other auto-connect flags if only one default is desired
-                for (auto& dev : m_devices) {
-                    dev.isAutoConnect = false;
-                }
-                m_lastActiveDeviceId = cameraId;
-            }
-            m_devices[cameraId].isAutoConnect = isAuto;
-        }
-    }
-    if (autoSave) {
-        save();
-    }
 }
 
 void DeviceConfigManager::markDeviceOnline(const QString& cameraId, bool online) {
@@ -487,12 +406,14 @@ void DeviceConfigManager::updateDeviceCalibration(const QString& cameraId,
                                                    double p3x, double p3y,
                                                    double cx, double cy,
                                                    double baseRadius,
-                                                   bool autoSave) {
+                                                   bool autoSave,
+                                                   const QJsonArray& scalePoints) {
     bool found = false;
     {
         QMutexLocker locker(&m_mutex);
         if (m_devices.contains(cameraId)) {
             auto& item = m_devices[cameraId];
+            item.hasCalibration = true;
             item.perspectiveEnabled = perspectiveEnabled;
             item.calibratedWidth = calibW;
             item.calibratedHeight = calibH;
@@ -502,6 +423,7 @@ void DeviceConfigManager::updateDeviceCalibration(const QString& cameraId,
             item.pt3_x = p3x; item.pt3_y = p3y;
             item.centerX = cx; item.centerY = cy;
             item.pointerBaseRadius = baseRadius;
+            item.scalePoints = scalePoints;
             found = true;
         }
     }

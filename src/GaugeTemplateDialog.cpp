@@ -53,7 +53,7 @@ public:
         m_unit->setObjectName("templateUnit");
         forms[0]->addRow(tr("模板编号"), m_id);
         forms[0]->addRow(tr("读数单位"), m_unit);
-        auto* hint = new QLabel(tr("角度参考：右侧 0°，下方 90°，左侧 180°，上方 270°。\n设备的透视标定和中心坐标仍在设备档案中单独设置。"), this);
+        auto* hint = new QLabel(tr("量程和数值增长方向由模板设置。\n每台设备必须在矫正图上完成轴心和刻度标定后才能识别。"), this);
         hint->setWordWrap(true);
         forms[0]->addRow(hint);
         for (const auto& field : GaugeTemplateStore::fields()) {
@@ -103,6 +103,7 @@ public:
     QJsonObject value() const {
         auto profile = m_original;
         profile.remove("profile_id");
+        profile.remove("min_angle_deg"); profile.remove("max_angle_deg");
         profile["gauge_id"] = m_id->text().trimmed();
         profile["unit"] = m_unit->text().trimmed();
         for (const auto& field : GaugeTemplateStore::fields()) {
@@ -263,10 +264,9 @@ void GaugeTemplateDialog::updateSelection() {
     const auto id = m_list->currentItem()->text();
     const auto profile = m_store.effectiveProfile(id);
     const auto devices = usedBy(id);
-    m_details->setText(tr("模板编号：%1\n\n量程：%2 ～ %3 %4\n刻度角度：%5° → %6°\n数值方向：%7\n\n使用设备：%8")
+    m_details->setText(tr("模板编号：%1\n\n量程：%2 ～ %3 %4\n数值方向：%5\n\n使用设备：%6")
         .arg(id).arg(profile["min_val"].toDouble()).arg(profile["max_val"].toDouble(1))
-        .arg(profile["unit"].toString("MPa")).arg(profile["min_angle_deg"].toDouble(135))
-        .arg(profile["max_angle_deg"].toDouble(45)).arg(profile["clockwise"].toBool(true) ? tr("顺时针") : tr("逆时针"))
+        .arg(profile["unit"].toString("MPa")).arg(profile["clockwise"].toBool(true) ? tr("顺时针") : tr("逆时针"))
         .arg(devices.isEmpty() ? tr("暂无") : devices.join("、")));
 }
 
@@ -277,6 +277,7 @@ void GaugeTemplateDialog::editProfile(bool creating, bool copying) {
     const auto effective = creating && !copying ? profile : m_store.effectiveProfile(GaugeTemplateStore::idOf(profile));
     if (copying) {
         profile.remove("profile_id");
+        profile.remove("min_angle_deg"); profile.remove("max_angle_deg");
         QString id = GaugeTemplateStore::idOf(profile) + "_COPY";
         int suffix = 2;
         while (m_store.ids().contains(id)) id = GaugeTemplateStore::idOf(profile) + "_COPY_" + QString::number(suffix++);

@@ -1,10 +1,12 @@
 #include "GaugeReaderEngine.hpp"
+#include "ScaleCalibration.hpp"
 #include "RecognitionQuality.hpp"
 #include <cmath>
 #include <iostream>
 #include <numeric>
 #include <algorithm>
 #include <filesystem>
+#include <chrono>
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -80,32 +82,6 @@ bool GaugeReaderEngine::locateDialCircle(const cv::Mat& gray, cv::Point2f& cente
     radius = bestRadius;
 
     return found;
-}
-
-double GaugeReaderEngine::detectPointerAngleRobust(const cv::Mat& gray, const cv::Point2f& center, float radius, const GaugeProfile& profile, cv::Mat* outScanVis) {
-    GaugeConfig cfg;
-    cfg.center = center;
-    cfg.radius = radius;
-    cfg.pointerMinAngle = profile.min_angle_deg;
-    cfg.pointerMaxAngle = profile.max_angle_deg;
-    cfg.clockwise = profile.clockwise;
-    cfg.pointerBaseRadius = profile.pointerBaseRadius;
-    cfg.pointerMinWidth = profile.pointerMinWidth;
-    cfg.pointerMaxWidth = profile.pointerMaxWidth;
-    cfg.pointerMinLength = profile.pointerMinLength;
-    cfg.coarseAngleStep = profile.coarseAngleStep;
-    cfg.fineAngleStep = profile.fineAngleStep;
-    cfg.fineAngleRange = profile.fineAngleRange;
-    cfg.minValidSectionRatio = profile.minValidSectionRatio;
-
-    // Forward optical polarity & dark entity constraints
-    cfg.requireDarkPointer = profile.require_dark_pointer;
-    cfg.minPointerDarkContrast = profile.min_pointer_dark_contrast;
-    cfg.maxPointerInsideGray = profile.max_pointer_inside_gray;
-
-    PointerDetector detector(cfg);
-    PointerResult ptrRes = detector.detect(gray, outScanVis);
-    return ptrRes.angle;
 }
 
 std::vector<cv::Point2f> GaugeReaderEngine::autoDetectCardinalPoints(const cv::Mat& image) {
@@ -249,6 +225,15 @@ cv::Mat GaugeReaderEngine::rectifyPerspective(const cv::Mat& src, const std::vec
 
 GaugeResult GaugeReaderEngine::process(const cv::Mat& frame, GaugeProfile& profile, GaugeRunMode mode) {
     GaugeResult res;
+    using Clock = std::chrono::steady_clock;
+    const auto engineStarted = Clock::now();
+    auto lastStage = engineStarted;
+    auto mark = [&](const char* name) {
+        const auto now = Clock::now();
+        res.stageTimings[name] = std::chrono::duration<double, std::milli>(now-lastStage).count();
+        lastStage = now;
+    };
+    auto finish = [&]() { res.stageTimings["engine_total_ms"] = std::chrono::duration<double, std::milli>(Clock::now()-engineStarted).count(); };
     res.runMode = mode;
     const bool debug = mode == GaugeRunMode::Debug;
     const bool evidence = mode != GaugeRunMode::Production;
@@ -258,13 +243,20 @@ GaugeResult GaugeReaderEngine::process(const cv::Mat& frame, GaugeProfile& profi
         res.errorStep = "步骤 1: 原始采集图像 (Original Stream Frame)";
         res.errorMessage = "输入图像帧为空 (frame is empty)";
         res.detailedDebugInfo = "❌ [Pipeline Error] 摄像头或输入图像源未采集到有效图像帧 (cv::Mat::empty)。";
-        return res;
+        finish(); return res;
     }
 
     // Step 1: 原图 (Original Frame)
     if (evidence) res.step1_original = frame.clone();
     if (debug) res.originalImage = res.step1_original;
 
+    if (profile.scalePoints.isEmpty()) {
+        res.errorStep="Scale calibration";
+        res.errorMessage="未完成手动刻度标定，请重新标定后识别";
+        finish(); return res;
+    }
+
+    mark("input_copy_ms");
     // Step 2: 视场矫正 (FOV Perspective Correction)
     cv::Mat workFrame = frame;
     cv::Mat invH;
@@ -313,9 +305,11 @@ GaugeResult GaugeReaderEngine::process(const cv::Mat& frame, GaugeProfile& profi
         workFrame = frame;
     }
 
+    mark("perspective_ms");
     if (evidence) res.step2_rectified = workFrame.clone();
     if (debug) res.rectifiedImage = workFrame;
 
+    mark("rectified_copy_ms");
     // Grayscale is the direct input to pointer detection.
     cv::Mat gray;
     if (workFrame.channels() == 3) {
@@ -324,9 +318,11 @@ GaugeResult GaugeReaderEngine::process(const cv::Mat& frame, GaugeProfile& profi
         gray = workFrame;
     }
     if (debug) res.grayImage = gray;
+    mark("grayscale_ms");
     // The core stages also need the actual detector input in evidence mode.
     if (evidence) cv::cvtColor(gray, res.step3_gray, cv::COLOR_GRAY2BGR);
 
+    mark("gray_preview_ms");
     // Step 4: 识别 (Dial Center, Pointer Angle, Value & Overlay Result)
     if (profile.perspective_correction_enabled && !profile.auto_detect_roi && profile.center.x > 0 && profile.center.y > 0 && !invH.empty()) {
         float sx = (profile.calibrated_width > 0) ? (static_cast<float>(frame.cols) / profile.calibrated_width) : 1.0f;
@@ -357,12 +353,36 @@ GaugeResult GaugeReaderEngine::process(const cv::Mat& frame, GaugeProfile& profi
         }
     }
 
+    // Transform all device scale points with the same homography as the hub.
+    ScaleCalibration::Mapping scaleMapping;
+    double minAngle=0, maxAngle=0;
+    {
+        const double sx = profile.calibrated_width>0 ? double(frame.cols)/profile.calibrated_width : 1;
+        const double sy = profile.calibrated_height>0 ? double(frame.rows)/profile.calibrated_height : 1;
+        const auto points = ScaleCalibration::scaled(profile.scalePoints,sx,sy);
+        if (profile.perspective_correction_enabled && invH.empty()) {
+            res.errorMessage="刻度标定无法应用：透视校正失败"; finish(); return res;
+        }
+        std::vector<cv::Point2f> hub{{float(profile.center.x*sx),float(profile.center.y*sy)}};
+        if (!invH.empty()) cv::perspectiveTransform(hub,hub,invH.inv());
+        if (!std::isfinite(hub[0].x) || !std::isfinite(hub[0].y) || hub[0].x<0 || hub[0].y<0 || hub[0].x>=gray.cols || hub[0].y>=gray.rows) {
+            res.errorMessage="刻度标定无法应用：轴心不在校正图像内"; finish(); return res;
+        }
+        res.center=hub[0];
+        if (!ScaleCalibration::valid(points,frame.cols,frame.rows,{float(profile.center.x*sx),float(profile.center.y*sy)}) ||
+            !ScaleCalibration::build(points,res.center,invH.empty()?cv::Mat():invH.inv(),profile.clockwise,scaleMapping)) {
+            res.errorStep = "Scale calibration";
+            res.errorMessage = "刻度标定无效：请检查端点、中间点顺序和数值增长方向";
+            finish(); return res;
+        }
+        minAngle=scaleMapping.angles.front(); maxAngle=scaleMapping.angles.back();
+    }
     // Configure PointerDetector
     GaugeConfig cfg;
     cfg.center = res.center;
     cfg.radius = res.radius;
-    cfg.pointerMinAngle = profile.min_angle_deg;
-    cfg.pointerMaxAngle = profile.max_angle_deg;
+    cfg.pointerMinAngle = minAngle;
+    cfg.pointerMaxAngle = maxAngle;
     cfg.clockwise = profile.clockwise;
     cfg.pointerBaseRadius = profile.pointerBaseRadius;
     cfg.pointerMinWidth = profile.pointerMinWidth;
@@ -422,11 +442,15 @@ GaugeResult GaugeReaderEngine::process(const cv::Mat& frame, GaugeProfile& profi
 
     PointerDetector detector(cfg);
 
+    mark("calibration_setup_ms");
     // Detection is identical across modes. Visualizations are optional outputs.
     cv::Mat rectOverlay;
     if (evidence) rectOverlay = workFrame.clone();
+    mark("overlay_copy_ms");
     res.pointerDetectorResult = detector.detect(gray, cv::Point2d(res.center.x, res.center.y),
                                                 debug ? &rectOverlay : nullptr);
+    mark("pointer_detection_ms");
+    res.stageTimings["pointer_details"] = res.pointerDetectorResult.stageTimings;
     if (debug) {
         res.diagnosticHudImage = res.pointerDetectorResult.hudImage;
         res.diagnosticText = res.pointerDetectorResult.hudText;
@@ -434,26 +458,25 @@ GaugeResult GaugeReaderEngine::process(const cv::Mat& frame, GaugeProfile& profi
 
     res.pointer_angle_deg = res.pointerDetectorResult.angle;
 
-    double minA = normalizeAngle(profile.min_angle_deg);
-    double maxA = normalizeAngle(profile.max_angle_deg);
+    double minA = normalizeAngle(minAngle);
+    double maxA = normalizeAngle(maxAngle);
     double ptrA = res.pointer_angle_deg;
 
     double totalSpanDeg = profile.clockwise ? std::fmod(maxA - minA + 360.0, 360.0)
                                             : std::fmod(minA - maxA + 360.0, 360.0);
-    if (totalSpanDeg < 1e-3) totalSpanDeg = 270.0;
 
     double ptrSpanDeg = profile.clockwise ? std::fmod(ptrA - minA + 360.0, 360.0)
                                           : std::fmod(minA - ptrA + 360.0, 360.0);
     if (ptrSpanDeg > totalSpanDeg && ptrSpanDeg > (360.0 - 25.0)) ptrSpanDeg = 0.0;
 
-    double fraction = ptrSpanDeg / totalSpanDeg;
-    fraction = std::max(0.0, std::min(1.0, fraction));
-
+    const double fraction = ScaleCalibration::ratio(scaleMapping, ptrSpanDeg);
     res.value = profile.min_val + fraction * (profile.max_val - profile.min_val);
     res.confidence = res.pointerDetectorResult.confidence;
     res.success = res.pointerDetectorResult.valid;
+    mark("value_mapping_ms");
     res.recognitionQuality = evaluateRecognitionQuality(res.pointerDetectorResult, profile.qualityConfig);
 
+    mark("quality_ms");
     if (!res.success) {
         res.errorStep = "灰度图指针检测 (Grayscale Pointer Detection)";
         res.errorMessage = res.pointerDetectorResult.failureReason.empty() ?
@@ -465,37 +488,39 @@ GaugeResult GaugeReaderEngine::process(const cv::Mat& frame, GaugeProfile& profi
         if (ptrSpanDeg > maxSpanAllowed && ptrSpanDeg < (360.0 - 15.0)) {
             char rangeWarn[256];
             snprintf(rangeWarn, sizeof(rangeWarn), "⚠️ [量程警告] 指针角度 (%.1f°) 超出标定量程跨度 [%.1f°, %.1f°] (超出 %.1f°)",
-                     res.pointer_angle_deg, profile.min_angle_deg, profile.max_angle_deg, ptrSpanDeg - totalSpanDeg);
+                     res.pointer_angle_deg, minAngle, maxAngle, ptrSpanDeg - totalSpanDeg);
             if (!res.centerInconsistent) {
                 res.warningMessage = rangeWarn;
             }
         }
     }
 
-    res.detailedDebugInfo += "\n" + qualitySummary(res.recognitionQuality).toStdString();
+    res.detailedDebugInfo += "\n" + qualitySummary(res.recognitionQuality).toUtf8().toStdString();
     float tipR = static_cast<float>(res.pointerDetectorResult.tipRadius > 0 ? res.pointerDetectorResult.tipRadius : (res.radius * 0.8f));
     double tipRad = res.pointer_angle_deg * M_PI / 180.0;
     res.pointer_tip = cv::Point2f(res.center.x + tipR * static_cast<float>(std::cos(tipRad)),
                                   res.center.y + tipR * static_cast<float>(std::sin(tipRad)));
 
+    mark("result_diagnostics_ms");
     if (debug) {
         res.overlayImage = frame.clone();
-        drawOverlay(res.overlayImage, profile, res, invH);
+        drawOverlay(res.overlayImage, profile, res, invH, minAngle, maxAngle);
     }
     if (evidence) {
         cv::Mat emptyInvH;
-        drawOverlay(rectOverlay, profile, res, emptyInvH);
+        drawOverlay(rectOverlay, profile, res, emptyInvH, minAngle, maxAngle);
         res.step4_recognition = rectOverlay;
     }
 
+    mark("rendering_ms");
     // Check calibration against the independently located hub.
     cv::Point2f autoCenter;
     float autoRadius{0.0f};
     locateDialCircle(gray, autoCenter, autoRadius);
 
-    cv::Point2f expectedCenter(gray.cols * 0.5f, gray.rows * 0.5f);
+    cv::Point2f expectedCenter = res.center;
     if (!profile.auto_detect_roi && profile.center.x > 0 && profile.center.y > 0 && !invH.empty()) {
-        std::vector<cv::Point2f> srcC = { profile.center };
+        std::vector<cv::Point2f> srcC = { {profile.center.x * (profile.calibrated_width>0?float(frame.cols)/profile.calibrated_width:1), profile.center.y * (profile.calibrated_height>0?float(frame.rows)/profile.calibrated_height:1)} };
         std::vector<cv::Point2f> dstC;
         cv::perspectiveTransform(srcC, dstC, invH.inv());
         expectedCenter = dstC[0];
@@ -514,6 +539,7 @@ GaugeResult GaugeReaderEngine::process(const cv::Mat& frame, GaugeProfile& profi
 
     }
 
+    mark("center_check_ms");
     if (debug && profile.save_debug_images) {
         std::filesystem::create_directories("debug_images");
         cv::imwrite("debug_images/original.png", res.step1_original);
@@ -522,10 +548,12 @@ GaugeResult GaugeReaderEngine::process(const cv::Mat& frame, GaugeProfile& profi
         cv::imwrite("debug_images/recognition.png", res.step4_recognition);
         if (!res.diagnosticHudImage.empty()) cv::imwrite("debug_images/diagnostic_hud.png", res.diagnosticHudImage);
     }
+    mark("debug_save_ms");
+    finish();
     return res;
 }
 
-void GaugeReaderEngine::drawOverlay(cv::Mat& canvas, const GaugeProfile& profile, const GaugeResult& res, const cv::Mat& invH) {
+void GaugeReaderEngine::drawOverlay(cv::Mat& canvas, const GaugeProfile& profile, const GaugeResult& res, const cv::Mat& invH, double minAngle, double maxAngle) {
     if (!res.success) {
         // Draw visual error diagnostic banner on canvas
         int boxW = std::min(canvas.cols - 20, 580);
@@ -639,8 +667,8 @@ void GaugeReaderEngine::drawOverlay(cv::Mat& canvas, const GaugeProfile& profile
     }
 
     // 2. Draw Zero & Max Scale Rays - Thin Lines (1 px)
-    double minRad = profile.min_angle_deg * M_PI / 180.0;
-    double maxRad = profile.max_angle_deg * M_PI / 180.0;
+    double minRad = minAngle * M_PI / 180.0;
+    double maxRad = maxAngle * M_PI / 180.0;
 
     cv::Point2f minP(res.center.x + res.radius * std::cos(minRad), res.center.y + res.radius * std::sin(minRad));
     cv::Point2f maxP(res.center.x + res.radius * std::cos(maxRad), res.center.y + res.radius * std::sin(maxRad));

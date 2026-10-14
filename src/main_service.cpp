@@ -85,6 +85,7 @@ int main(int argc, char** argv) {
         InspectionTask task;
         task.captureTimeoutMs = captureTimeout;
         task.device = device;
+        task.preferOnvifSnapshot = true;
         if (device.protocolType == CameraProtocolType::LOCAL_FILE)
             task.inputKind = InspectionInputKind::LocalImage;
         task.runMode = mode;

@@ -13,7 +13,7 @@
 /**
  * @brief Persistent Device Registry and Configuration Manager.
  * 
- * Manages device persistence (config/devices.json), auto-connection state machine,
+ * Manages device persistence (config/devices.json), device configuration,
  * network parameters, and device life-cycle management.
  */
 class DeviceConfigManager : public QObject {
@@ -32,13 +32,7 @@ public:
     void addOrUpdateDevice(const DiscoveredCameraItem& item, bool autoSave = true);
     bool removeDevice(const QString& cameraId, bool autoSave = true);
 
-    QString getLastActiveDeviceId() const;
-    void setLastActiveDeviceId(const QString& id, bool autoSave = true);
 
-    bool isAutoConnectEnabled() const;
-    void setAutoConnectEnabled(bool enable, bool autoSave = true);
-
-    void setDeviceAutoConnect(const QString& cameraId, bool isAuto, bool autoSave = true);
     void markDeviceOnline(const QString& cameraId, bool online);
 
     void updateDeviceCalibration(const QString& cameraId,
@@ -50,7 +44,8 @@ public:
                                  double p3x, double p3y,
                                  double cx, double cy,
                                  double baseRadius,
-                                 bool autoSave = true);
+                                 bool autoSave = true,
+                                 const QJsonArray& scalePoints = {});
 
     QString getConfigPath() const { return m_currentFilePath; }
     static QString resolveConfigPath(const QString& preferredPath = "");
@@ -68,8 +63,6 @@ private:
 
     mutable QMutex m_mutex;
     QMap<QString, DiscoveredCameraItem> m_devices;
-    QString m_lastActiveDeviceId;
-    bool m_autoConnectOnStartup{true};
     QString m_currentFilePath;
     QString m_lastError;
     QThreadPool m_databasePool;

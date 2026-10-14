@@ -42,6 +42,7 @@ int main(int argc, char** argv) {
         const QString id = request["camera_id"].toString();
         if (id == "hang") { QThread::sleep(60); return 3; }
         if (id == "crash") return 3;
+        if (id == "healthy" && !request["_prefer_onvif_snapshot"].toBool()) return 3;
         const QString folder = QString::fromLocal8Bit(argv[2]);
         cv::Mat frame(24, 24, CV_8UC3, cv::Scalar(40, 90, 120));
         if (!cv::imwrite((folder + "/frame.png").toStdString(), frame)) return 3;
@@ -68,6 +69,7 @@ int main(int argc, char** argv) {
     task.device.cameraId = "crash";
     if (isolatedCapture(task, cancel).failure != CaptureFailure::WorkerFailed) return 1;
     task.device.cameraId = "healthy";
+    task.preferOnvifSnapshot = true;
     const auto healthy = isolatedCapture(task, cancel);
     if (!healthy.ok() || healthy.frame.at<cv::Vec3b>(0, 0) != cv::Vec3b(40, 90, 120)) { fprintf(stderr, "healthy: %s\n", captureFailureName(healthy.failure)); return 1; }
     {

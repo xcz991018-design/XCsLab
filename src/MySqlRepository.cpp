@@ -6,6 +6,7 @@
 #include "MySqlTemplateSchema.hpp"
 #include "GaugeTemplateStore.hpp"
 #include "GaugeProfile.hpp"
+#include "DeviceCalibration.hpp"
 #include <mysql.h>
 #include <QCryptographicHash>
 #include <QJsonDocument>
@@ -184,6 +185,7 @@ public:
 };
 QJsonObject cleanDevice(QJsonObject d) {
     d.remove("password");
+    d.remove("is_auto_connect");
     QUrl url(d["rtsp_url"].toString()); url.setUserName(QString()); url.setPassword(QString());
     d["rtsp_url"] = url.toString(); return d;
 }
@@ -262,7 +264,9 @@ QString MySqlRepository::testConnection() const {
 QJsonObject MySqlRepository::sanitizedRegistry(QJsonObject registry) {
     QJsonArray devices;
     for (const auto& value : registry["devices"].toArray()) devices.append(cleanDevice(value.toObject()));
-    registry["devices"] = devices; return registry;
+    registry["devices"] = devices;
+    auto system=registry["system"].toObject(); system.remove("auto_connect_on_startup"); system.remove("last_active_device_id");
+    registry["system"]=system; return registry;
 }
 QJsonObject MySqlRepository::loadRegistry() const {
     Connection c(m_settings); QJsonArray devices;
@@ -272,6 +276,27 @@ QJsonObject MySqlRepository::loadRegistry() const {
     auto sys = c.exec("SELECT setting_json FROM runtime_settings WHERE setting_key='system'");
     if (!sys.empty()) result["system"] = QJsonDocument::fromJson(sys[0][0].value_or(QByteArray())).object();
     return result;
+}
+
+DiscoveredCameraItem MySqlRepository::loadDevice(const QString& cameraId) const {
+    Connection c(m_settings);
+    const auto rows = c.exec("SELECT archive_json FROM camera_archives WHERE camera_id=? AND deleted_at IS NULL", {cameraId.toUtf8()});
+    if (rows.empty()) fail("CAMERA_NOT_FOUND");
+    return deviceFromJson(QJsonDocument::fromJson(rows.front()[0].value_or(QByteArray())).object());
+}
+
+DiscoveredCameraItem MySqlRepository::saveCalibration(const QString& cameraId, const QJsonObject& calibration) const {
+    if (!validDeviceCalibration(calibration)) fail("INVALID_CAMERA_CALIBRATION");
+    Connection c(m_settings); Transaction tx(c);
+    const auto rows = c.exec("SELECT archive_json FROM camera_archives WHERE camera_id=? AND deleted_at IS NULL FOR UPDATE", {cameraId.toUtf8()});
+    if (rows.empty()) fail("CAMERA_NOT_FOUND");
+    auto archive = QJsonDocument::fromJson(rows.front()[0].value_or(QByteArray())).object();
+    auto confirmed = calibration; confirmed["calibration_confirmed"] = true;
+    archive["calibration"] = confirmed;
+    c.exec("UPDATE camera_archives SET archive_json=?,updated_at=? WHERE camera_id=?",
+           {json(archive), time(QDateTime::currentDateTimeUtc()), cameraId.toUtf8()});
+    tx.commit();
+    return deviceFromJson(archive);
 }
 void MySqlRepository::saveRegistry(const QJsonObject& registry) const {
     Connection c(m_settings); Transaction tx(c); QSet<QString> ids;
@@ -295,7 +320,7 @@ void MySqlRepository::saveRegistry(const QJsonObject& registry) const {
         if (!ids.contains(str(row[0]))) c.exec("UPDATE camera_archives SET enabled=0,deleted_at=?,updated_at=? WHERE camera_id=?",
             {time(QDateTime::currentDateTimeUtc()), time(QDateTime::currentDateTimeUtc()), row[0]});
     c.exec("INSERT INTO runtime_settings(setting_key,setting_json) VALUES('system',?)"
-        " ON DUPLICATE KEY UPDATE setting_json=VALUES(setting_json)", {json(registry["system"].toObject())});
+        " ON DUPLICATE KEY UPDATE setting_json=VALUES(setting_json)", {json(sanitizedRegistry(registry)["system"].toObject())});
     tx.commit();
 }
 
@@ -304,6 +329,7 @@ GaugeTemplateRecord templateRecord(const Row& row) {
     GaugeTemplateRecord record;
     record.id = str(row[0]);
     record.definition = QJsonDocument::fromJson(row[1].value_or(QByteArray())).object();
+    record.definition.remove("min_angle_deg"); record.definition.remove("max_angle_deg");
     record.revision = str(row[2]).toULongLong();
     if (record.definition.isEmpty() || record.definition["gauge_id"].toString() != record.id || !record.revision)
         fail("DATABASE_TEMPLATE_INVALID");
@@ -349,7 +375,8 @@ GaugeTemplateRecord MySqlRepository::loadTemplate(const QString& id) const {
     return record;
 }
 
-GaugeTemplateRecord MySqlRepository::saveTemplate(const QJsonObject& definition, quint64 expectedRevision) const {
+GaugeTemplateRecord MySqlRepository::saveTemplate(const QJsonObject& input, quint64 expectedRevision) const {
+    auto definition=input; definition.remove("min_angle_deg"); definition.remove("max_angle_deg");
     validateTemplate(definition);
     const auto id = definition["gauge_id"].toString();
     Connection c(m_settings); Transaction tx(c);
@@ -389,7 +416,8 @@ int MySqlRepository::importTemplates(const QList<QJsonObject>& definitions) cons
         validateTemplate(definition);
         const auto id = definition["gauge_id"].toString();
         if (unique.contains(id)) fail(QStringLiteral("迁移文件中的模板编号重复：%1").arg(id));
-        unique[id] = definition;
+        auto cleaned=definition; cleaned.remove("min_angle_deg"); cleaned.remove("max_angle_deg");
+        unique[id] = cleaned;
     }
     Connection c(m_settings); Transaction tx(c);
     int imported = 0;

@@ -13,6 +13,7 @@
  * @brief ONVIF Standard Device Metadata & Service Parameters.
  */
 struct ONVIFDeviceInfo {
+    bool preferHttpSnapshot{false};
     std::string xaddr;
     std::string ipAddress{"192.168.1.101"};
     int port{80};
@@ -43,6 +44,7 @@ public:
     bool captureSingleSnapshot(cv::Mat& frame) override;
     FrameCaptureResult readFrame() override;
     FrameCaptureResult captureSnapshot() override;
+    FrameCaptureResult captureHttpSnapshot();
     void close() override;
     bool isOpened() const override;
     std::string getSourceName() const override;

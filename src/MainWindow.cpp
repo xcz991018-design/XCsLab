@@ -1,6 +1,10 @@
 #include "MainWindow.hpp"
+#include <QBrush>
+#include <QColor>
+#include "InspectionCalibration.hpp"
 #include "RecognitionQuality.hpp"
 #include "CardinalSelectorDialog.hpp"
+#include "ScaleCalibration.hpp"
 #include "CameraInfoEditDialog.hpp"
 #include "GaugeTemplateDialog.hpp"
 #include <QFileDialog>
@@ -134,6 +138,13 @@ MainWindow::MainWindow(QWidget *parent) : QMainWindow(parent) {
     });
     connect(m_previewService, &CameraPreviewService::frameReady, this,
             [this](const QString& cameraId, const FrameCaptureResult& result) {
+        if (!result.ok()) m_cameraHasFrame = false;
+        if (result.ok()) {
+            if (!m_cameraHasFrame) m_calibrationChecked.remove(cameraId);
+            m_cameraHasFrame = true;
+            checkCameraCalibration(cameraId);
+            tryOpenCameraCalibration();
+        }
         if (!m_isLiveStreaming) return;
         if (m_discoveredItemsMap.contains(cameraId)) {
             DeviceConfigManager::instance().markDeviceOnline(cameraId, result.ok());
@@ -159,7 +170,7 @@ MainWindow::MainWindow(QWidget *parent) : QMainWindow(parent) {
     m_currentImagePath.clear();
     m_imagePathEdit->clear();
 
-    // Populate Camera List from Persistent Device Registry & Auto-Connect Previous Device
+    // Load the device list; preview starts only after user selection.
     loadAndRestoreSavedDevices();
 
     // Start background periodic network discovery without clearing user list
@@ -299,7 +310,7 @@ QWidget* MainWindow::createLeftSidebar(QWidget *parent) {
     sideLayout->setSpacing(8);
 
     // 1. Auto-Discovery & Devices Box
-    QGroupBox *devBox = new QGroupBox(tr("摄像头设备管理库 (开机自动连接 🟢 已就绪)"), sidebar);
+    QGroupBox *devBox = new QGroupBox(tr("摄像头设备管理库（点击设备查看实时画面）"), sidebar);
     QVBoxLayout *devLayout = new QVBoxLayout(devBox);
 
     QHBoxLayout *devBtnLayout = new QHBoxLayout();
@@ -353,8 +364,6 @@ QWidget* MainWindow::createLeftSidebar(QWidget *parent) {
     fileLayout->addLayout(imgFileLayout);
 
     fileLayout->addWidget(new QLabel(tr("算法模板：MySQL 数据库"), fileBox));
-    m_browseCfgBtn = new QPushButton(tr("管理表计算法模板…"), fileBox);
-    fileLayout->addWidget(m_browseCfgBtn);
     m_snapAndRunBtn = new QPushButton(tr("📷 拍摄并识别当前表计"), fileBox);
     m_snapAndRunBtn->setStyleSheet("background-color: #00897b; color: white; font-weight: bold; font-size: 13px; padding: 9px; border-radius: 6px;");
     fileLayout->addWidget(m_snapAndRunBtn);
@@ -363,9 +372,6 @@ QWidget* MainWindow::createLeftSidebar(QWidget *parent) {
     m_batchPatrolBtn->setStyleSheet("background-color: #0288d1; color: white; font-weight: bold; font-size: 13px; padding: 8px; border-radius: 6px;");
     fileLayout->addWidget(m_batchPatrolBtn);
 
-    m_calibrateBtn = new QPushButton(tr("🎯 视场切点校准"), fileBox);
-    m_calibrateBtn->setStyleSheet("background-color: #37474f; color: #00e5ff; border: 1px solid #00acc1; font-weight: bold; padding: 6px; border-radius: 4px;");
-    fileLayout->addWidget(m_calibrateBtn);
 
     m_runModeCombo = new QComboBox(fileBox);
     m_runModeCombo->addItem(tr("生产模式：读数与原图留存"), int(GaugeRunMode::Production));
@@ -389,14 +395,12 @@ QWidget* MainWindow::createLeftSidebar(QWidget *parent) {
     m_cfgGisInfo = new QLabel(tr("GIS 坐标: -"), profileBox);
     m_cfgGaugeSpec = new QLabel(tr("表头规格: -"), profileBox);
     m_cfgRange = new QLabel(tr("量程范围: -"), profileBox);
-    m_cfgAngleRange = new QLabel(tr("刻度角度: -"), profileBox);
 
     profLayout->addWidget(m_cfgGaugeId);
     profLayout->addWidget(m_cfgLocationInfo);
     profLayout->addWidget(m_cfgGisInfo);
     profLayout->addWidget(m_cfgGaugeSpec);
     profLayout->addWidget(m_cfgRange);
-    profLayout->addWidget(m_cfgAngleRange);
     sideLayout->addWidget(profileBox);
 
     // 4. Metrics Summary Card
@@ -427,14 +431,12 @@ QWidget* MainWindow::createLeftSidebar(QWidget *parent) {
     connect(m_addDeviceBtn, &QPushButton::clicked, this, &MainWindow::onAddNewDevice);
     connect(m_removeDeviceBtn, &QPushButton::clicked, this, &MainWindow::onRemoveSelectedDevice);
     connect(m_deviceFilterEdit, &QLineEdit::textChanged, this, &MainWindow::onFilterDeviceList);
-    connect(m_deviceListWidget, &QListWidget::itemSelectionChanged, this, &MainWindow::onCameraSelectionChanged);
-    connect(m_deviceListWidget, &QListWidget::itemDoubleClicked, this, &MainWindow::onEditCameraInfo);
+    connect(m_deviceListWidget, &QListWidget::itemClicked, this, &MainWindow::onCameraSelectionChanged);
+    connect(m_deviceListWidget, &QListWidget::itemActivated, this, &MainWindow::onCameraSelectionChanged);
     connect(m_deviceListWidget, &QListWidget::customContextMenuRequested, this, &MainWindow::onDeviceCustomContextMenu);
     connect(m_browseImgBtn, &QPushButton::clicked, this, &MainWindow::onSelectImage);
-    connect(m_browseCfgBtn, &QPushButton::clicked, this, &MainWindow::onManageGaugeTemplates);
     connect(m_snapAndRunBtn, &QPushButton::clicked, this, &MainWindow::onCaptureAndRecognizeCurrent);
     connect(m_batchPatrolBtn, &QPushButton::clicked, this, &MainWindow::onStartAllDevicesInspection);
-    connect(m_calibrateBtn, &QPushButton::clicked, this, &MainWindow::onCalibrateCardinalPoints);
     connect(m_runBtn, &QPushButton::clicked, this, &MainWindow::onRunRecognition);
 
     return sidebar;
@@ -555,7 +557,7 @@ QWidget* MainWindow::createLiveStreamStageArea(QWidget *parent) {
     m_liveStreamLabel->setAlignment(Qt::AlignCenter);
     m_liveStreamLabel->setMinimumSize(520, 380);
     m_liveStreamLabel->setStyleSheet("background-color: #0a0b0e; border: 1px solid #232635; border-radius: 4px;");
-    m_liveStreamLabel->setText(tr("<font color='#555868'>正在初始化摄像头视频流...请在左侧列表中点击选择设备</font>"));
+    m_liveStreamLabel->setText(tr("<font color='#555868'>请在左侧列表中手动选择设备以查看实时画面</font>"));
 
     streamLayout->addWidget(m_liveStreamLabel, 1);
     splitter->addWidget(streamBox);
@@ -649,6 +651,10 @@ void MainWindow::loadAndRestoreSavedDevices() {
         return;
     }
 
+    if (m_previewService) m_previewService->select(InspectionTask());
+    m_cameraHasFrame=false;
+    m_liveStreamLabel->clear();
+    m_liveStreamLabel->setText(tr("请在左侧列表中手动选择设备以查看实时画面。"));
     m_deviceListWidget->clear();
     m_discoveredItemsMap.clear();
 
@@ -667,26 +673,6 @@ void MainWindow::loadAndRestoreSavedDevices() {
 
     if (m_statusCameraCountBadge) {
         m_statusCameraCountBadge->setText(tr("📷 在库设备: %1 台").arg(m_discoveredItemsMap.size()));
-    }
-
-    // Determine target device to auto-connect on startup
-    QString targetId;
-    if (DatabaseSettings::fromEnvironment().enabled) {
-        targetId = DeviceConfigManager::instance().getLastActiveDeviceId();
-    }
-    if (targetId.isEmpty() && DeviceConfigManager::instance().isAutoConnectEnabled()) {
-        for (const auto& device : devices) {
-            if (device.isAutoConnect) { targetId = device.cameraId; break; }
-        }
-    }
-    QListWidgetItem *targetItem = findListItemByCameraId(targetId);
-
-    if (targetItem) {
-        m_deviceListWidget->setCurrentItem(targetItem);
-        switchActiveCameraSource(targetId);
-        QString devName = m_discoveredItemsMap.value(targetId).customName;
-        if (devName.isEmpty()) devName = m_discoveredItemsMap.value(targetId).modelName;
-        onLogReceived(tr("[SYSTEM] 正在尝试连接已配置的自动连接设备: %1 (%2)，连接结果以实际采集为准。").arg(targetId).arg(devName));
     }
 
     // Initialize or sync inspection matrix table with all saved devices
@@ -748,21 +734,29 @@ void MainWindow::updateDeviceListItemWidget(QListWidgetItem* item, const Discove
     if (!item) return;
 
     QString statusIcon = data.isOnline ? "🟢" : "🔴";
-    QString starIcon = data.isAutoConnect ? " ⭐[自连]" : "";
     QString nameText = data.customName.isEmpty() ? data.modelName : data.customName;
+    const bool calibrated = data.hasCalibration &&
+        hasSavedDeviceCalibration(deviceToJson(data)["calibration"].toObject());
+    const QString calibrationStatus = calibrated ? tr("已标定") : tr("未标定");
+    const QString calibrationBadge = calibrated ? tr("✅[已标定]") : tr("🟠[未标定]");
 
-    QString line1 = QString("%1 %2 (%3)%4")
+    QString line1 = QString("%1 %2 %3 (%4)")
                         .arg(statusIcon)
+                        .arg(calibrationBadge)
                         .arg(data.cameraId)
-                        .arg(nameText)
-                        .arg(starIcon);
+                        .arg(nameText);
 
     QString line2 = QString("   地址/SN: %1 | %2")
                         .arg(data.ipOrSn)
                         .arg(data.protocolName);
 
     item->setText(line1 + "\n" + line2);
-    item->setToolTip(tr("设备编号: %1\n名称备注: %2\n地址/SN: %3\n通信协议: %4\n端口: %5 (RTSP: %6)\n默认表计: %7\n开机自连: %8\n在线状态: %9\n\n💡 提示: 双击或右键可编辑网络连接参数与表计档案")
+    item->setForeground(QBrush(QColor(calibrated ? "#e0e0e0" : "#ffb74d")));
+    item->setBackground(QBrush(QColor(calibrated ? "#12131a" : "#302316")));
+    auto font = item->font();
+    font.setBold(!calibrated);
+    item->setFont(font);
+    item->setToolTip(tr("设备编号: %1\n名称备注: %2\n地址/SN: %3\n通信协议: %4\n端口: %5 (RTSP: %6)\n默认表计: %7\n在线状态: %8\n表计标定: %9\n\n💡 提示: 右键可编辑设备档案或进行表计标定")
                          .arg(data.cameraId)
                          .arg(nameText)
                          .arg(data.ipOrSn)
@@ -770,8 +764,8 @@ void MainWindow::updateDeviceListItemWidget(QListWidgetItem* item, const Discove
                          .arg(data.port)
                          .arg(data.rtspPort)
                          .arg(data.defaultProfileId)
-                         .arg(data.isAutoConnect ? tr("是 (默认启动自连)") : tr("否"))
-                         .arg(data.isOnline ? tr("在线") : tr("离线")));
+                         .arg(data.isOnline ? tr("在线") : tr("离线"))
+                         .arg(calibrated ? calibrationStatus : tr("未标定，请先完成标定后再识别或巡检")));
 }
 
 QListWidgetItem* MainWindow::findListItemByCameraId(const QString& camId) {
@@ -798,6 +792,11 @@ void MainWindow::onTriggerAutoDiscovery() {
 }
 
 void MainWindow::onDiscoveredCameraAdded(const DiscoveredCameraItem& item) {
+    // Defer full registry snapshots until calibration commits and updates the cache.
+    if (m_calibrationDialogOpen) {
+        QTimer::singleShot(250, this, [this, item]() { onDiscoveredCameraAdded(item); });
+        return;
+    }
     if (DatabaseSettings::fromEnvironment().enabled && !m_registryLoaded) {
         // Do not submit an incomplete snapshot that could replace DB archives.
         m_discoveredItemsMap[item.cameraId] = item;
@@ -825,9 +824,6 @@ void MainWindow::onDiscoveredCameraAdded(const DiscoveredCameraItem& item) {
     }
     updateDeviceListItemWidget(listItem, registered);
 
-    if (!m_deviceListWidget->currentItem() && registered.protocolType == CameraProtocolType::ONVIF_RTSP_STREAM) {
-        m_deviceListWidget->setCurrentItem(listItem);
-    }
 
     if (m_deviceFilterEdit) {
         QString filterKey = m_deviceFilterEdit->text().trimmed().toLower();
@@ -856,8 +852,7 @@ void MainWindow::onAddNewDevice() {
             it->setData(Qt::UserRole, newItem.cameraId);
         }
         updateDeviceListItemWidget(it, newItem);
-        m_deviceListWidget->setCurrentItem(it);
-        switchActiveCameraSource(newItem.cameraId);
+        onLogReceived(tr("[DEVICE] 请在设备列表中手动选择该设备以查看实时画面。"));
 
         if (m_statusCameraCountBadge) {
             m_statusCameraCountBadge->setText(tr("📷 在库设备: %1 台").arg(m_discoveredItemsMap.size()));
@@ -884,7 +879,12 @@ void MainWindow::onRemoveSelectedDevice() {
         onLogReceived(tr("[DEVICE] 已从设备库中删除摄像头: %1").arg(camId));
 
         if (m_deviceListWidget->count() > 0) {
-            m_deviceListWidget->setCurrentRow(0);
+            m_deviceListWidget->clearSelection();
+            m_deviceListWidget->setCurrentItem(nullptr);
+            if (m_previewService) m_previewService->select(InspectionTask());
+            m_cameraHasFrame=false;
+            m_liveStreamLabel->clear();
+            m_liveStreamLabel->setText(tr("请在左侧列表中手动选择设备以查看实时画面。"));
         } else {
             if (m_singleService) m_singleService->stop();
             if (m_previewService) m_previewService->select(InspectionTask());
@@ -899,39 +899,20 @@ void MainWindow::onRemoveSelectedDevice() {
     }
 }
 
-void MainWindow::onSetDeviceAsDefaultAutoConnect() {
-    QListWidgetItem *curr = m_deviceListWidget->currentItem();
-    if (!curr) return;
-
-    QString camId = curr->data(Qt::UserRole).toString();
-    DeviceConfigManager::instance().setDeviceAutoConnect(camId, true, true);
-
-    // Refresh UI item states
-    for (int i = 0; i < m_deviceListWidget->count(); ++i) {
-        QListWidgetItem *it = m_deviceListWidget->item(i);
-        QString cid = it->data(Qt::UserRole).toString();
-        DiscoveredCameraItem item = DeviceConfigManager::instance().getDevice(cid);
-        m_discoveredItemsMap[cid] = item;
-        updateDeviceListItemWidget(it, item);
-    }
-
-    onLogReceived(tr("[DEVICE] ⭐ 已将摄像头 [%1] 设为开机默认自动连接设备。").arg(camId));
-    QMessageBox::information(this, tr("设置成功"), tr("已将摄像头 [%1] 设为开机默认自动连接设备！\n下次打开软件将直接连接此摄像头。").arg(camId));
-}
-
 void MainWindow::onDeviceCustomContextMenu(const QPoint& pos) {
     QListWidgetItem *item = m_deviceListWidget->itemAt(pos);
     QMenu menu(this);
 
     if (item) {
+        m_deviceListWidget->setCurrentItem(item);
         QString camId = item->data(Qt::UserRole).toString();
         menu.addAction(tr("⚡ 立即连接此设备"), this, [this, camId]() {
             switchActiveCameraSource(camId);
         });
-        menu.addAction(tr("⭐ 设为开机默认自动连接设备"), this, &MainWindow::onSetDeviceAsDefaultAutoConnect);
         menu.addAction(tr("✏️ 编辑设备网络参数与表计档案..."), this, [this, item]() {
             onEditCameraInfo(item);
         });
+        menu.addAction(tr("🎯 表计标定..."), this, &MainWindow::onCalibrateCardinalPoints);
         menu.addAction(tr("🗑️ 从设备库移除此设备"), this, &MainWindow::onRemoveSelectedDevice);
         menu.addSeparator();
     }
@@ -986,6 +967,11 @@ void MainWindow::onCameraSelectionChanged() {
 
 void MainWindow::switchActiveCameraSource(const QString& camId) {
     if (!m_discoveredItemsMap.contains(camId)) return;
+    m_cameraHasFrame = false;
+    ++m_cameraConnectionGeneration;
+    m_calibrationChecked.remove(camId);
+    m_calibrationQueries.clear();
+    m_pendingCalibrationCamera.clear();
     if (m_singleService && m_singleService->isRunning()) m_singleService->stop();
     m_hasAnalysisInput = m_hasSnapshotInput = false;
     m_latestResult = GaugeResult();
@@ -1005,7 +991,6 @@ void MainWindow::switchActiveCameraSource(const QString& camId) {
     updateImageCard(m_capturedSnapshotLabel, cv::Mat(), "Snapshot");
     m_liveStreamLabel->clear();
     m_liveStreamLabel->setText(tr("正在连接所选设备..."));
-    DeviceConfigManager::instance().setLastActiveDeviceId(camId, true);
     InspectionTask task;
     task.device = m_discoveredItemsMap.value(camId);
     m_previewService->select(task);
@@ -1018,7 +1003,6 @@ void MainWindow::applyCameraCalibrationAndProfile(const QString& camId) {
     const auto profileId = m_discoveredItemsMap[camId].defaultProfileId.isEmpty()
         ? QStringLiteral("PRESSURE_GAUGE_1.6MPA") : m_discoveredItemsMap[camId].defaultProfileId;
     m_profileReady = false;
-    m_calibrateBtn->setEnabled(false);
     m_cfgRange->setText(tr("量程范围：正在读取数据库模板…"));
     using ProfileReply = QPair<QJsonObject, QString>;
     auto* watcher = new QFutureWatcher<ProfileReply>(this);
@@ -1050,15 +1034,14 @@ void MainWindow::applyCameraCalibrationAndProfile(const QString& camId) {
         cv::Point2f(static_cast<float>(item.pt2_x), static_cast<float>(item.pt2_y)),
         cv::Point2f(static_cast<float>(item.pt3_x), static_cast<float>(item.pt3_y))
         };
+        m_profile.scalePoints = item.scalePoints;
         m_profile.center = cv::Point2f(static_cast<float>(item.centerX), static_cast<float>(item.centerY));
         m_profile.pointerBaseRadius = item.pointerBaseRadius;
         m_profile.calibrated_width = item.calibratedWidth;
         m_profile.calibrated_height = item.calibratedHeight;
         m_profile.auto_detect_roi = false;
         m_profileReady = true;
-        m_calibrateBtn->setEnabled(true);
         m_cfgRange->setText(tr("量程范围：%1 ～ %2 %3").arg(m_profile.min_val).arg(m_profile.max_val).arg(QString::fromStdString(m_profile.unit)));
-        m_cfgAngleRange->setText(tr("刻度角度：%1° → %2°").arg(m_profile.min_angle_deg).arg(m_profile.max_angle_deg));
     });
     watcher->setFuture(QtConcurrent::run([profileId]() -> ProfileReply {
         try { return {MySqlRepository().loadTemplate(profileId).definition, QString()}; }
@@ -1136,7 +1119,7 @@ void MainWindow::onTabChanged(int index) {
 }
 
 void MainWindow::onUpdateLiveStreamFrame() {
-    if (m_isLiveStreaming && m_previewService) m_previewService->requestFrame();
+    if ((m_isLiveStreaming || !m_pendingCalibrationCamera.isEmpty()) && m_previewService) m_previewService->requestFrame();
 }
 
 void MainWindow::onLogReceived(const QString& logMsg) {
@@ -1167,24 +1150,110 @@ void MainWindow::onManageGaugeTemplates() {
     dialog.exec();
 }
 void MainWindow::onCalibrateCardinalPoints() {
-    const QString activeCam = makeSingleTask().device.cameraId;
-    if (!m_profileReady || !m_hasAnalysisInput || m_currentFrame.empty() || m_analysisInput.device.cameraId != activeCam) {
-        QMessageBox::warning(this, tr("标定图像未指定"), tr("请为当前设备明确选择本地图像或成功抓拍；不能使用其他设备的图像标定。"));
-        return;
-    }
+    const QString cameraId = makeSingleTask().device.cameraId;
+    if (!m_discoveredItemsMap.contains(cameraId)) return;
+    m_calibrationChecked.remove(cameraId);
+    m_pendingCalibrationCamera = cameraId;
+    m_statusLabel->setText(tr("正在获取设备 %1 的实时标定底图…").arg(cameraId));
+    checkCameraCalibration(cameraId);
+    tryOpenCameraCalibration();
+    m_previewService->requestFrame();
+}
 
-    CardinalSelectorDialog dialog(m_currentFrame, m_profile, activeCam, this);
-    if (dialog.exec() == QDialog::Accepted) {
-        DeviceConfigManager::instance().load();
-        if (m_discoveredItemsMap.contains(activeCam)) {
-            m_discoveredItemsMap[activeCam] = DeviceConfigManager::instance().getDevice(activeCam);
+void MainWindow::checkCameraCalibration(const QString& cameraId) {
+    if (cameraId != makeSingleTask().device.cameraId || m_calibrationChecked.contains(cameraId) ||
+        m_calibrationQueries.contains(cameraId) || !m_registryLoaded) return;
+    m_calibrationQueries.insert(cameraId);
+    const auto generation = m_cameraConnectionGeneration;
+    using Reply = QPair<DiscoveredCameraItem, QString>;
+    auto* watcher = new QFutureWatcher<Reply>(this);
+    connect(watcher, &QFutureWatcher<Reply>::finished, this, [this, watcher, cameraId, generation]() {
+        const auto reply = watcher->result();
+        watcher->deleteLater();
+        if (generation != m_cameraConnectionGeneration) return;
+        m_calibrationQueries.remove(cameraId);
+        m_calibrationChecked.insert(cameraId);
+        if (!reply.second.isEmpty()) {
+            onLogReceived(tr("[CALIBRATION] 设备 %1 标定查询失败: %2；请保存设备档案后从右键菜单重试。").arg(cameraId, reply.second));
+            m_statusLabel->setText(tr("设备 %1 标定查询失败，请从右键菜单重试。").arg(cameraId));
+            m_pendingCalibrationCamera.clear();
+            return;
         }
-        applyCameraCalibrationAndProfile(activeCam);
-        m_analysisInput.device = m_discoveredItemsMap.value(activeCam);
-        m_analysisInput.useHistoricalConfiguration = false;
-        m_analysisInput.historicalProfile = QJsonObject();
-        onRunRecognition();
-    }
+        // Keep connection credentials from the in-memory archive.
+        auto& item = m_discoveredItemsMap[cameraId];
+        const auto& saved = reply.first;
+        item.hasCalibration = saved.hasCalibration;
+        item.perspectiveEnabled = saved.perspectiveEnabled;
+        item.calibratedWidth = saved.calibratedWidth; item.calibratedHeight = saved.calibratedHeight;
+        item.pt0_x = saved.pt0_x; item.pt0_y = saved.pt0_y;
+        item.pt1_x = saved.pt1_x; item.pt1_y = saved.pt1_y;
+        item.pt2_x = saved.pt2_x; item.pt2_y = saved.pt2_y;
+        item.pt3_x = saved.pt3_x; item.pt3_y = saved.pt3_y;
+        item.centerX = saved.centerX; item.centerY = saved.centerY;
+        item.pointerBaseRadius = saved.pointerBaseRadius;
+        item.scalePoints = saved.scalePoints;
+        if (auto* row = findListItemByCameraId(cameraId)) updateDeviceListItemWidget(row, item);
+        if (!saved.hasCalibration) {
+            m_pendingCalibrationCamera = cameraId;
+            onLogReceived(tr("[CALIBRATION] 设备 %1 未保存表计标定，请手动标定。").arg(cameraId));
+        }
+        tryOpenCameraCalibration();
+    });
+    watcher->setFuture(QtConcurrent::run([cameraId]() -> Reply {
+        try {
+            DeviceConfigManager::instance().waitForDatabaseWrites();
+            return {MySqlRepository().loadDevice(cameraId), QString()};
+        } catch (const std::exception& error) { return {{}, QString::fromUtf8(error.what())}; }
+    }));
+}
+
+void MainWindow::tryOpenCameraCalibration() {
+    const QString cameraId = m_pendingCalibrationCamera;
+    if (cameraId.isEmpty() || cameraId != makeSingleTask().device.cameraId || m_calibrationDialogOpen ||
+        !m_calibrationChecked.contains(cameraId) || m_calibrationQueries.contains(cameraId)) return;
+    const auto frame = m_previewService->snapshot(cameraId);
+    if (!frame.ok()) return;
+    m_pendingCalibrationCamera.clear();
+    m_calibrationDialogOpen = true;
+    // Queue the modal window outside the frame callback. Freeze this camera's real frame.
+    QTimer::singleShot(0, this, [this, cameraId, frame]() {
+        if (cameraId != makeSingleTask().device.cameraId) {
+            m_calibrationDialogOpen = false;
+            return;
+        }
+        const auto device = m_discoveredItemsMap.value(cameraId);
+        GaugeProfile profile = m_profile;
+        profile.scalePoints = {};
+        profile.perspective_correction_enabled = device.hasCalibration;
+        if (device.hasCalibration) {
+            const float sx = device.calibratedWidth > 0 ? float(frame.frame.cols) / device.calibratedWidth : 1;
+            const float sy = device.calibratedHeight > 0 ? float(frame.frame.rows) / device.calibratedHeight : 1;
+            profile.perspective_pts = {{float(device.pt0_x)*sx, float(device.pt0_y)*sy},
+                {float(device.pt1_x)*sx, float(device.pt1_y)*sy},
+                {float(device.pt2_x)*sx, float(device.pt2_y)*sy}, {float(device.pt3_x)*sx, float(device.pt3_y)*sy}};
+            profile.center = {float(device.centerX)*sx, float(device.centerY)*sy};
+            profile.scalePoints = ScaleCalibration::scaled(device.scalePoints,sx,sy);
+            profile.pointerBaseRadius = device.pointerBaseRadius * (sx+sy)/2;
+        } else {
+            profile.perspective_pts.clear();
+            profile.center = {-1, -1};
+        }
+        CardinalSelectorDialog dialog(frame.frame, profile, cameraId, this);
+        if (!device.hasCalibration)
+            dialog.setWindowTitle(tr("设备 %1 尚未标定 — 请完成表计标定并保存").arg(cameraId));
+        if (dialog.exec() == QDialog::Accepted) {
+            m_discoveredItemsMap[cameraId] = DeviceConfigManager::instance().getDevice(cameraId);
+            if (auto* row = findListItemByCameraId(cameraId))
+                updateDeviceListItemWidget(row, m_discoveredItemsMap.value(cameraId));
+            if (m_analysisInput.device.cameraId == cameraId && !m_analysisInput.useHistoricalConfiguration)
+                m_analysisInput.device = m_discoveredItemsMap.value(cameraId);
+            if (m_snapshotInput.device.cameraId == cameraId)
+                m_snapshotInput.device = m_discoveredItemsMap.value(cameraId);
+            if (cameraId == makeSingleTask().device.cameraId) applyCameraCalibrationAndProfile(cameraId);
+            onLogReceived(tr("[CALIBRATION] 设备 %1 的表计标定已保存到 MySQL。").arg(cameraId));
+        }
+        m_calibrationDialogOpen = false;
+    });
 }
 
 void MainWindow::onEditCameraInfo(QListWidgetItem *item) {
@@ -1202,8 +1271,8 @@ void MainWindow::onEditCameraInfo(QListWidgetItem *item) {
 
         QListWidgetItem *it = findListItemByCameraId(newCamId);
         if (it) {
-            m_deviceListWidget->setCurrentItem(it);
-            switchActiveCameraSource(newCamId);
+            m_deviceListWidget->clearSelection();
+            m_deviceListWidget->setCurrentItem(nullptr);
         }
     }
 }
@@ -1221,6 +1290,17 @@ InspectionTask MainWindow::makeSingleTask() const {
 
 void MainWindow::submitSingleTask(InspectionTask task) {
     if (m_singleService->isRunning()) return;
+    if (task.inputKind != InspectionInputKind::HistoricalImage || !task.useHistoricalConfiguration) {
+        if (m_discoveredItemsMap.contains(task.device.cameraId))
+            task.device = m_discoveredItemsMap.value(task.device.cameraId);
+    }
+    if (requiresInspectionCalibration(task)) {
+        const auto message = tr("设备 %1 尚未完成表计标定，不能进行识别。\n请在设备列表中右键该设备，选择“表计标定”并保存。").arg(task.device.cameraId);
+        m_statusLabel->setText(tr("请先完成设备 %1 的表计标定。").arg(task.device.cameraId));
+        onLogReceived(tr("[CALIBRATION] %1").arg(message));
+        QMessageBox::warning(this, tr("请先完成表计标定"), message);
+        return;
+    }
     task.outputDirectory = QCoreApplication::applicationDirPath() + "/inspection_snapshots";
     task.runMode = static_cast<GaugeRunMode>(m_runModeCombo->currentData().toInt());
     task.returnImages = true;
@@ -1523,11 +1603,33 @@ void MainWindow::onCaptureAndRecognizeCurrent() {
 void MainWindow::onStartAllDevicesInspection() {
     if (m_isPatrolRunning) return;
 
-    DeviceConfigManager::instance().load();
+    if (!DeviceConfigManager::instance().load()) {
+        const auto message = tr("无法读取设备档案及标定数据，本次巡检未启动：%1").arg(DeviceConfigManager::instance().lastError());
+        onLogReceived(tr("[PATROL] %1").arg(message));
+        m_inspectionSummaryLabel->setText(message);
+        if (sender() != m_autoPatrolTimer) QMessageBox::warning(this, tr("巡检未启动"), message);
+        return;
+    }
     QList<DiscoveredCameraItem> devices = DeviceConfigManager::instance().getAllDevices();
     if (devices.isEmpty()) {
         QMessageBox::information(this, tr("提示"), tr("当前设备库为空，请先添加摄像头设备！"));
         return;
+    }
+
+    QStringList uncalibrated;
+    for (auto it = devices.begin(); it != devices.end();) {
+        if (!canRecognizeDevice(*it)) {
+            uncalibrated.append(it->cameraId);
+            it = devices.erase(it);
+        } else ++it;
+    }
+    if (!uncalibrated.isEmpty()) {
+        const auto message = tr("以下设备尚未完成表计标定，已排除在本次全站批量巡检之外：\n%1\n请右键对应设备，完成“表计标定”并保存。").arg(uncalibrated.join("\n"));
+        onLogReceived(tr("[CALIBRATION] %1").arg(message));
+        m_inspectionSummaryLabel->setText(tr("未标定设备已跳过：%1 台；请先完成表计标定。").arg(uncalibrated.size()));
+        if (sender() != m_autoPatrolTimer)
+            QMessageBox::warning(this, tr("请先完成表计标定"), message);
+        if (devices.isEmpty()) return;
     }
 
     m_isPatrolRunning = true;
@@ -1593,6 +1695,7 @@ void MainWindow::onStartAllDevicesInspection() {
     for (const auto& device : devices) {
         InspectionTask task;
         task.device = device;
+        task.preferOnvifSnapshot = true;
         if (device.protocolType == CameraProtocolType::LOCAL_FILE) task.inputKind = InspectionInputKind::LocalImage;
         task.runMode = static_cast<GaugeRunMode>(m_runModeCombo->currentData().toInt());
         task.localImagePath = m_hasAnalysisInput && m_analysisInput.inputKind == InspectionInputKind::LocalImage
@@ -1635,13 +1738,40 @@ void MainWindow::onInspectionOutcome(const InspectionOutcome& outcome) {
     rec.originalPath = outcome.originalPath;
     rec.step4Path = outcome.recognitionPath;
     rec.diagnosticText = outcome.errorMessage.isEmpty()
-        ? QString::fromStdString(res.detailedDebugInfo) : outcome.errorMessage;
+        ? QString::fromUtf8(res.detailedDebugInfo.data(), static_cast<int>(res.detailedDebugInfo.size())) : outcome.errorMessage;
     const bool valid = res.success && outcome.errorCode.isEmpty();
     m_inspectionTable->item(row, 4)->setText(valid ? QString::asprintf("%.2f %s", rec.readingValue, rec.unit.c_str()) : "--");
     m_inspectionTable->item(row, 5)->setText(valid ? QString::asprintf("%.1f°", rec.pointerAngle) : "--");
     m_inspectionTable->item(row, 6)->setText(QString::asprintf("%.1f%%", rec.confidence));
     m_inspectionTable->item(row, 7)->setText(rec.status);
+    onLogReceived(tr("[CAPTURE] 设备 %1 · 采集方式 %2").arg(outcome.cameraId, outcome.captureMethod));
+    const auto& timings = outcome.timings;
+    const auto engineSteps = timings["engine_steps"].toObject();
+    QStringList details;
+    for (auto it = engineSteps.begin(); it != engineSteps.end(); ++it)
+        if (it.value().isDouble()) details.append(it.key() + "=" + QString::number(it.value().toDouble(), 'f', 1));
+    onLogReceived(tr("[RECOGNITION TIMING] 设备 %1 · 模板读取 %2 ms · 配置准备 %3 ms · %4")
+        .arg(outcome.cameraId).arg(timings["template_load_ms"].toDouble(), 0, 'f', 1)
+        .arg(timings["profile_setup_ms"].toDouble(), 0, 'f', 1).arg(details.join("; ")));
+    onLogReceived(tr("[POINTER TIMING] 设备 %1 · %2").arg(outcome.cameraId,
+        QString::fromUtf8(QJsonDocument(engineSteps["pointer_details"].toObject()).toJson(QJsonDocument::Compact))));
+    const auto timingText = tr("耗时(ms)：总计 %1；排队 %2；采集 %3；识别等待 %4；识别 %5；存储等待 %6；图片保存 %7；结果保存 %8；数据库 %9")
+        .arg(timings["total_ms"].toDouble(), 0, 'f', 1)
+        .arg(timings["queue_ms"].toDouble(), 0, 'f', 1)
+        .arg(timings["capture_ms"].toDouble(), 0, 'f', 1)
+        .arg(timings["recognition_queue_ms"].toDouble(), 0, 'f', 1)
+        .arg(timings["recognition_ms"].toDouble(), 0, 'f', 1)
+        .arg(timings["storage_queue_ms"].toDouble(), 0, 'f', 1)
+        .arg(timings["image_save_ms"].toDouble(), 0, 'f', 1)
+        .arg(timings["result_save_ms"].isDouble()
+             ? QString::number(timings["result_save_ms"].toDouble(), 'f', 1) : tr("未完成"))
+        .arg(timings["database_write_ms"].isDouble()
+             ? QString::number(timings["database_write_ms"].toDouble(), 'f', 1) : tr("未执行"));
+    if (timings["metrics_save_failed"].toBool())
+        onLogReceived(tr("[TIMING] 设备 %1 · 任务 %2 · 耗时统计文件保存失败").arg(outcome.cameraId, outcome.taskId));
+    rec.diagnosticText += "\n" + timingText;
     m_inspectionTable->item(row, 7)->setToolTip(rec.diagnosticText);
+    onLogReceived(tr("[TIMING] 设备 %1 · 任务 %2 · %3").arg(outcome.cameraId, outcome.taskId, timingText));
     m_inspectionTable->item(row, 8)->setText(rec.timestamp);
     onLogReceived(tr("[PATROL] %1: %2").arg(outcome.cameraId, rec.status));
 }
@@ -1844,7 +1974,9 @@ void MainWindow::showInspectionPhotosDialog(int row) {
     if (!rec.diagnosticText.isEmpty()) {
         QLabel *diagLabel = new QLabel(tr("ℹ️ 算法诊断与特征提取详情: %1").arg(rec.diagnosticText.trimmed().replace("\n", "  |  ")), &dlg);
         diagLabel->setStyleSheet("background-color: #12141d; color: #81d4fa; border: 1px solid #1e2230; border-radius: 4px; padding: 6px 10px; font-size: 11px;");
+        diagLabel->setTextFormat(Qt::PlainText);
         diagLabel->setWordWrap(true);
+        diagLabel->setTextInteractionFlags(Qt::TextSelectableByMouse);
         mainLayout->addWidget(diagLabel);
     }
 

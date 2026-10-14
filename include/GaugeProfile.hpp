@@ -5,6 +5,7 @@
 #include <string>
 #include <vector>
 #include <QJsonObject>
+#include <QJsonArray>
 
 /**
  * @brief Calibration Profile for an Individual Gauge.
@@ -59,10 +60,7 @@ struct GaugeProfile {
     double min_val{0.0};
     double max_val{1.0};
     
-    // Angles in degrees (OpenCV Cartesian: 0° = 3 o'clock, 90° = 6 o'clock, 180° = 9 o'clock, 270° = 12 o'clock)
-    double min_angle_deg{135.0}; // Angle at zero scale mark
-    double max_angle_deg{45.0};  // Angle at max scale mark
-    
+    // Direction in which the manually calibrated scale values increase.
     bool clockwise{true};
     
     // Pointer Needle Tip vs Tail Orientation Inversion
@@ -137,6 +135,7 @@ struct GaugeProfile {
     float center_search_tolerance{35.0f};
 
     // Camera Perspective Distortion Correction Parameters
+    QJsonArray scalePoints; // Device calibration, never a template parameter.
     bool perspective_correction_enabled{true};
     std::vector<cv::Point2f> perspective_pts; // 4 points [12H Top, 3H Right, 6H Bottom, 9H Left]
     int calibrated_width{0};                   // Resolution width of original frame during 4-point calibration

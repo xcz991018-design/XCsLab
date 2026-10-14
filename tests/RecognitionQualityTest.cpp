@@ -25,6 +25,11 @@ int main() {
     auto straight=fixture(30,true);
     auto good=evaluateRecognitionQuality(straight,{});
     if (good["status"]!="trusted" || !good["tail"].toObject()["available"].toBool()) return 1;
+    const auto expectedPrefix=QString::fromUtf8(QByteArray::fromHex("e69781e8b7afe8b4a8e9878fefbc9ae58fafe4bfa1"));
+    const auto summary=qualitySummary(good);
+    if (!summary.startsWith(expectedPrefix) || summary.contains(QChar(0xfffd))) return 1;
+    const auto utf8=summary.toUtf8().toStdString();
+    if (QString::fromUtf8(utf8.data(),static_cast<int>(utf8.size()))!=summary) return 1;
     auto weak=fixture(3);
     if (evaluateRecognitionQuality(weak,{})["status"]!="unassessable") return 1;
     straight.tipLikelihoodB=11;
@@ -32,6 +37,8 @@ int main() {
     straight.tipLikelihoodB=2;
     for (int i=8;i<18;++i) straight.directionA.candidateRegion.rightEdge.points[i].hasRawSupport=false;
     auto gap=evaluateRecognitionQuality(straight,{});
+    const auto expectedGap=QString::fromUtf8(QByteArray::fromHex("e99288e8baabe69c80e995bfe8bf9ee7bbade8beb9e7bc98e7bcbae5a4b1e8b685e8bf87e8ada6e5918ae99888e580bc"));
+    if (!qualitySummary(gap).contains(expectedGap)) return 1;
     if (!gap["body"].toObject()["gap_warning"].toBool() || gap["status"]!="review") return 1;
     const auto config=resolvedQualityConfig({{"body_weights",QJsonArray{0,0,0,0,0}}, {"coverage_range",QJsonArray{1,0}}});
     if (config["body_weights"]!=defaultQualityConfig()["body_weights"]) return 1;

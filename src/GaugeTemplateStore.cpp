@@ -24,6 +24,8 @@ bool GaugeTemplateStore::load(QString& error) {
             if (record.id.isEmpty() || record.id != idOf(record.definition) || !record.revision || m_records.contains(record.id))
                 throw std::runtime_error("DATABASE_TEMPLATE_INVALID");
             m_records[record.id] = record;
+            m_records[record.id].definition.remove("min_angle_deg");
+            m_records[record.id].definition.remove("max_angle_deg");
         }
         m_loaded = true;
         return true;
@@ -62,8 +64,6 @@ QVector<GaugeTemplateField> GaugeTemplateStore::fields(const GaugeProfile& g) {
     };
     number("min_val", "量程下限", 0, g.min_val, -1e9, 1e9, 6);
     number("max_val", "量程上限", 0, g.max_val, -1e9, 1e9, 6);
-    number("min_angle_deg", "下限刻度角度 (°)", 0, g.min_angle_deg, 0, 360);
-    number("max_angle_deg", "上限刻度角度 (°)", 0, g.max_angle_deg, 0, 360);
     flag("clockwise", "数值沿顺时针方向增大", 0, g.clockwise);
     flag("pointer_invert_direction", "反转指针方向", 0, g.pointer_invert_direction);
     number("pointerBaseRadius", "中心死区半径 (像素)", 1, g.pointerBaseRadius, 0, 100000, 3, {"pointer_base_radius"});
@@ -158,8 +158,6 @@ QString GaugeTemplateStore::validate(const QJsonObject& profile) {
         values[field.key] = value;
     }
     if (values["max_val"].toDouble() <= values["min_val"].toDouble()) return QStringLiteral("量程上限必须大于下限");
-    if (std::fmod(values["min_angle_deg"].toDouble(), 360.0) == std::fmod(values["max_angle_deg"].toDouble(), 360.0))
-        return QStringLiteral("上下限刻度角度不能相同");
     if (values["pointerMaxWidth"].toDouble() < values["pointerMinWidth"].toDouble()) return QStringLiteral("指针最大宽度不能小于最小宽度");
     if (values["tail_max_width"].toDouble() < values["tail_min_width"].toDouble()) return QStringLiteral("尾部最大宽度不能小于最小宽度");
     return {};
@@ -175,7 +173,8 @@ bool GaugeTemplateStore::saveProfile(const QJsonObject& profile, bool replacing,
         return false;
     }
     try {
-        auto record = m_backend.save(profile, replacing ? m_records.value(id).revision : 0);
+        auto cleaned=profile; cleaned.remove("min_angle_deg"); cleaned.remove("max_angle_deg");
+        auto record = m_backend.save(cleaned, replacing ? m_records.value(id).revision : 0);
         record.usedBy = m_records.value(id).usedBy;
         m_records[id] = record;
         error.clear(); return true;

@@ -70,7 +70,6 @@ DiscoveredCameraItem CameraInfoEditDialog::getUpdatedDeviceItem() const {
     item.username = m_usernameEdit ? m_usernameEdit->text().trimmed() : "";
     item.password = m_passwordEdit ? m_passwordEdit->text() : "";
     item.defaultProfileId = m_gaugeProfileCombo ? m_gaugeProfileCombo->currentData().toString() : QString();
-    item.isAutoConnect = m_autoConnectCheck ? m_autoConnectCheck->isChecked() : false;
     if (m_isNewDevice || previousAddress != item.ipOrSn || previousStreamUrl != item.rtspUrl)
         item.isOnline = false;
 
@@ -183,8 +182,6 @@ void CameraInfoEditDialog::setupUi() {
     m_passwordEdit->setEchoMode(QLineEdit::Password);
     m_passwordEdit->setPlaceholderText(tr("摄像头视频访问密码"));
 
-    m_autoConnectCheck = new QCheckBox(tr("⭐ 设为开机默认自动连接此设备 (Auto-Connect on Startup)"), netTab);
-    m_autoConnectCheck->setStyleSheet("QCheckBox { color: #ffd740; font-weight: bold; font-size: 13px; }");
 
     netForm->addRow(tr("设备唯一编号 (camera_id):"), m_cameraIdEdit);
     netForm->addRow(tr("设备别名/备注 (custom_name):"), m_customNameEdit);
@@ -197,9 +194,8 @@ void CameraInfoEditDialog::setupUi() {
     auto* networkHint = new QLabel(tr("跨车间接入：按 IP/完整 RTSP 地址手动添加每台摄像头。\n计算机须能访问目标网段；跨 VLAN 路由及访问权限由现场网络配置。"), netTab);
     networkHint->setWordWrap(true);
     netForm->addRow(networkHint);
-    netForm->addRow("", m_autoConnectCheck);
 
-    m_tabWidget->addTab(netTab, tr("🌐 网络与自动连接配置"));
+    m_tabWidget->addTab(netTab, tr("🌐 网络配置"));
 
     // ================= Tab 2: 表计规格与安装档案 =================
     QWidget *gaugeTab = new QWidget(m_tabWidget);
@@ -297,7 +293,6 @@ void CameraInfoEditDialog::loadCameraInfo() {
         m_protocolCombo->setCurrentIndex(0); // Default ONVIF
         m_portSpin->setValue(80);
         m_rtspPortSpin->setValue(554);
-        m_autoConnectCheck->setChecked(false);
 
         // No fake default values, require explicit user input
         m_substationEdit->clear();
@@ -322,7 +317,6 @@ void CameraInfoEditDialog::loadCameraInfo() {
         m_rtspUrlEdit->setText(dev.rtspUrl);
         m_usernameEdit->setText(dev.username);
         m_passwordEdit->setText(dev.password);
-        m_autoConnectCheck->setChecked(dev.isAutoConnect);
 
         if (dev.protocolType == CameraProtocolType::ONVIF_RTSP_STREAM) {
             m_protocolCombo->setCurrentIndex(0);
@@ -458,10 +452,6 @@ bool CameraInfoEditDialog::saveCameraInfo() {
         DeviceConfigManager::instance().removeDevice(m_originalCameraId, false);
     }
     DeviceConfigManager::instance().addOrUpdateDevice(item, true);
-
-    if (item.isAutoConnect) {
-        DeviceConfigManager::instance().setDeviceAutoConnect(newCamId, true);
-    }
 
     QMessageBox::information(this, tr("保存成功"), tr("摄像头网络参数与设备档案已成功更新至 devices.json！"));
     return true;
