@@ -12,7 +12,7 @@
 已有模板只需一次性迁移（使用 GUI 保存的同一 MySQL 连接配置）：
 
 ```powershell
-./build/Release/gauge_reader_service.exe --import-templates ./config/gauge_profile.json
+./build/Release/gauge_reader_service.exe --import-templates <旧模板JSON路径>
 ```
 
 该命令只迁移模板后退出，不启动巡检。全局设置及文件继承参数先解析成独立模板，
@@ -38,7 +38,7 @@
 可查看各分项及原始指标；指标和原因保存在 result.json 的 recognition_quality 中，
 巡检紧凑结果也保留该字段。未执行识别的任务不产生评估。
 
-配置参考 config/recognition_quality.example.json。将 recognition_quality 对象合并至
+在表计模板中配置 recognition_quality 对象，将该对象合并至
 仪表档案顶层或指定仪表对象；局部配置覆盖顶层配置。缺省采用示例权重和阈值，非法
 权重或区间回退默认值。有效配置写入任务配置快照的 _runtime_quality_config，历史
 重分析优先使用该快照。JSON/数据库补写信封携带质量结果；当前数据库历史表尚无
@@ -68,11 +68,10 @@
 ## 编译与运行
 
 ```powershell
-cmake -S . -B build-service
-cmake --build build-service --config Release --parallel 4
-ctest --test-dir build-service -C Release --output-on-failure
+cmake -S . -B build
+cmake --build build --config Release --parallel 4
 
-./build-service/Release/gauge_reader_service.exe --devices config/devices.json --output inspection_snapshots --concurrency 4 --interval 60
+./build/Release/gauge_reader_service.exe --output inspection_snapshots --concurrency 4 --interval 60
 ```
 
 运行环境需要 Qt 和 OpenCV DLL 可被搜索到。`--interval 0` 执行一次；正数表示
@@ -215,14 +214,14 @@ $env:GAUGE_MYSQL_OUTBOX = 'C:/GaugeReaderData/mysql_registry_outbox'
 ```
 
 首次启动没有保存配置时，默认启用本机 MySQL 连接（BYS_GaugeReaderDB）；可在配置界面关闭 MySQL 以使用文件模式。启用后数据库是设备档案的权威来源；
-首次连接一个未初始化档案的数据库，会导入已有 devices.json（不会凭空生成档案）。
+首次连接一个未初始化档案的数据库只初始化系统信息，不自动导入本地设备档案。
 数据库不可用或缺少表时 UI 明确显示加载失败，不以样例设备替代；30 秒后自动重试。
 档案编辑先原子保存本地凭据缓存及待同步快照，再由后台同步。设备移除在数据库中
 采用软删除，保留历史记录。当前完整档案快照由一个 GUI 管理实例写入；不支持多个
 管理实例同时修改同一份档案。后台巡检不会覆盖现有档案。
 
 数据库档案/历史快照/待同步 JSON 不包含摄像头密码或带凭据的 RTSP 地址。摄像头
-密码仍从本机 devices.json 按 camera_id 匹配；新部署终端需配置对应的本地凭据。
+密码从用户数据目录 GaugeReader/credentials/devices.json 按 camera_id 匹配；界面与后台程序共用该文件，新部署终端需配置对应的本地凭据。
 数据库连接密码从进程环境或当前用户加密配置读取，不写入日志。设备档案包含 IP、端口、协议、位置、
 表计档案和标定参数。历史配置采用内容哈希复用版本，在线状态变化
 不会创建新的配置版本。
@@ -253,15 +252,6 @@ UI 日志报告待同步，headless 单轮返回失败退出码。档案待同�
 数据库成功入库后暂不自动删除本地原图；数据库/文件容量、备份与保留策略需另行配置。
 启用数据库不会自动导入以前只有 result.json 的历史目录，因为它们缺少可靠的配置
 快照；本次新增任务均入库，旧记录仍可通过原文件复核入口查看。
-
-## MySQL 集成验证
-
-新增 mysql_storage_and_review 测试默认跳过，避免误连接业务库。启用验证时必须使用
-独立本机 127.0.0.1:33379 测试实例，root 空密码仅用于该临时实例；设置
-GAUGE_MYSQL_TEST_PORT=33379 后运行 ctest。测试自动创建随机 gauge_test_* 数据库，
-执行四份迁移并在结束时删除自己的测试库，不操作其他数据库。UI 测试使用 offscreen。
-覆盖档案脱敏、配置快照、原图字节一致性、事务回滚、幂等写入、分页/参数绑定、历史
-原图再分析、UI 按需拉取显示、人工修正、断线补写、软删除和篡改图片拒绝。
 
 默认首次连接使用 127.0.0.1:3306、数据库 BYS_GaugeReaderDB、账号 root；请在 GUI 中填写实际密码并保存后重启。已有保存配置及环境变量优先。缺失的数据库由后台自动创建并初始化八张业务表（utf8mb4）；账号需要 CREATE 权限。连接、权限或初始化失败会显示错误并保留待入库数据。原有数据库不会自动执行 ALTER 迁移。
 
@@ -315,20 +305,6 @@ GUI 全站巡检日志输出 `[TIMING]`，鼠标悬停巡检状态也可查看�
 
 统计文件保存失败仅在返回统计中标记 `metrics_save_failed`，不改变识别或原始证据保存状态。
 
-## 临时 ONVIF 抓图验证工具
-
-编译 `cmake --build build-service --config Release --target onvif_snapshot_probe`。
-执行 `./build-service/Release/onvif_snapshot_probe.exe --host 192.168.110.11`。
-默认只读数据库设备档案，使用已保存的设备账号，不输出密码、抓图 URL 或 SOAP 原文。
-也可用 `--devices <JSON路径>` 指定档案；`--port` 覆盖 ONVIF HTTP 端口。
-对每个 Media Profile 默认测试 5 次，`--count 1..20` 可调整。
-SOAP 使用现有 1800 ms 超时，图片下载限时 5 秒、限大小 16 MiB，不使用 RTSP 回退。
-输出 `test_outputs/onvif_snapshot_probe/report.json` 和成功抓取的原始图片，`--output` 可指定目录。
-报告分别记录服务发现、获取抓图地址、下载、解码耗时；单次 total 不含初始服务发现和图片保存。
-退出码：0 至少一张图片成功下载并解码；1 未验证成功；2 配置、档案或报告写入失败。
-同一输出目录会覆盖相同名称的测试文件，需要保留历史时指定新的输出目录。
-抓图失败不直接代表接口不支持；需结合 HTTP 状态、认证和 SOAP 结果判断。
-
 ## 全站巡检 ONVIF 抓图
 
 GUI 全站巡检和后台巡检服务对 ONVIF 设备优先通过 GetCapabilities、GetProfiles、
@@ -338,9 +314,6 @@ GetSnapshotUri 获取 HTTP/HTTPS 原图，使用设备账号处理 HTTP 认证�
 全部采集仍受独立子进程的总体超时和取消约束。实时预览及单设备原有抓拍行为保持不变。
 GUI 日志 `[CAPTURE]` 和结果 JSON `capture_method` 标明 ONVIF_HTTP 或 RTSP。
 标定坐标沿用已有按输入图片尺寸自动缩放的逻辑，保存的是本次真实抓图，不放大替代原图。
-
-实机全流水线验证可运行 `onvif_snapshot_probe --host 192.168.110.11 --pipeline`，
-会执行该设备的一次识别及正常结果入库，输出采集方式和分阶段耗时。
 
 ## 识别内部耗时及同图模式对比
 
@@ -355,20 +328,10 @@ GUI 日志 `[CAPTURE]` 和结果 JSON `capture_method` 标明 ONVIF_HTTP 或 RTS
 梯度预处理、粗搜索、候选排序/诊断、精搜索、方向评分/诊断和调试绘图。
 内部细分包含在 pointer_detection_ms 内，不应重复相加。失败只记录已完成阶段。
 
-可编译 `recognition_mode_benchmark` 后用 `--record <历史任务/result.json>`
-和 `--output <报告.json>` 重跑同一张 original.png。
-工具直接使用该任务冻结的设备与模板，不抓拍、不查询数据库、不写入历史结果。
-production/evidence 各预热一次，再各执行 7 次（`--iterations` 可调整），交替先后顺序；
-报告保留逐次耗时、预热耗时、中位数、构建类型、OpenCV线程数和结果一致性检查。
-每次都复制相同配置，验证输入未改变及两种模式读数、置信度、质量评估一致。
-Debug/Release 为编译配置，production/evidence 为运行模式，两者应分别对比。
-
-
 档案保存日志分为 [LOCAL-ARCHIVE]（本地凭据档案打开、写入、原子提交）、
 [REGISTRY-QUEUE]（本地待同步队列）和 [MYSQL]（数据库同步）。本地失败记录完整
-绝对路径、失败阶段和系统错误原因，不记录密码或档案正文。默认配置目录无法保存时，
-数据库模式尝试用户数据目录 credentials/devices.json；成功后记录原路径和新路径，
-后续启动优先使用该缓存。显式指定的保存路径失败时直接报错，不擅自改用其他路径。
+绝对路径、失败阶段和系统错误原因，不记录密码或档案正文。默认凭据目录为用户数据目录 GaugeReader/credentials；显式旧路径无法保存时，
+数据库模式可回退到此目录；成功后记录原路径和新路径。显式指定的保存路径失败时直接报错，不擅自改用其他路径。
 已有设备的在线状态刷新不重复写档案；新增设备保存失败会保留待保存状态并在扫描时重试。
 
 
@@ -401,11 +364,6 @@ Debug/Release 为编译配置，production/evidence 为运行模式，两者应�
 一致性和距离选择轴帽，避免将刻度数字的圆弧当作轴帽。确认存在轴帽且与标定中心
 偏差超过 center_search_tolerance 时，本次识别失败并提示重新标定中心，不自动修改
 数据库标定，也不继续给出文字/阴影形成的替代读数。无可靠轴帽证据时不据此强行拒绝。
-
-新增 pointer_shadow_discrimination 回归使用已脱敏的历史图片样本，覆盖灰色阴影
-排除、错误轴心拒绝、正确轴心下约 0.4 MPa 的读数，并与针尾轮廓及运行模式测试联合验证。
-开发工具 gauge_replay_inspection <历史任务编号或本地source.json> <输出目录> 只读
-获取冻结配置及原图并生成离线诊断，不更新历史记录和设备标定。
 
 ### 历史原图分析前标定
 
@@ -466,8 +424,6 @@ GUI 和后台服务沿用数据库同步定时器，每 5 分钟执行一次图�
 low_disk_space=true）。不通过提前删除未到期异常图像来满足容量指标。
 MySQL 删除 BLOB 会释放可复用页，表文件不一定立即缩小；不自动执行 OPTIMIZE TABLE。
 
-后续分析可复制整个 UUID 目录，并使用 recognition_mode_benchmark --record <result.json>
-在冻结配置下同图重跑；工具同时兼容 original.jpg、新版清单及旧版 original.png。
 到期后无法再读取图片，仍可查询当时的读数和配置；重要异常应在 90 天内导出保存。
 
 ## 数据库历史原图直接重分析
@@ -527,3 +483,22 @@ CSV 导出包含范围、允许偏差和判定（CSV 本身不支持文字颜色
 右键菜单提供“连接此设备”和“断开连接”。断开会取消预览采集、清除实时画面并释放连接，
 异步返回的旧画面不会恢复预览；之后可再次通过右键连接。暂停/恢复按钮仅作用于已连接设备。
 单次抓拍、标定和全站巡检继续按原有明确操作执行。
+
+
+### 用户目录凭据与旧 config 迁移
+
+Windows 默认凭据文件为 `%LOCALAPPDATA%/GaugeReader/credentials/devices.json`，
+不再依赖可执行程序名称、工程目录或工作目录。GUI 和后台服务使用相同路径。
+`gauge_reader_service --credential-path` 可查看当前实际路径；`--devices <路径>` 仍可显式覆盖。
+
+新版本首次加载时可兼容迁移旧的 config/devices.json 及旧应用名目录中的凭据缓存，
+迁移保留 camera_id、硬件 UUID、凭据和完整本地档案，不改写数据库中的设备编号或标定。
+用户目录已存在的凭据优先，旧文件中的空密码不会覆盖已有非空密码；迁移完成后不再反复导入旧目录。
+旧 JSON 的原始字节备份保存在凭据目录的 legacy-config 子目录中，包含原模板导入文件和配置示例。
+可以使用 `gauge_reader_service --migrate-config <旧目录>` 显式迁移并校验备份，不启动摄像头、不写数据库。
+日常表计模板、设备档案和标定仍以 MySQL 为准；本地缓存负责连接凭据及离线档案保留。
+CMake/qmake 不再复制 config 目录，程序保存档案时也不会向工程目录同步设备凭据。
+
+`--sync-credential-cache` 按数据库已有档案键补齐本机缓存，沿用原加载逻辑得到的有效凭据，
+不会按 IP 归并设备或改写数据库。`--audit-device-storage` 输出连接参数、设备档案与模板的校验值，
+用于迁移前后核对，不输出密码。凭据匹配优先档案键，也兼容唯一一致的硬件 UUID；UUID 冲突时不使用该条凭据。

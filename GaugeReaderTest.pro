@@ -109,15 +109,8 @@ win32-msvc {
     QMAKE_POST_LINK += $(COPY_FILE) $$shell_quote($$OPENCV_RUNTIME_PATH) $$shell_quote($$RUNTIME_OUT_PATH)
 }
 
-# Deploy config directory (devices.json, gauge_profile.json) to output folder
-win32 {
-    CONFIG_IN_PATH = $$shell_path($$PWD/config)
-    CONFIG_OUT_PATH = $$shell_path($$OUT_PWD/config)
-    QMAKE_POST_LINK += $$escape_expand(\n\t) if not exist \"$$CONFIG_OUT_PATH\" $(MKDIR) \"$$CONFIG_OUT_PATH\"
-    QMAKE_POST_LINK += $$escape_expand(\n\t) $(COPY_DIR) \"$$CONFIG_IN_PATH\" \"$$CONFIG_OUT_PATH\"
-}
-
-
 HEADERS += $$PWD/include/ScaleCalibration.hpp
 
 HEADERS += $$PWD/include/RecognitionQuality.hpp
+
+HEADERS += $$PWD/include/DeviceCredentialStore.hpp

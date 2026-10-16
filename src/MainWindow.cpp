@@ -115,7 +115,7 @@ MainWindow::MainWindow(QWidget *parent) : QMainWindow(parent) {
             m_hasAnalysisInput = !m_analysisInput.localImagePath.isEmpty() || !m_analysisInput.databaseOriginalTaskId.isEmpty();
             m_currentImagePath = m_analysisInput.localImagePath;
             m_imagePathEdit->setText(m_currentImagePath);
-            updateImageCard(m_imgStage1, m_currentFrame, "Task original");
+            updateImageCard(m_originalImage, m_currentFrame, "Task original");
             if (submitted.inputKind == InspectionInputKind::CameraSnapshot) {
                 m_lastCapturedFrame = out.capturedFrame;
                 m_snapshotInput = m_analysisInput;
@@ -144,7 +144,7 @@ MainWindow::MainWindow(QWidget *parent) : QMainWindow(parent) {
                 m_latestResult.errorMessage = (out.errorCode + ": " + out.errorMessage).toStdString();
             }
             onRecognitionFinished();
-            if (!out.capturedFrame.empty()) updateImageCard(m_imgStage1, out.capturedFrame, "Task original");
+            if (!out.capturedFrame.empty()) updateImageCard(m_originalImage, out.capturedFrame, "Task original");
         } else m_statusLabel->setText(tr("图片已就绪；分析将仅使用此任务对应的指定图片。"));
     });
     connect(m_singleService, &InspectionService::imageExported, this, [this](const QString& path, const QString& error) {
@@ -415,7 +415,7 @@ QWidget* MainWindow::createLeftSidebar(QWidget *parent) {
 
     m_runModeCombo = new QComboBox(fileBox);
     m_runModeCombo->addItem(tr("生产模式：读数与原图留存"), int(GaugeRunMode::Production));
-    m_runModeCombo->addItem(tr("证据模式：核心四步图片"), int(GaugeRunMode::Evidence));
+    m_runModeCombo->addItem(tr("证据模式：保留识别过程图片"), int(GaugeRunMode::Evidence));
     m_runModeCombo->addItem(tr("调试模式：识别图片与算法诊断"), int(GaugeRunMode::Debug));
     m_runModeCombo->setCurrentIndex(1);
     m_runModeCombo->setToolTip(tr("生产模式不绘制中间图；全站巡检在所有模式下保留本次原图供人工复核。"));
@@ -508,7 +508,7 @@ QWidget* MainWindow::createCenterVisionArea(QWidget *parent) {
     QWidget *liveStageArea = createLiveStreamStageArea(m_visionTabWidget);
     m_visionTabWidget->addTab(liveStageArea, tr("📷 摄像头实时流与抓图 (Live Stream & Capture)"));
 
-    // --- Tab 1: 核心 4 步主流程 ---
+    // --- Tab 1: 采集原图与最终识别结果 ---
     QScrollArea *tab1Scroll = new QScrollArea(m_visionTabWidget);
     tab1Scroll->setWidgetResizable(true);
     tab1Scroll->setStyleSheet("QScrollArea { border: none; background-color: #121216; }");
@@ -517,7 +517,7 @@ QWidget* MainWindow::createCenterVisionArea(QWidget *parent) {
     QGridLayout *gridLayout = new QGridLayout(gridContainer);
     gridLayout->setSpacing(10);
 
-    auto createStageCard = [this, gridContainer](const QString& title, QLabel*& outLabel) {
+    auto createImageCard = [this, gridContainer](const QString& title, QLabel*& outLabel) {
         QGroupBox *card = new QGroupBox(title, gridContainer);
         QVBoxLayout *cardLayout = new QVBoxLayout(card);
         cardLayout->setContentsMargins(6, 10, 6, 6);
@@ -531,20 +531,15 @@ QWidget* MainWindow::createCenterVisionArea(QWidget *parent) {
         return card;
     };
 
-    gridLayout->addWidget(createStageCard(tr("步骤 1: 实时传输/采集原帧 (Original Stream Frame)"), m_imgStage1), 0, 0);
-    gridLayout->addWidget(createStageCard(tr("步骤 2: 4切点视场透视矫正图 (FOV Rectified Image)"), m_imgStage2), 0, 1);
-    gridLayout->addWidget(createStageCard(tr("步骤 3: 检测输入灰度图 (Grayscale Input)"), m_imgStage3), 1, 0);
+    gridLayout->addWidget(createImageCard(tr("采集原图"), m_originalImage), 0, 0);
 
-    QGroupBox *stage4Card = createStageCard(tr("步骤 4: 最终仪表读数识别 (Final Recognition Result)"), m_imgStage4);
-    QPushButton *stage4DiagBtn = new QPushButton(tr("📊 独立窗口查看指针算法诊断信息 (HUD)"), stage4Card);
-    stage4DiagBtn->setStyleSheet("QPushButton { background-color: #1a2a3a; color: #00e5ff; border: 1px solid #00a0e9; padding: 5px; border-radius: 4px; font-size: 12px; font-weight: bold; margin-top: 4px; }"
-                                 "QPushButton:hover { background-color: #243b55; border-color: #00e5ff; }");
-    connect(stage4DiagBtn, &QPushButton::clicked, this, &MainWindow::onShowDiagnosticWindow);
-    stage4Card->layout()->addWidget(stage4DiagBtn);
-    gridLayout->addWidget(stage4Card, 1, 1);
+    gridLayout->addWidget(createImageCard(tr("最终识别结果"), m_recognitionImage), 0, 1);
+    gridLayout->setColumnStretch(0, 1);
+    gridLayout->setColumnStretch(1, 1);
+    gridLayout->setRowStretch(0, 1);
 
     tab1Scroll->setWidget(gridContainer);
-    m_visionTabWidget->addTab(tab1Scroll, tr("⚡ 核心 4 步主流程 (Core 4 Stages)"));
+    m_visionTabWidget->addTab(tab1Scroll, tr("⚡ 仪表读数识别"));
 
     // --- Tab 2: 全站设备巡检读数总览 (Batch Patrol Inspection Matrix) ---
     QWidget *inspectionArea = createInspectionStageArea(m_visionTabWidget);
@@ -562,7 +557,7 @@ QWidget* MainWindow::createLiveStreamStageArea(QWidget *parent) {
     mainLayout->setSpacing(8);
 
     // 1. Top Header & Control Toolbar
-    QGroupBox *toolbarBox = new QGroupBox(tr("📷 摄像头实时流监控与快照抓取控制台 (Stage 0: Live Stream & Capture)"), container);
+    QGroupBox *toolbarBox = new QGroupBox(tr("📷 摄像头实时流监控与快照抓取控制台"), container);
     QHBoxLayout *tbLayout = new QHBoxLayout(toolbarBox);
     tbLayout->setContentsMargins(10, 6, 10, 6);
 
@@ -933,7 +928,7 @@ void MainWindow::onRemoveSelectedDevice() {
 
     QString camId = curr->data(Qt::UserRole).toString();
     auto reply = QMessageBox::question(this, tr("确认删除"),
-                                      tr("确定要从持久化设备库中移除摄像头 [%1] 吗？\n此操作将同时更新 devices.json 配置文件。").arg(camId),
+                                      tr("确定要从持久化设备库中移除摄像头 [%1] 吗？\n此操作将同时更新设备档案及本机凭据缓存。").arg(camId),
                                       QMessageBox::Yes | QMessageBox::No, QMessageBox::No);
     if (reply == QMessageBox::Yes) {
         DeviceConfigManager::instance().removeDevice(camId, true);
@@ -1051,10 +1046,8 @@ void MainWindow::selectCameraForDetails(const QString& camId) {
     m_latestResult = GaugeResult();
     m_valLabel->setText(tr("读取数值: --"));
     m_statusLabel->setText(tr("已选择设备档案；实时预览请通过右键菜单连接。"));
-    updateImageCard(m_imgStage1, cv::Mat(), "Original");
-    updateImageCard(m_imgStage2, cv::Mat(), "Rectified");
-    updateImageCard(m_imgStage3, cv::Mat(), "Grayscale Input");
-    updateImageCard(m_imgStage4, cv::Mat(), "Recognition");
+    updateImageCard(m_originalImage, cv::Mat(), "Original");
+    updateImageCard(m_recognitionImage, cv::Mat(), "Recognition");
     m_currentFrame.release();
     m_lastCapturedFrame.release();
     m_currentImagePath.clear();
@@ -1256,7 +1249,7 @@ void MainWindow::onUseSnapshotForRecognition() {
 
 void MainWindow::onTabChanged(int index) {
     if (index == 0) {
-        onLogReceived(tr("[STREAM] 画面切回实时流监控页 (Stage 0)，恢复画面实时重绘。"));
+        onLogReceived(tr("[STREAM] 画面切回实时流监控页，恢复画面实时重绘。"));
         QTimer::singleShot(30, this, &MainWindow::onUpdateLiveStreamFrame);
     } else {
         onLogReceived(tr("[STREAM] 切换至算法调试/识别结果页，已暂停 GUI 界面重绘（底层视频流保持实时接收）以降低 CPU/GPU 损耗。"));
@@ -1606,11 +1599,9 @@ void MainWindow::onRecognitionFinished() {
         label->setToolTip(qualityDetails(m_latestResult.recognitionQuality));
     }
     onLogReceived(qualitySummary(m_latestResult.recognitionQuality));
-    // Show the core images, including the actual grayscale detector input.
-    updateImageCard(m_imgStage1, m_latestResult.step1_original, "1. Original Stream Frame");
-    updateImageCard(m_imgStage2, m_latestResult.step2_rectified, "2. FOV Rectified Image");
-    updateImageCard(m_imgStage3, m_latestResult.step3_gray, "3. Grayscale Input Image");
-    updateImageCard(m_imgStage4, m_latestResult.step4_recognition, "4. Final Recognition Result");
+    // Show only the original capture and final recognition result.
+    updateImageCard(m_originalImage, m_latestResult.step1_original, tr("采集原图"));
+    updateImageCard(m_recognitionImage, m_latestResult.step4_recognition, tr("最终识别结果"));
 
     // Clear diagnostics from a preceding debug run when the current mode omits them.
     if (m_latestResult.runMode != GaugeRunMode::Debug && m_diagnosticImgLabel) {

@@ -551,10 +551,8 @@ GaugeResult GaugeReaderEngine::process(const cv::Mat& frame, GaugeProfile& profi
     }
 
     res.detailedDebugInfo += "\n" + qualitySummary(res.recognitionQuality).toUtf8().toStdString();
-    float tipR = static_cast<float>(res.pointerDetectorResult.tipRadius > 0 ? res.pointerDetectorResult.tipRadius : (res.radius * 0.8f));
-    double tipRad = res.pointer_angle_deg * M_PI / 180.0;
-    res.pointer_tip = cv::Point2f(res.center.x + tipR * static_cast<float>(std::cos(tipRad)),
-                                  res.center.y + tipR * static_cast<float>(std::sin(tipRad)));
+    // Use the detector endpoint for both reading geometry and the result overlay.
+    res.pointer_tip = cv::Point2f(res.pointerDetectorResult.tipPoint);
 
     mark("result_diagnostics_ms");
     if (debug) {

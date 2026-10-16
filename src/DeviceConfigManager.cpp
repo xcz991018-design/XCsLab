@@ -16,6 +16,7 @@
 #include <QHostAddress>
 #include <QStandardPaths>
 #include "CameraIdentity.hpp"
+#include "DeviceCredentialStore.hpp"
 
 namespace {
 bool automaticId(const QString& id) {
@@ -106,26 +107,7 @@ QString DeviceConfigManager::resolveConfigPath(const QString& preferredPath) {
         return QFileInfo(preferredPath).absoluteFilePath();
     }
 
-    QString appDir = QCoreApplication::applicationDirPath();
-    QStringList candidates = {
-        QStandardPaths::writableLocation(QStandardPaths::AppLocalDataLocation) + "/credentials/devices.json",
-        appDir + "/config/devices.json",
-        "config/devices.json",
-        "../config/devices.json",
-        appDir + "/devices.json",
-        "devices.json"
-    };
-
-    for (const auto& cand : candidates) {
-        if (QFileInfo::exists(cand)) {
-            return QFileInfo(cand).absoluteFilePath();
-        }
-    }
-
-    // Default to app local config directory
-    QString defaultTarget = appDir + "/config/devices.json";
-    QDir().mkpath(QFileInfo(defaultTarget).absolutePath());
-    return defaultTarget;
+    return DeviceCredentialStore::defaultPath();
 }
 
 bool DeviceConfigManager::load(const QString& configPath) {
@@ -134,6 +116,8 @@ bool DeviceConfigManager::load(const QString& configPath) {
     QString path = configPath.isEmpty() ? m_currentFilePath : configPath;
     path = resolveConfigPath(path);
     m_currentFilePath = path;
+    if (path == DeviceCredentialStore::defaultPath() &&
+        !DeviceCredentialStore::migrate(DeviceCredentialStore::legacyPaths(), {}, m_lastError)) return false;
 
     QFile file(path);
     const bool hasLocal = file.open(QIODevice::ReadOnly);
@@ -155,20 +139,11 @@ bool DeviceConfigManager::load(const QString& configPath) {
                 repository.saveRegistry(MySqlRepository::sanitizedRegistry(root));
                 root = repository.loadRegistry();
             }
-            // Passwords stay in the existing local credential file, matched by camera ID.
-            QMap<QString, QJsonObject> credentials;
-            for (const auto& value : QJsonDocument::fromJson(localData).object()["devices"].toArray()) {
-                auto device = value.toObject(); credentials.insert(device["camera_id"].toString(), device);
-            }
+            // Match local secrets by archive key or a unique verified hardware UUID, never by IP.
+            const auto localDevices = QJsonDocument::fromJson(localData).object()["devices"].toArray();
             QJsonArray devices;
-            for (const auto& value : root["devices"].toArray()) {
-                auto device = value.toObject(); const auto local = credentials.value(device["camera_id"].toString());
-                device["password"] = local["password"];
-                const QUrl localUri(local["rtsp_url"].toString());
-                if (!localUri.userName().isEmpty()) device["username"] = localUri.userName();
-                if (!localUri.password().isEmpty()) device["password"] = localUri.password();
-                devices.append(device);
-            }
+            for (const auto& value : root["devices"].toArray())
+                devices.append(DeviceCredentialStore::withCredentials(value.toObject(),localDevices));
             root["devices"] = devices;
             migrated = removeLegacyDemoDevices(root);
             migrated = mergeDuplicateDevices(root) || migrated;
@@ -228,6 +203,7 @@ bool DeviceConfigManager::save(const QString& configPath) {
 
     QJsonObject root;
     QJsonObject sys;
+    sys["credential_storage_version"] = 1;
     sys["updated_at"] = QDateTime::currentDateTime().toString("yyyy-MM-dd HH:mm:ss");
     root["system"] = sys;
 
@@ -268,7 +244,7 @@ bool DeviceConfigManager::save(const QString& configPath) {
     if (!writeLocal(path)) {
         failures.append({stage, path, reason});
         // Preserve atomic writes; do not truncate a locked or protected credentials file.
-        const auto fallback = QStandardPaths::writableLocation(QStandardPaths::AppLocalDataLocation) + "/credentials/devices.json";
+        const auto fallback = DeviceCredentialStore::defaultPath();
         if (configPath.isEmpty() && DatabaseSettings::fromEnvironment().enabled && path != fallback) {
             recoveredFrom = path;
             path = QFileInfo(fallback).absoluteFilePath();
@@ -307,26 +283,6 @@ bool DeviceConfigManager::save(const QString& configPath) {
         retryDatabaseSync();
         // Database mode uses this one file as the local credential cache only.
         return true;
-    }
-
-    // Synchronize to workspace devices.json copies if running from build directory
-    QStringList syncCandidates = {
-        "config/devices.json",
-        "../config/devices.json",
-        "../../config/devices.json"
-    };
-    for (const auto& altPath : syncCandidates) {
-        if (QFileInfo::exists(altPath)) {
-            QString can1 = QFileInfo(path).canonicalFilePath();
-            QString can2 = QFileInfo(altPath).canonicalFilePath();
-            if (can1.isEmpty() || can2.isEmpty() || can1 != can2) {
-                QFile altFile(altPath);
-                if (altFile.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
-                    altFile.write(doc.toJson(QJsonDocument::Indented));
-                    altFile.close();
-                }
-            }
-        }
     }
 
     m_registrySavePending = false;

@@ -207,11 +207,9 @@ private:
     cv::Mat m_lastCapturedFrame;
     bool m_isLiveStreaming{false};
 
-    // 4 Core Pipeline Stage Image Display Labels
-    QLabel *m_imgStage1{nullptr}; // Step 1: 图像/视频采集原帧 (Original Stream Frame)
-    QLabel *m_imgStage2{nullptr}; // Step 2: 视场透视矫正 (FOV Rectified Image)
-    QLabel *m_imgStage3{nullptr}; // Step 3: 检测输入灰度图 (Grayscale Input)
-    QLabel *m_imgStage4{nullptr}; // Step 4: 最终仪表读数识别 (Final Recognition Overlay)
+    // Original capture and final recognition image displays
+    QLabel *m_originalImage{nullptr};
+    QLabel *m_recognitionImage{nullptr};
 
     // Bottom System Log Console
     QTextEdit *m_logConsole{nullptr};

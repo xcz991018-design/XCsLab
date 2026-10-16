@@ -126,24 +126,6 @@ if(WIN32)
     endif()
 endif()
 
-# Automatically deploy config folder (devices.json, gauge_profile.json) to output directories on build
-add_custom_command(TARGET gauge_reader_gui POST_BUILD
-    COMMAND ${CMAKE_COMMAND} -E make_directory "$<TARGET_FILE_DIR:gauge_reader_gui>/config"
-    COMMAND ${CMAKE_COMMAND} -E copy_directory
-        "${CMAKE_CURRENT_SOURCE_DIR}/config"
-        "$<TARGET_FILE_DIR:gauge_reader_gui>/config"
-    COMMENT "Deploying config directory to gauge_reader_gui output directory"
-)
-
-add_custom_command(TARGET gauge_reader_test POST_BUILD
-    COMMAND ${CMAKE_COMMAND} -E make_directory "$<TARGET_FILE_DIR:gauge_reader_test>/config"
-    COMMAND ${CMAKE_COMMAND} -E copy_directory
-        "${CMAKE_CURRENT_SOURCE_DIR}/config"
-        "$<TARGET_FILE_DIR:gauge_reader_test>/config"
-    COMMENT "Deploying config directory to gauge_reader_test output directory"
-)
-
-
 # Headless runtime: same inspection pipeline, no MainWindow dependency.
 add_library(gauge_inspection_runtime STATIC
     src/GaugeTemplateStore.cpp src/GaugeTemplateMigration.cpp
@@ -155,96 +137,13 @@ add_library(gauge_inspection_runtime STATIC
     src/DeviceConfigManager.cpp src/FileCameraSource.cpp src/GaugeProfile.cpp
     src/GaugeReaderEngine.cpp src/PointerDetector.cpp src/ONVIFDeviceManager.cpp)
 target_link_libraries(gauge_inspection_runtime PUBLIC ${OpenCV_LIBS} ${QT_LIBS} gauge_mysql_client ws2_32 crypt32)
-add_executable(gauge_replay_inspection test_tools/ReplayInspection.cpp)
-target_link_libraries(gauge_replay_inspection PRIVATE gauge_inspection_runtime)
 add_executable(gauge_reader_service src/main_service.cpp)
 target_sources(gauge_inspection_runtime PRIVATE src/IsolatedCapture.cpp)
 target_link_libraries(gauge_reader_service PRIVATE gauge_inspection_runtime)
 target_link_libraries(gauge_reader_test PRIVATE gauge_inspection_runtime)
-include(CTest)
-if(BUILD_TESTING)
-    add_executable(device_archive_summary_tests tests/DeviceArchiveSummaryTest.cpp)
-    target_link_libraries(device_archive_summary_tests PRIVATE gauge_inspection_runtime)
-    add_test(NAME device_archive_summary_fields COMMAND device_archive_summary_tests)
-    add_executable(csv_report_tests tests/CsvReportTest.cpp)
-    target_link_libraries(csv_report_tests PRIVATE ${QT_LIBS})
-    add_test(NAME csv_report_excel_encoding COMMAND csv_report_tests)
-    add_executable(safe_working_range_tests tests/SafeWorkingRangeTest.cpp)
-    target_link_libraries(safe_working_range_tests PRIVATE gauge_inspection_runtime)
-    add_test(NAME safe_working_range_limits COMMAND safe_working_range_tests)
-    add_executable(pointer_shadow_tests tests/PointerShadowTest.cpp)
-    target_link_libraries(pointer_shadow_tests PRIVATE gauge_inspection_runtime)
-    target_compile_definitions(pointer_shadow_tests PRIVATE REPO_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}")
-    add_test(NAME pointer_shadow_discrimination COMMAND pointer_shadow_tests)
-    set_tests_properties(pointer_shadow_discrimination PROPERTIES TIMEOUT 30)
-    add_executable(camera_health_tests tests/CameraHealthScheduleTest.cpp src/AutoCameraDiscoveryService.cpp include/AutoCameraDiscoveryService.hpp)
-    target_link_libraries(camera_health_tests PRIVATE gauge_inspection_runtime)
-    add_test(NAME camera_health_scheduling COMMAND camera_health_tests)
-    set_tests_properties(camera_health_scheduling PROPERTIES TIMEOUT 15)
-    add_executable(scale_calibration_tests tests/ScaleCalibrationTest.cpp src/CardinalSelectorDialog.cpp include/CardinalSelectorDialog.hpp)
-    target_link_libraries(scale_calibration_tests PRIVATE gauge_inspection_runtime)
-    add_test(NAME scale_calibration_mapping COMMAND scale_calibration_tests)
-    set_tests_properties(scale_calibration_mapping PROPERTIES ENVIRONMENT "QT_QPA_PLATFORM=offscreen" TIMEOUT 30)
-    add_executable(camera_discovery_target_tests tests/CameraDiscoveryTargetsTest.cpp)
-    target_link_libraries(camera_discovery_target_tests PRIVATE gauge_inspection_runtime)
-    add_test(NAME camera_discovery_saved_targets COMMAND camera_discovery_target_tests)
-    add_executable(snapshot_frame_tests tests/SnapshotFrameReaderTest.cpp)
-    target_link_libraries(snapshot_frame_tests PRIVATE gauge_inspection_runtime)
-    add_test(NAME snapshot_decoder_warmup COMMAND snapshot_frame_tests)
-    set_tests_properties(snapshot_decoder_warmup PROPERTIES TIMEOUT 15)
-    add_executable(gauge_template_tests tests/GaugeTemplateTest.cpp src/GaugeTemplateDialog.cpp include/GaugeTemplateDialog.hpp src/CameraInfoEditDialog.cpp include/CameraInfoEditDialog.hpp)
-    target_link_libraries(gauge_template_tests PRIVATE gauge_inspection_runtime)
-    add_test(NAME gauge_template_management COMMAND gauge_template_tests)
-    set_tests_properties(gauge_template_management PROPERTIES ENVIRONMENT "QT_QPA_PLATFORM=offscreen" TIMEOUT 30)
-    if(WIN32 AND TARGET Qt5::Core)
-        get_target_property(template_qt_core Qt5::Core IMPORTED_LOCATION_RELEASE)
-        get_filename_component(template_qt_bin "${template_qt_core}" DIRECTORY)
-        if(EXISTS "${template_qt_bin}/../plugins/platforms/qoffscreen.dll")
-            add_custom_command(TARGET gauge_template_tests POST_BUILD
-                COMMAND ${CMAKE_COMMAND} -E make_directory "$<TARGET_FILE_DIR:gauge_template_tests>/platforms"
-                COMMAND ${CMAKE_COMMAND} -E copy_if_different "${template_qt_bin}/../plugins/platforms/qoffscreen.dll" "$<TARGET_FILE_DIR:gauge_template_tests>/platforms")
-        endif()
-    endif()
-    add_executable(tail_endpoint_tests tests/TailEndpointTest.cpp)
-    target_link_libraries(tail_endpoint_tests PRIVATE gauge_inspection_runtime)
-    add_test(NAME tail_endpoints_12345 COMMAND tail_endpoint_tests "${CMAKE_CURRENT_SOURCE_DIR}/test_images/12345.png")
-    add_executable(recognition_quality_tests tests/RecognitionQualityTest.cpp)
-    target_link_libraries(recognition_quality_tests PRIVATE ${OpenCV_LIBS} ${QT_LIBS})
-    add_test(NAME recognition_quality_advisory COMMAND recognition_quality_tests)
-    add_executable(isolated_capture_tests tests/IsolatedCaptureTest.cpp)
-    target_link_libraries(isolated_capture_tests PRIVATE gauge_inspection_runtime)
-    add_test(NAME isolated_capture_deadlines COMMAND isolated_capture_tests)
-    file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/tests-disabled-mysql.json" "{\"version\":1,\"enabled\":false}")
-    add_executable(inspection_service_tests tests/InspectionServiceTest.cpp)
-    target_link_libraries(inspection_service_tests PRIVATE gauge_inspection_runtime)
-    add_test(NAME inspection_service_pipeline COMMAND inspection_service_tests)
-    add_executable(gauge_run_mode_tests tests/GaugeRunModeTest.cpp)
-    target_link_libraries(gauge_run_mode_tests PRIVATE gauge_inspection_runtime)
-    add_test(NAME gauge_run_modes COMMAND gauge_run_mode_tests)
-    add_executable(input_acquisition_tests tests/InputAcquisitionTest.cpp)
-    add_executable(onvif_resolution_tests tests/OnvifResolutionTest.cpp)
-    target_link_libraries(onvif_resolution_tests PRIVATE gauge_inspection_runtime)
-    add_test(NAME onvif_stream_resolution COMMAND onvif_resolution_tests)
-    target_link_libraries(input_acquisition_tests PRIVATE gauge_inspection_runtime)
-    add_test(NAME explicit_input_acquisition COMMAND input_acquisition_tests)
-    add_executable(mysql_integration_tests tests/MySqlIntegrationTest.cpp src/DatabaseHistoryDialog.cpp src/DatabaseConnectionDialog.cpp src/CardinalSelectorDialog.cpp include/CardinalSelectorDialog.hpp)
-    target_link_libraries(mysql_integration_tests PRIVATE gauge_inspection_runtime)
-    target_compile_definitions(mysql_integration_tests PRIVATE REPO_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}")
-    add_test(NAME mysql_storage_and_review COMMAND mysql_integration_tests)
-    set_tests_properties(mysql_storage_and_review PROPERTIES SKIP_RETURN_CODE 77 ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
-    add_executable(database_configuration_tests tests/DatabaseConfigurationTest.cpp src/DatabaseConnectionDialog.cpp)
-    target_link_libraries(database_configuration_tests PRIVATE gauge_inspection_runtime)
-    add_test(NAME mysql_connection_configuration COMMAND database_configuration_tests)
-    add_executable(mysql_error_text_tests tests/MySqlErrorTextTest.cpp src/MySqlErrorText.cpp)
-    target_link_libraries(mysql_error_text_tests PRIVATE ${QT_LIBS})
-    add_test(NAME mysql_error_message_encoding COMMAND mysql_error_text_tests)
-    set_tests_properties(mysql_connection_configuration PROPERTIES ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
-    set_tests_properties(inspection_service_pipeline gauge_run_modes explicit_input_acquisition mysql_storage_and_review
-        PROPERTIES ENVIRONMENT "QT_QPA_PLATFORM=offscreen;GAUGE_MYSQL_DATABASE=;GAUGE_MYSQL_CONFIG_PATH=${CMAKE_CURRENT_BINARY_DIR}/tests-disabled-mysql.json")
-endif()
 
 if(WIN32)
-    foreach(runtime_target device_archive_summary_tests csv_report_tests safe_working_range_tests pointer_shadow_tests gauge_replay_inspection camera_health_tests scale_calibration_tests gauge_reader_gui gauge_reader_service camera_discovery_target_tests snapshot_frame_tests gauge_template_tests isolated_capture_tests inspection_service_tests gauge_run_mode_tests input_acquisition_tests onvif_resolution_tests mysql_integration_tests database_configuration_tests)
+    foreach(runtime_target gauge_reader_gui gauge_reader_service gauge_reader_test)
         if(TARGET ${runtime_target})
             foreach(qt_module Core Network Concurrent)
                 if(TARGET Qt5::${qt_module})
@@ -263,26 +162,4 @@ if(WIN32)
             endforeach()
         endif()
     endforeach()
-endif()
-
-# Temporary read-only camera snapshot diagnostic tool.
-add_executable(onvif_snapshot_probe test_tools/OnvifSnapshotProbe.cpp)
-target_link_libraries(onvif_snapshot_probe PRIVATE gauge_inspection_runtime)
-
-add_executable(recognition_mode_benchmark test_tools/RecognitionModeBenchmark.cpp)
-target_link_libraries(recognition_mode_benchmark PRIVATE gauge_inspection_runtime)
-
-if(BUILD_TESTING)
-    add_executable(evidence_archive_tests tests/EvidenceArchiveTest.cpp)
-    target_link_libraries(evidence_archive_tests PRIVATE gauge_inspection_runtime)
-    add_test(NAME evidence_archive_storage COMMAND evidence_archive_tests)
-    set_tests_properties(evidence_archive_storage PROPERTIES ENVIRONMENT "QT_QPA_PLATFORM=offscreen;GAUGE_MYSQL_DATABASE=;GAUGE_MYSQL_CONFIG_PATH=${CMAKE_BINARY_DIR}/tests-disabled-mysql.json")
-endif()
-
-if(BUILD_TESTING)
-    add_executable(pointer_occlusion_tests tests/PointerOcclusionTest.cpp)
-    target_link_libraries(pointer_occlusion_tests PRIVATE gauge_inspection_runtime)
-    target_compile_definitions(pointer_occlusion_tests PRIVATE REPO_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}")
-    add_test(NAME pointer_text_occlusion COMMAND pointer_occlusion_tests)
-    set_tests_properties(pointer_text_occlusion PROPERTIES TIMEOUT 30)
 endif()

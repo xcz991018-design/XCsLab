@@ -67,3 +67,12 @@ vcpkg_installed/
 Testing/
 .cache/
 /debug_images/
+
+# Generated diagnostics and test runs (original inputs/fixtures remain versionable)
+/debug_*.png
+/patch.png
+/result.png
+/result_rectified.png
+/test_outputs/
+/capture-test-*/
+/template-test-*/

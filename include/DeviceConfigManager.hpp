@@ -13,7 +13,7 @@
 /**
  * @brief Persistent Device Registry and Configuration Manager.
  * 
- * Manages device persistence (config/devices.json), device configuration,
+ * Manages user-data credential persistence, device configuration,
  * network parameters, and device life-cycle management.
  */
 class DeviceConfigManager : public QObject {

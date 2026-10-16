@@ -3,6 +3,7 @@
 #include "DeviceConfigManager.hpp"
 #include "MySqlRepository.hpp"
 #include "GaugeTemplateMigration.hpp"
+#include "DeviceCredentialStore.hpp"
 #include <QCoreApplication>
 #include <QCommandLineParser>
 #include <QTimer>
@@ -18,7 +19,11 @@ int main(int argc, char** argv) {
     parser.setApplicationDescription("Headless gauge inspection runtime");
     parser.addHelpOption();
     parser.addOptions({
-        QCommandLineOption("devices", "Device registry JSON", "path", "config/devices.json"),
+        QCommandLineOption("devices", "Explicit credential/registry JSON override (default: user data directory)", "path"),
+        QCommandLineOption("credential-path", "Print the shared user credential path without opening a camera"),
+        QCommandLineOption("migrate-config", "Migrate legacy JSON directory to user data and verify backups; no DB writes", "directory"),
+        QCommandLineOption("sync-credential-cache", "Add DB archive keys to the local credential cache without changing DB data"),
+        QCommandLineOption("audit-device-storage", "Print archive/template checksums without displaying credentials"),
         QCommandLineOption("import-templates", "One-time legacy template import into MySQL; exits without inspection", "path"),
         QCommandLineOption("check-database", "Check database template and device references without capture"),
         QCommandLineOption("output", "Evidence directory", "path", "inspection_snapshots"),
@@ -29,6 +34,91 @@ int main(int argc, char** argv) {
         QCommandLineOption("interval", "Repeat interval in seconds (0: one pass)", "seconds", "0")
     });
     parser.process(app);
+    if (parser.isSet("credential-path")) {
+        QTextStream(stdout) << DeviceCredentialStore::defaultPath() << "\n"; return 0;
+    }
+    if (parser.isSet("migrate-config")) {
+        QDir directory(parser.value("migrate-config"));
+        if (!directory.exists()) { QTextStream(stderr) << "Legacy directory does not exist\n"; return 2; }
+        QStringList archives;
+        for (const auto& file : directory.entryInfoList({"*.json"}, QDir::Files)) archives.append(file.absoluteFilePath());
+        auto sources = DeviceCredentialStore::legacyPaths(); sources.append(directory.absoluteFilePath("devices.json"));
+        QString error;
+        if (!DeviceCredentialStore::migrate(sources,archives,error,DeviceCredentialStore::defaultPath(),true)) {
+            QTextStream(stderr) << error << "\n"; return 2;
+        }
+        QJsonObject root;
+        if (!DeviceCredentialStore::readRegistry(DeviceCredentialStore::defaultPath(),root,error)) return 2;
+        QTextStream(stdout) << "Credential store: " << DeviceCredentialStore::defaultPath()
+            << "; devices: " << root["devices"].toArray().size() << "; legacy JSON backups: " << archives.size() << "\n";
+        return 0;
+    }
+    if (parser.isSet("sync-credential-cache")) {
+        try {
+            QString error; QJsonObject local;
+            if (!DeviceCredentialStore::readRegistry(DeviceCredentialStore::defaultPath(),local,error)) {
+                QTextStream(stderr) << error << "\n"; return 2;
+            }
+            const auto snapshot = local["devices"].toArray();
+            auto records = snapshot;
+            QSet<QString> ids;
+            for (const auto& value : records) ids.insert(value.toObject()["camera_id"].toString());
+            int added = 0;
+            for (const auto& value : MySqlRepository().loadRegistry()["devices"].toArray()) {
+                const auto device = value.toObject();
+                if (!ids.contains(device["camera_id"].toString())) {
+                    // Use exactly the effective credentials of the previous loader, not an IP match.
+                    records.append(DeviceCredentialStore::withCredentials(device,snapshot)); ++added;
+                }
+            }
+            if (!DeviceCredentialStore::archiveFile(DeviceCredentialStore::defaultPath(),DeviceCredentialStore::defaultPath(),error)) return 2;
+            local["devices"] = records;
+            if (!DeviceCredentialStore::atomicWrite(DeviceCredentialStore::defaultPath(),QJsonDocument(local).toJson(QJsonDocument::Indented),error)) {
+                QTextStream(stderr) << error << "\n"; return 2;
+            }
+            QTextStream(stdout) << "Added database credential cache entries: " << added << "\n";
+            return 0;
+        } catch (const std::exception& error) { QTextStream(stderr) << error.what() << "\n"; return 2; }
+    }
+    if (parser.isSet("audit-device-storage")) {
+        try {
+            MySqlRepository repository;
+            const auto registry = repository.loadRegistry();
+            QJsonArray templates;
+            for (const auto& record : repository.loadTemplates()) templates.append(record.definition);
+            const auto digest = [](const QJsonObject& object) { return QCryptographicHash::hash(QJsonDocument(object).toJson(QJsonDocument::Compact),QCryptographicHash::Sha256).toHex(); };
+            QJsonObject credentials; QString readError;
+            int matched = 0;
+            if (QFileInfo::exists(DeviceCredentialStore::defaultPath()) &&
+                !DeviceCredentialStore::readRegistry(DeviceCredentialStore::defaultPath(),credentials,readError)) {
+                QTextStream(stderr) << readError << "\n"; return 2;
+            }
+            QJsonArray connections;
+            QSet<QString> localIds;
+            for (const auto& value : credentials["devices"].toArray()) localIds.insert(value.toObject()["camera_id"].toString());
+            for (const auto& value : registry["devices"].toArray()) {
+                const auto device = value.toObject();
+                if (localIds.contains(device["camera_id"].toString())) ++matched;
+                const auto effective = DeviceCredentialStore::withCredentials(device,credentials["devices"].toArray());
+                QJsonObject connection;
+                for (const auto* key : {"camera_id", "hardware_id", "username", "password", "ip_or_sn", "rtsp_url", "port", "rtsp_port"})
+                    connection[key] = effective[key];
+                connections.append(connection);
+            }
+            QTextStream(stdout) << "Connections SHA256: " << digest(QJsonObject{{"connections",connections}}) << "\n";
+            for (const auto& value : registry["devices"].toArray()) {
+                const auto device = value.toObject();
+                const QJsonObject identity{{"camera_id",device["camera_id"]},{"hardware_id",device["hardware_id"]},
+                    {"credential_ref",device["credential_ref"]},{"address",device["ip_or_sn"]},
+                    {"has_calibration",device.contains("calibration")}};
+                QTextStream(stdout) << "DB identity: " << QJsonDocument(identity).toJson(QJsonDocument::Compact) << "\n";
+            }
+            QTextStream(stdout) << "Registry SHA256: " << digest(registry) << "; templates SHA256: "
+                << digest(QJsonObject{{"templates",templates}}) << "; devices: " << registry["devices"].toArray().size()
+                << "; local credential matches: " << matched << "\n";
+            return 0;
+        } catch (const std::exception& error) { QTextStream(stderr) << error.what() << "\n"; return 2; }
+    }
     if (parser.isSet("check-database")) {
         try {
             MySqlRepository repository;

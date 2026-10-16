@@ -2535,6 +2535,45 @@ PointerDetectionResult PointerDetector::detect(const cv::Mat& gray, const cv::Po
         res.tailDetected = tailA.valid;
     }
 
+    // The search ray locates a corridor; tracked edges may lie off that ray.
+    // Fit their midpoints and place the tip on the observed body centerline,
+    // then measure its bearing from the calibrated pivot (also used by scales).
+    const double searchRad = res.pointerAngle * M_PI / 180.0;
+    const cv::Point2d searchDir(std::cos(searchRad), std::sin(searchRad));
+    const cv::Point2d searchNormal(-searchDir.y, searchDir.x);
+    const double terminalRadius = res.endRadius > 0.0 ? res.endRadius : m_config.maxSearchRadius * 0.8;
+    res.tipPoint = effectivePivot + searchDir * terminalRadius;
+    std::vector<cv::Point2f> midpoints;
+    for (const auto& section : res.sections) {
+        if (section.valid && section.leftValid && section.rightValid && section.edgePairCoherent &&
+            std::isfinite(section.radius) && std::isfinite(section.centerT)) {
+            midpoints.emplace_back(static_cast<float>(section.radius), static_cast<float>(section.centerT));
+        }
+    }
+    if (midpoints.size() >= 5 &&
+        midpoints.back().x - midpoints.front().x >= m_config.minCommonLengthPx &&
+        std::abs(midpoints.back().x - terminalRadius) <= std::max(3.0, m_config.radialStepPx * 2.0)) {
+        cv::Vec4f line;
+        cv::fitLine(midpoints, line, cv::DIST_HUBER, 0, 0.01, 0.001);
+        if (std::abs(line[0]) > 0.5) {
+            const double slope = line[1] / line[0];
+            const double terminalOffset = line[3] + (terminalRadius - line[2]) * slope;
+            double residual = 0.0;
+            for (const auto& point : midpoints) {
+                residual += std::abs(point.y - line[3] - (point.x - line[2]) * slope) /
+                            std::sqrt(1.0 + slope * slope);
+            }
+            residual /= midpoints.size();
+            if (std::isfinite(terminalOffset) && residual <= m_config.maxLineFitResidualPx &&
+                std::abs(terminalOffset) <= m_config.corridorHalfWidthPx) {
+                res.tipPoint += searchNormal * terminalOffset;
+                const cv::Point2d tipVector = res.tipPoint - effectivePivot;
+                res.pointerAngle = normalizeAngle(std::atan2(tipVector.y, tipVector.x) * 180.0 / M_PI);
+            }
+        }
+    }
+    res.tipRadius = static_cast<float>(cv::norm(res.tipPoint - effectivePivot));
+
     if (res.tailDetected) {
         res.polarityConfidence = (res.tipLikelihoodMargin >= 1.5) ? "HIGH" : "MEDIUM";
     } else if (res.tipLikelihoodMargin < 1.2) {
@@ -2610,8 +2649,6 @@ PointerDetectionResult PointerDetector::detect(const cv::Mat& gray, const cv::Po
     double ptrRad = res.pointerAngle * M_PI / 180.0;
     cv::Point2d ptrDir(std::cos(ptrRad), std::sin(ptrRad));
 
-    res.tipRadius = static_cast<float>(res.endRadius > 0.0 ? res.endRadius : m_config.maxSearchRadius * 0.8);
-    res.tipPoint = effectivePivot + ptrDir * res.tipRadius;
     if (res.tailDetected && res.tailProfile.reach > 5.0) {
         res.tailPoint = effectivePivot - ptrDir * res.tailProfile.reach;
     } else {
