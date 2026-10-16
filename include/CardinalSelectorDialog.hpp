@@ -11,6 +11,7 @@
 #include <QPaintEvent>
 #include <opencv2/opencv.hpp>
 #include <vector>
+#include <utility>
 
 #include "GaugeProfile.hpp"
 
@@ -79,6 +80,7 @@ private slots:
 private:
     void setupUi();
     void updatePreview();
+    std::pair<cv::Point2f,QJsonArray> sourceAnnotations() const;
 
     cv::Mat m_frame;
     GaugeProfile& m_profile;
@@ -92,7 +94,8 @@ private:
     cv::Mat m_inverseHomography;
     bool m_perspectiveConfirmed{false};
     bool m_centerConfirmed{false};
-    bool m_loadExistingPoints{true};
+    cv::Point2f m_sourceCenter{-1,-1};
+    QJsonArray m_sourceScalePoints;
     QDoubleSpinBox *m_baseRadiusSpinBox{nullptr};
     QPushButton *m_autoBtn{nullptr};
     QPushButton *m_resetBtn{nullptr};

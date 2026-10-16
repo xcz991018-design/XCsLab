@@ -16,6 +16,7 @@
 #include <QPointer>
 #include <atomic>
 #include "CameraHealthSchedule.hpp"
+#include "SafeWorkingRange.hpp"
 #include "ICameraSource.hpp"
 #include "GB28181StreamManager.hpp"
 #include "ONVIFDeviceManager.hpp"
@@ -25,6 +26,7 @@
  */
 struct DiscoveredCameraItem {
     QString cameraId;
+    QString hardwareId; // Stable ONVIF device UUID; empty means identity is unverified.
     QString customName;
     QString ipOrSn;
     CameraProtocolType protocolType{CameraProtocolType::LOCAL_FILE};
@@ -38,6 +40,7 @@ struct DiscoveredCameraItem {
     bool isOnline{true};
     QString defaultProfileId{"PRESSURE_GAUGE_1.6MPA"};
     QString lastSeenTime;
+    SafeWorkingRange safeWorkingRange;
 
     // Asset & Physical Installation Metadata (no defaults, requires explicit input)
     QString substation;

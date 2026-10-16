@@ -153,12 +153,8 @@ int main(int argc,char** argv) {
         auto saveDialog = [&](const QString& id, bool success) {
             auto profile = calibrationProfile;
             CardinalSelectorDialog dialog(calibrationFrame, profile, id);
-            require(QMetaObject::invokeMethod(&dialog,"onConfirmPerspective",Qt::DirectConnection),"Perspective step failed");
-            auto* corrected=dialog.findChild<InteractiveImageLabel*>("rectifiedCalibrationImage");
-            corrected->resize(800,800);
-            const auto center=corrected->getCenterPoint();
-            QMouseEvent centerClick(QEvent::MouseButtonPress,QPointF(center.x,center.y),Qt::LeftButton,Qt::LeftButton,Qt::NoModifier);
-            QApplication::sendEvent(corrected,&centerClick);
+            for(auto* spin:dialog.findChildren<QDoubleSpinBox*>())
+                if(spin->suffix().contains("px")) spin->setValue(63);
             QEventLoop loop; QTimer poll, timeout; timeout.setSingleShot(true); int ticks=0;
             QObject::connect(&dialog,&QDialog::accepted,&loop,&QEventLoop::quit);
             QObject::connect(&poll,&QTimer::timeout,&loop,[&]{
@@ -179,6 +175,7 @@ int main(int argc,char** argv) {
         require(calibrationManager.getDevice(device.cameraId).hasCalibration &&
                 calibrationManager.getDevice(device.cameraId).password==device.password,
                 "Calibration confirmation lost local credentials");
+        require(repository.loadDevice(device.cameraId).pointerBaseRadius==63,"Radius-only edit was not persisted");
         const auto persistedPoints=repository.loadDevice(device.cameraId).scalePoints;
         require(persistedPoints.size()==calibrationProfile.scalePoints.size(),"Scale endpoints were not persisted");
         for(int i=0;i<persistedPoints.size();++i) {
@@ -200,7 +197,7 @@ int main(int argc,char** argv) {
         cv::Mat pixels(48,64,CV_8UC3,cv::Scalar(17,98,205)); const auto imagePath=folder.path()+"/original.png";
         require(cv::imwrite(imagePath.toStdString(),pixels),"Image creation failed");
         QFile imageFile(imagePath); require(imageFile.open(QIODevice::ReadOnly),"Image read failed"); auto imageBytes=imageFile.readAll(); imageFile.close();
-        InspectionTask task; task.taskId=QUuid::createUuid().toString(QUuid::WithoutBraces); task.device=device;
+        InspectionTask task; task.taskId=QUuid::createUuid().toString(QUuid::WithoutBraces); task.device=repository.loadDevice(device.cameraId);
         task.inputKind=InspectionInputKind::LocalImage; task.captureOnly=true; task.localImagePath=imagePath;
         task.outputDirectory=folder.path()+"/evidence";
         InspectionOutcome out; out.taskId=task.taskId; out.cameraId=device.cameraId;
@@ -307,6 +304,7 @@ int main(int argc,char** argv) {
         // Refresh discovers a camera: automatic registration must survive a DB-backed restart.
         DiscoveredCameraItem discoveredCamera;
         discoveredCamera.cameraId = "CAM_ONVIF_192_0_2_25";
+        discoveredCamera.hardwareId = "33333333-3333-4333-8333-333333333333";
         discoveredCamera.ipOrSn = "192.0.2.25";
         discoveredCamera.protocolType = CameraProtocolType::ONVIF_RTSP_STREAM;
         discoveredCamera.customName = "新车间摄像头";
@@ -320,6 +318,13 @@ int main(int argc,char** argv) {
         manager.waitForDatabaseWrites();
         require(manager.load(registryPath) && manager.hasDevice(addedCamera.cameraId),"DB restart did not restore discovered camera");
         require(!manager.getDevice(addedCamera.cameraId).isOnline,"DB restart reused stale online state");
+        discoveredCamera.ipOrSn = "198.51.100.25";
+        const auto relocatedCamera = manager.registerDiscoveredDevice(discoveredCamera);
+        manager.waitForDatabaseWrites();
+        require(relocatedCamera.cameraId == addedCamera.cameraId, "IP change replaced the DB identity");
+        require(manager.load(registryPath) && manager.getDevice(addedCamera.cameraId).ipOrSn == discoveredCamera.ipOrSn &&
+            manager.getDevice(addedCamera.cameraId).hardwareId == discoveredCamera.hardwareId,
+            "IP/UUID update did not survive DB restart");
         auto bad=envelope; bad["task_id"]=QUuid::createUuid().toString(QUuid::WithoutBraces);
         bad["original_path"]=folder.path()+"/missing.png";
         require(throws([&]{repository.saveInspection(bad);}),"Missing original accepted");
@@ -337,6 +342,27 @@ int main(int argc,char** argv) {
         require(repository.original(reread.taskId).bytes==imageBytes,"Reanalysis changed original bytes");
         require(repository.original(reread.taskId).inspection.device.customName=="测试油压表", "Reanalysis did not preserve historical config identity");
         require(database.scalar("SELECT COUNT(*) FROM image_blobs")==1,"Original was duplicated");
+        // Recognition must use the original task's calibration, even with no current
+        // geometry or a conflicting per-analysis calibration supplied by the caller.
+        auto replay=task; replay.captureOnly=false;
+        replay.device.hasCalibration=false; replay.device.scalePoints={}; replay.device.centerX=-1;
+        replay.historicalCalibration=QJsonObject{{"calibrated_width",1},{"center_x",-999}};
+        replay.historicalProfile=QJsonObject{{"ignored_current_template",true}};
+        const auto replayed=run(service,replay);
+        require(replayed.recognitionPerformed && replayed.databaseSaved && factoryCalls==0,
+                "Historical recognition requested new calibration or opened camera");
+        require(replayed.deviceSnapshot["calibration"].toObject()==deviceToJson(repository.original(out.taskId).inspection.device)["calibration"].toObject(),
+                "Historical recognition replaced the original calibration");
+        require(replayed.profileSnapshot["profiles"]==out.profileSnapshot["profiles"],"Historical recognition used a current template");
+        auto incomplete=envelope; const auto incompleteId=QUuid::createUuid().toString(QUuid::WithoutBraces);
+        incomplete["task_id"]=incompleteId; auto incompleteDevice=incomplete["device"].toObject();
+        incompleteDevice.remove("calibration"); incomplete["device"]=incompleteDevice;
+        incomplete["original_path"]=reread.originalPath;
+        repository.saveInspection(incomplete);
+        auto missingGeometry=replay; missingGeometry.databaseOriginalTaskId=missingGeometry.parentTaskId=incompleteId;
+        const auto deniedReplay=run(service,missingGeometry);
+        require(deniedReplay.errorCode=="HISTORICAL_CONFIGURATION_MISSING" && !deniedReplay.recognitionPerformed,
+                "Incomplete history silently used current geometry");
         auto recalibrated=task; recalibrated.useHistoricalConfiguration=false;
         const auto configured=run(service,recalibrated);
         require(configured.databaseSaved && repository.original(configured.taskId).inspection.device.customName==task.device.customName,
@@ -347,9 +373,10 @@ int main(int argc,char** argv) {
         auto rejected=run(service,wrong); require(!rejected.errorCode.isEmpty() && rejected.capturedFrame.empty(),"Wrong camera history accepted");
 
         // The GUI must query metadata first, then fetch the original after a click.
-        bool viewerOpened=false, imageDisplayed=false;
+        bool viewerOpened=false, imageDisplayed=false, replaySubmitted=false;
+        InspectionTask viewerTask;
         {
-            DatabaseHistoryDialog dialog(nullptr,[](InspectionTask){}); dialog.show();
+            DatabaseHistoryDialog dialog(nullptr,[&](InspectionTask task){viewerTask=task; replaySubmitted=true;}); dialog.show();
             QEventLoop loop; QTimer probe, timeout; timeout.setSingleShot(true);
             bool clicked=false;
             QObject::connect(&probe,&QTimer::timeout,&loop,[&]{
@@ -364,13 +391,19 @@ int main(int argc,char** argv) {
                 for (auto* widget:QApplication::topLevelWidgets()) if (widget->objectName()=="databaseOriginalViewer") {
                     viewerOpened=true; auto* label=widget->findChild<QLabel*>("databaseOriginalImage");
                     imageDisplayed=label && label->pixmap() && !label->pixmap()->isNull();
-                    static_cast<QDialog*>(widget)->accept(); loop.quit(); break;
+                    auto* analyze=widget->findChild<QPushButton*>("databaseReanalyzeButton");
+                    if(analyze && analyze->isEnabled()) analyze->click();
+                    else static_cast<QDialog*>(widget)->accept();
+                    loop.quit(); break;
                 }
             });
             QObject::connect(&timeout,&QTimer::timeout,&loop,&QEventLoop::quit);
             probe.start(10); timeout.start(15000); loop.exec(); dialog.close();
         }
         require(viewerOpened && imageDisplayed,"UI did not fetch and display database original");
+        require(replaySubmitted && viewerTask.databaseOriginalTaskId==out.taskId && viewerTask.useHistoricalConfiguration &&
+                viewerTask.historicalCalibration.isEmpty() && viewerTask.historicalProfile==out.profileSnapshot,
+                "History UI did not submit the frozen configuration directly");
 
         // A disconnected writer keeps an atomic outbox file and retries idempotently.
         task.inputKind=InspectionInputKind::LocalImage; task.databaseOriginalTaskId.clear(); task.parentTaskId.clear();
@@ -392,6 +425,49 @@ int main(int argc,char** argv) {
         registry["devices"]=QJsonArray(); repository.saveRegistry(registry);
         require(repository.loadRegistry()["devices"].toArray().isEmpty(),"Soft deleted device visible");
         require(repository.original(out.taskId).bytes==imageBytes,"Soft deletion erased history evidence");
+
+        // Image retention preserves all results/configs and shared originals.
+        database.execute("ALTER TABLE inspection_history DROP COLUMN result_snapshot");
+        repository.checkConnection();
+        require(database.scalar("SELECT COUNT(*) FROM information_schema.columns WHERE table_schema=DATABASE() AND table_name='inspection_history' AND column_name='result_snapshot'")==1,"Evidence schema upgrade failed");
+        auto makeAged=[&](int days,bool anomaly,bool legacy=false,bool unique=false) {
+            const auto id=QUuid::createUuid().toString(QUuid::WithoutBraces);
+            auto copy=envelope; copy["task_id"]=id;
+            copy["processed_at"]=QDateTime::currentDateTimeUtc().addDays(-days).toString(Qt::ISODateWithMs);
+            copy["parent_task_id"]=QString(); copy["reuse_original_task_id"]=QString();
+            copy["result"]=legacy ? QJsonObject() : QJsonObject{{"archive",QJsonObject{{"anomaly",anomaly}}}};
+            const auto local=task.outputDirectory+"/"+id;
+            require(QDir().mkpath(local),"Retention folder failed");
+            const auto originalPath=local+(unique ? "/original.jpg" : "/original.png");
+            if(unique) require(cv::imwrite(originalPath.toStdString(),cv::Mat(32,32,CV_8UC3,cv::Scalar(1,2,3))),"JPEG retention fixture failed");
+            else require(QFile::copy(task.localImagePath,originalPath),"Retention sample copy failed");
+            copy["original_path"]=originalPath;
+            QFile metadata(local+"/result.json"); require(metadata.open(QIODevice::WriteOnly),"Retention metadata failed");
+            metadata.write(QJsonDocument(QJsonObject{{"task_id",id},{"profile_snapshot",out.profileSnapshot}}).toJson()); metadata.close();
+            repository.saveInspection(copy);
+            return id;
+        };
+        const auto normalOld=makeAged(8,false),normalRecent=makeAged(6,false),abnormalOld=makeAged(91,true),
+            abnormalRecent=makeAged(89,true),reviewed=makeAged(8,false),pendingOld=makeAged(8,false),legacy=makeAged(8,false,true);
+        const auto uniqueExpired=makeAged(8,false,false,true);
+        require(database.scalar("SELECT COUNT(*) FROM image_blobs WHERE mime_type='image/jpeg'")>=1,"JPEG MIME was not preserved");
+        const int blobsBefore=database.scalar("SELECT COUNT(*) FROM image_blobs");
+        repository.addReview(reviewed,"retention-reviewer","corrected","0.5","Keep abnormal sample");
+        auto pendingEnvelope=envelope; pendingEnvelope["task_id"]=pendingOld;
+        const auto protectedQueue=MySqlRepository::queueInspection(pendingEnvelope,task.outputDirectory);
+        const auto countBefore=database.scalar("SELECT COUNT(*) FROM inspection_history");
+        repository.maintainEvidence(task.outputDirectory);
+        require(database.scalar("SELECT COUNT(*) FROM image_blobs")==blobsBefore-1,"Unreferenced expired BLOB was not released");
+        require(throws([&]{repository.original(uniqueExpired);}),"Unique expired JPEG remained available");
+        require(throws([&]{repository.original(normalOld);}) && throws([&]{repository.original(abnormalOld);}),"Expired database images remained available");
+        require(!QFile::exists(task.outputDirectory+"/"+normalOld+"/original.png") &&
+                QFile::exists(task.outputDirectory+"/"+normalOld+"/result.json"),"Local expiry removed metadata or retained image");
+        for(const auto& id:{normalRecent,abnormalRecent,reviewed,pendingOld,legacy})
+            require(repository.original(id).bytes==imageBytes,"Retention deleted protected/shared image");
+        require(database.scalar("SELECT COUNT(*) FROM inspection_history")==countBefore,"Retention removed historical results");
+        require(QFile::remove(protectedQueue),"Pending retention fixture cleanup failed");
+        repository.maintainEvidence(task.outputDirectory);
+        require(throws([&]{repository.original(pendingOld);}),"Acknowledged expired sample not removed");
 
         database.execute("UPDATE image_blobs SET image_bytes=CONCAT(0x00,SUBSTRING(image_bytes,2))");
         require(throws([&]{repository.original(out.taskId);}),"Corrupted original passed integrity check");

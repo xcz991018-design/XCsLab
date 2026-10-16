@@ -543,8 +543,7 @@ GaugeResult GaugeReaderEngine::process(const cv::Mat& frame, GaugeProfile& profi
         double maxSpanAllowed = totalSpanDeg + 15.0;
         if (ptrSpanDeg > maxSpanAllowed && ptrSpanDeg < (360.0 - 15.0)) {
             char rangeWarn[256];
-            snprintf(rangeWarn, sizeof(rangeWarn), "⚠️ [量程警告] 指针角度 (%.1f°) 超出标定量程跨度 [%.1f°, %.1f°] (超出 %.1f°)",
-                     res.pointer_angle_deg, minAngle, maxAngle, ptrSpanDeg - totalSpanDeg);
+            snprintf(rangeWarn, sizeof(rangeWarn), "⚠️ [量程警告] 检测结果超出标定量程，请复核图像及标定配置。");
             if (!res.centerInconsistent) {
                 res.warningMessage = rangeWarn;
             }
@@ -639,8 +638,8 @@ void GaugeReaderEngine::drawOverlay(cv::Mat& canvas, const GaugeProfile& profile
         cv::putText(canvas, buf, cv::Point(boxX + 12, textY), cv::FONT_HERSHEY_SIMPLEX, 0.42, cv::Scalar(180, 180, 180), 1, cv::LINE_AA);
 
         textY += 22;
-        snprintf(buf, sizeof(buf), "Detected Angle: %.1f deg (Score: %.2f, Confidence: %.1f%%)",
-                 res.pointer_angle_deg, res.pointerDetectorResult.score, res.confidence * 100.0);
+        snprintf(buf, sizeof(buf), "Score: %.2f, Confidence: %.1f%%",
+                 res.pointerDetectorResult.score, res.confidence * 100.0);
         cv::putText(canvas, buf, cv::Point(boxX + 12, textY), cv::FONT_HERSHEY_SIMPLEX, 0.40, cv::Scalar(160, 160, 160), 1, cv::LINE_AA);
 
         if (res.center.x > 0 && res.center.y > 0 && res.radius > 5.0f) {
@@ -741,11 +740,11 @@ void GaugeReaderEngine::drawOverlay(cv::Mat& canvas, const GaugeProfile& profile
     cv::line(canvas, drawCenter, minP, cv::Scalar(255, 255, 0), 1, cv::LINE_AA);
     cv::line(canvas, drawCenter, maxP, cv::Scalar(255, 0, 255), 1, cv::LINE_AA);
 
-    // 3. Draw Text Badge Overlay (Positioned at Top-Right for rectified images to avoid HUD overlap)
-    int boxW = 380;
-    int boxH = 120;
-    int boxX = (invH.empty() && canvas.cols > 750) ? (canvas.cols - boxW - 10) : 10;
-    int boxY = (invH.empty() && canvas.cols <= 750) ? 170 : 10;
+    // 3. Anchor the final reading badge at the bottom-left, leaving the upper dial visible.
+    const int boxW = std::min(380, canvas.cols);
+    const int boxH = std::min(100, canvas.rows);
+    const int boxX = std::min(10, canvas.cols - boxW);
+    const int boxY = std::max(0, canvas.rows - boxH - 10);
 
     cv::rectangle(canvas, cv::Rect(boxX, boxY, boxW, boxH), cv::Scalar(20, 20, 25), -1);
     cv::rectangle(canvas, cv::Rect(boxX, boxY, boxW, boxH), cv::Scalar(0, 230, 118), 1);
@@ -758,9 +757,6 @@ void GaugeReaderEngine::drawOverlay(cv::Mat& canvas, const GaugeProfile& profile
     snprintf(buf, sizeof(buf), "Value: %.3f %s", res.value, profile.unit.c_str());
     cv::putText(canvas, buf, cv::Point(boxX + 12, textY + 30), cv::FONT_HERSHEY_SIMPLEX, 0.75, cv::Scalar(0, 230, 118), 2, cv::LINE_AA);
 
-    snprintf(buf, sizeof(buf), "Pointer Angle: %.1f deg", res.pointer_angle_deg);
-    cv::putText(canvas, buf, cv::Point(boxX + 12, textY + 56), cv::FONT_HERSHEY_SIMPLEX, 0.52, cv::Scalar(255, 255, 255), 1, cv::LINE_AA);
-
     snprintf(buf, sizeof(buf), "PointerDetector: Cross-Section Trajectory");
-    cv::putText(canvas, buf, cv::Point(boxX + 12, textY + 76), cv::FONT_HERSHEY_SIMPLEX, 0.44, cv::Scalar(180, 180, 180), 1, cv::LINE_AA);
+    cv::putText(canvas, buf, cv::Point(boxX + 12, textY + 56), cv::FONT_HERSHEY_SIMPLEX, 0.44, cv::Scalar(180, 180, 180), 1, cv::LINE_AA);
 }

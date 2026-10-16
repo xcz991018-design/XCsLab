@@ -6,6 +6,7 @@
 #include <QDebug>
 #include <set>
 #include "DeviceConfigManager.hpp"
+#include "CameraIdentity.hpp"
 #include <QUrl>
 #include "CameraDiscoveryTargets.hpp"
 #include <QFile>
@@ -180,7 +181,13 @@ void AutoCameraDiscoveryService::executeDiscoveryProcess(bool manual) {
 
     for (const auto& dev : onvifList) {
         DiscoveredCameraItem item;
-        item.cameraId = QString("CAM_ONVIF_%1").arg(QString::fromStdString(dev.ipAddress).replace('.', '_'));
+        item.hardwareId = CameraIdentity::normalize(QString::fromStdString(dev.hardwareId));
+        item.cameraId = CameraIdentity::archiveId(item.hardwareId);
+        if (item.cameraId.isEmpty()) {
+            emit logGenerated(tr("[AUTO-DISCOVERY] %1 未返回有效设备 UUID，不能自动绑定档案。").arg(QString::fromStdString(dev.ipAddress)));
+            foundIps.insert(dev.ipAddress);
+            continue;
+        }
         item.customName = QString("ONVIF 网络相机 (%1)").arg(QString::fromStdString(dev.ipAddress));
         item.ipOrSn = QString::fromStdString(dev.ipAddress);
         item.protocolType = CameraProtocolType::ONVIF_RTSP_STREAM;
@@ -196,10 +203,8 @@ void AutoCameraDiscoveryService::executeDiscoveryProcess(bool manual) {
         item.lastSeenTime = QDateTime::currentDateTime().toString("yyyy-MM-dd HH:mm:ss");
 
         if (m_stopping.load()) return;
-        if (!registeredHosts.contains(item.ipOrSn)) {
-            emit cameraDiscovered(item);
-            emit logGenerated(tr("[AUTO-DISCOVERY] 发现新设备: %1 (%2)。").arg(item.cameraId, item.modelName));
-        }
+        emit cameraDiscovered(item);
+        emit logGenerated(tr("[AUTO-DISCOVERY] 发现设备 UUID: %1，当前地址: %2。").arg(item.hardwareId, item.ipOrSn));
         newFound++;
         foundIps.insert(dev.ipAddress);
     }
@@ -294,23 +299,7 @@ void AutoCameraDiscoveryService::executeDiscoveryProcess(bool manual) {
                 }
 
                 if (isReachable) {
-                    DiscoveredCameraItem item;
-                    item.cameraId = QString("CAM_IP_%1").arg(QString(candIp).replace('.', '_'));
-                    item.customName = QString("%1 网络相机 (%2)").arg(hitPort == 34567 ? "雄迈" : "标准").arg(candIp);
-                    item.ipOrSn = candIp;
-                    item.protocolType = (hitPort == 34567 ? CameraProtocolType::SDK_JLINK : CameraProtocolType::ONVIF_RTSP_STREAM);
-                    item.protocolName = (hitPort == 34567 ? "Xiongmai JLink Camera" : "IP Camera (RTSP)");
-                    item.modelName = (hitPort == 34567 ? "JFTech Xiongmai Camera" : "Network Camera");
-                    item.port = 80;
-                    item.rtspPort = hitPort;
-                    item.rtspUrl = QString(); // Configure the actual vendor path and credentials.
-                    item.username = "";
-                    item.password = "";
-                    item.isOnline = true;
-                    item.defaultProfileId = "PRESSURE_GAUGE_1.6MPA";
-                    item.lastSeenTime = QDateTime::currentDateTime().toString("yyyy-MM-dd HH:mm:ss");
-
-                    emit cameraDiscovered(item);
+                    emit logGenerated(tr("[AUTO-DISCOVERY] %1 仅验证了 RTSP 服务，未取得硬件 UUID，暂不自动登记。").arg(candIp));
                     emit logGenerated(tr("[AUTO-DISCOVERY] Found Active Camera at %1 (RTSP Port %2).").arg(candIp).arg(hitPort));
                     ++fallbackFound;
                 }

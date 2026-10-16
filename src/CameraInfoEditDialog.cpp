@@ -9,8 +9,11 @@
 #include <QFileInfo>
 #include <QCoreApplication>
 #include <QTabWidget>
+#include <QScrollArea>
+#include <QGroupBox>
 #include <QDebug>
 #include <QUrl>
+#include "CameraIdentity.hpp"
 #include <QFutureWatcher>
 #include <QtConcurrent/QtConcurrent>
 
@@ -39,6 +42,7 @@ DiscoveredCameraItem CameraInfoEditDialog::getUpdatedDeviceItem() const {
     const QString previousAddress = item.ipOrSn;
     const QString previousStreamUrl = item.rtspUrl;
     item.cameraId = getUpdatedCameraId();
+    item.hardwareId = CameraIdentity::normalize(m_hardwareIdEdit->text());
     item.customName = m_customNameEdit ? m_customNameEdit->text().trimmed() : "";
     item.ipOrSn = m_ipEdit ? m_ipEdit->text().trimmed() : "192.168.1.101";
 
@@ -82,6 +86,8 @@ DiscoveredCameraItem CameraInfoEditDialog::getUpdatedDeviceItem() const {
     item.manufacturer = m_manufacturerEdit ? m_manufacturerEdit->text().trimmed() : "";
     item.modelName = m_modelNameEdit ? m_modelNameEdit->text().trimmed() : item.modelName;
     item.accuracyClass = m_accuracyClassEdit ? m_accuracyClassEdit->text().trimmed() : "";
+    item.safeWorkingRange = {m_safeRangeEnabled->isChecked(), m_normalMin->value(), m_normalMax->value(),
+        m_allowanceMinus->value(), m_allowancePlus->value()};
 
     return item;
 }
@@ -124,8 +130,8 @@ void CameraInfoEditDialog::setupUi() {
     resize(640, 560);
     setStyleSheet("QDialog { background-color: #121216; color: #e0e0e0; font-family: 'Segoe UI', Microsoft YaHei, sans-serif; }"
                   "QLabel { color: #b0bec5; font-size: 13px; font-weight: 500; }"
-                  "QLineEdit, QSpinBox, QComboBox { background-color: #1a1a24; border: 1px solid #33384c; border-radius: 4px; padding: 6px; color: #00e5ff; font-weight: bold; font-size: 13px; }"
-                  "QLineEdit:focus, QSpinBox:focus, QComboBox:focus { border: 1px solid #00e5ff; background-color: #202230; }"
+                  "QLineEdit, QSpinBox, QDoubleSpinBox, QComboBox { background-color: #1a1a24; border: 1px solid #33384c; border-radius: 4px; padding: 6px; color: #00e5ff; font-weight: bold; font-size: 13px; }"
+                  "QLineEdit:focus, QSpinBox:focus, QDoubleSpinBox:focus, QComboBox:focus { border: 1px solid #00e5ff; background-color: #202230; }"
                   "QTabWidget::pane { border: 1px solid #272a38; background-color: #14151c; border-radius: 4px; }"
                   "QTabBar::tab { background-color: #1a1c26; color: #9fa6b2; padding: 8px 18px; font-weight: bold; border: 1px solid #272a38; border-top-left-radius: 4px; border-top-right-radius: 4px; margin-right: 2px; }"
                   "QTabBar::tab:selected { background-color: #272a3e; color: #00e5ff; border-bottom-color: #00e5ff; }");
@@ -146,6 +152,9 @@ void CameraInfoEditDialog::setupUi() {
     netForm->setSpacing(10);
     netForm->setLabelAlignment(Qt::AlignRight | Qt::AlignVCenter);
 
+    m_hardwareIdEdit = new QLineEdit(netTab);
+    m_hardwareIdEdit->setPlaceholderText(tr("相机返回的 ONVIF UUID（旧档案需核对后绑定）"));
+    m_hardwareIdEdit->setToolTip(tr("绑定后换 IP 将保留此档案的标定和历史。请核对相机 UUID，不能填写 IP。"));
     m_cameraIdEdit = new QLineEdit(netTab);
     m_cameraIdEdit->setPlaceholderText("例如: CAM_192_168_1_101 或 CAM_01");
 
@@ -183,7 +192,8 @@ void CameraInfoEditDialog::setupUi() {
     m_passwordEdit->setPlaceholderText(tr("摄像头视频访问密码"));
 
 
-    netForm->addRow(tr("设备唯一编号 (camera_id):"), m_cameraIdEdit);
+    netForm->addRow(tr("档案编号 (camera_id):"), m_cameraIdEdit);
+    netForm->addRow(tr("硬件唯一标识 (ONVIF UUID):"), m_hardwareIdEdit);
     netForm->addRow(tr("设备别名/备注 (custom_name):"), m_customNameEdit);
     netForm->addRow(tr("通信协议 (protocol):"), m_protocolCombo);
     netForm->addRow(tr("设备IP/序列号 (ip_or_sn):"), m_ipEdit);
@@ -199,6 +209,8 @@ void CameraInfoEditDialog::setupUi() {
 
     // ================= Tab 2: 表计规格与安装档案 =================
     QWidget *gaugeTab = new QWidget(m_tabWidget);
+    gaugeTab->setObjectName("deviceGaugeArchive");
+    gaugeTab->setStyleSheet("QWidget#deviceGaugeArchive { background-color: #14151c; }");
     QFormLayout *gaugeForm = new QFormLayout(gaugeTab);
     gaugeForm->setSpacing(10);
     gaugeForm->setLabelAlignment(Qt::AlignRight | Qt::AlignVCenter);
@@ -245,7 +257,7 @@ void CameraInfoEditDialog::setupUi() {
         dialog.exec();
         refreshProfiles();
     });
-    gaugeForm->addRow(tr("表计算法模板:"), profileRow);
+    gaugeForm->addRow(tr("表计模板:"), profileRow);
     m_templateStatus = new QLabel(tr("正在读取数据库模板…"), gaugeTab);
     m_templateStatus->setWordWrap(true);
     m_templateStatus->setTextFormat(Qt::PlainText);
@@ -259,8 +271,63 @@ void CameraInfoEditDialog::setupUi() {
     gaugeForm->addRow(tr("<font color='#ff5252'>*</font> 规格型号 (model_name):"), m_modelNameEdit);
     gaugeForm->addRow(tr("<font color='#ff5252'>*</font> 精度等级 (accuracy_class):"), m_accuracyClassEdit);
 
-    m_tabWidget->addTab(gaugeTab, tr("⚙️ 表计规格与安装点位档案"));
+    auto* gaugeScroll = new QScrollArea(m_tabWidget);
+    gaugeScroll->setWidgetResizable(true);
+    gaugeScroll->setStyleSheet("QScrollArea { background-color: #14151c; }");
+    gaugeScroll->setFrameShape(QFrame::NoFrame);
+    gaugeScroll->setWidget(gaugeTab);
+    m_tabWidget->addTab(gaugeScroll, tr("⚙️ 表计规格与安装点位档案"));
 
+    auto* rangeTab = new QGroupBox(tr("安全工作范围"), gaugeTab);
+    rangeTab->setObjectName("deviceSafeRange");
+    rangeTab->setStyleSheet("QGroupBox { color: #b0bec5; border: 1px solid #33384c; border-radius: 4px; margin-top: 10px; padding-top: 8px; } QGroupBox::title { subcontrol-origin: margin; left: 10px; padding: 0 4px; }");
+    auto* rangeForm = new QFormLayout(rangeTab);
+    m_safeRangeEnabled = new QCheckBox(tr("启用安全工作范围检查"), rangeTab);
+    m_safeRangeEnabled->setObjectName("safeRangeEnabled");
+    m_safeRangeEnabled->setChecked(true);
+    m_safeRangeEnabled->setStyleSheet("QCheckBox { color: #d8dee9; font-weight: bold; }");
+    const auto makeBound = [&](const char* name, bool allowance) {
+        auto* spin = new QDoubleSpinBox(rangeTab);
+        spin->setObjectName(name);
+        spin->setDecimals(6);
+        spin->setRange(allowance ? 0.0 : -1e12, 1e12);
+        spin->setSingleStep(0.01);
+        return spin;
+    };
+    m_normalMin = makeBound("safeNormalMin", false);
+    m_normalMax = makeBound("safeNormalMax", false);
+    m_allowanceMinus = makeBound("safeAllowanceMinus", true);
+    m_allowancePlus = makeBound("safeAllowancePlus", true);
+    rangeForm->addRow(m_safeRangeEnabled);
+    auto* normalBounds = new QHBoxLayout();
+    normalBounds->addWidget(m_normalMin);
+    normalBounds->addWidget(new QLabel(tr("至"), rangeTab));
+    normalBounds->addWidget(m_normalMax);
+    rangeForm->addRow(tr("正常工作范围:"), normalBounds);
+    auto* allowances = new QHBoxLayout();
+    allowances->addWidget(new QLabel(tr("−"), rangeTab));
+    allowances->addWidget(m_allowanceMinus);
+    allowances->addWidget(new QLabel(tr("＋"), rangeTab));
+    allowances->addWidget(m_allowancePlus);
+    rangeForm->addRow(tr("允许偏差:"), allowances);
+    m_safeRangePreview = new QLabel(rangeTab);
+    m_safeRangePreview->setWordWrap(true);
+    rangeForm->addRow(m_safeRangePreview);
+    auto* hint = new QLabel(tr("数值单位与表计读数一致。安全范围 = [正常下限 − 负偏差，正常上限 ＋ 正偏差]，包含边界。\n使用未四舍五入的读数判断；超范围时巡检行醒目标注并弹窗提醒。"), rangeTab);
+    hint->setWordWrap(true);
+    rangeForm->addRow(hint);
+    const auto updateRange = [this]() {
+        const bool enabled = m_safeRangeEnabled->isChecked();
+        for (auto* spin : {m_normalMin, m_normalMax, m_allowanceMinus, m_allowancePlus}) spin->setEnabled(enabled);
+        const auto range = getUpdatedDeviceItem().safeWorkingRange;
+        m_safeRangePreview->setText(!enabled ? tr("未启用范围检查") : !range.valid() ? tr("范围无效：正常下限不能大于上限") :
+            tr("实际安全工作范围：[%1，%2]").arg(range.lower(), 0, 'f', 6).arg(range.upper(), 0, 'f', 6));
+    };
+    connect(m_safeRangeEnabled, &QCheckBox::toggled, this, updateRange);
+    for (auto* spin : {m_normalMin, m_normalMax, m_allowanceMinus, m_allowancePlus})
+        connect(spin, QOverload<double>::of(&QDoubleSpinBox::valueChanged), this, updateRange);
+    updateRange();
+    gaugeForm->insertRow(2, rangeTab);
     mainLayout->addWidget(m_tabWidget, 1);
 
     // Action Buttons
@@ -287,7 +354,7 @@ void CameraInfoEditDialog::setupUi() {
 void CameraInfoEditDialog::loadCameraInfo() {
     if (m_isNewDevice) {
         int nextId = DeviceConfigManager::instance().getAllDevices().size() + 1;
-        m_cameraIdEdit->setText(QString("CAM_IP_192_168_1_%1").arg(100 + nextId));
+        m_cameraIdEdit->setText("CAM_MANUAL_" + QUuid::createUuid().toString(QUuid::WithoutBraces));
         m_customNameEdit->setText(QString("%1号新摄像头节点").arg(nextId));
         m_ipEdit->setText(QString("192.168.1.%1").arg(100 + nextId));
         m_protocolCombo->setCurrentIndex(0); // Default ONVIF
@@ -310,6 +377,7 @@ void CameraInfoEditDialog::loadCameraInfo() {
     if (DeviceConfigManager::instance().hasDevice(m_originalCameraId)) {
         DiscoveredCameraItem dev = DeviceConfigManager::instance().getDevice(m_originalCameraId);
         m_cameraIdEdit->setText(dev.cameraId);
+        m_hardwareIdEdit->setText(dev.hardwareId);
         m_customNameEdit->setText(dev.customName);
         m_ipEdit->setText(dev.ipOrSn);
         m_portSpin->setValue(dev.port > 0 ? dev.port : 80);
@@ -340,12 +408,27 @@ void CameraInfoEditDialog::loadCameraInfo() {
         m_manufacturerEdit->setText(dev.manufacturer);
         m_modelNameEdit->setText(dev.modelName);
         m_accuracyClassEdit->setText(dev.accuracyClass);
+        m_normalMin->setValue(dev.safeWorkingRange.normalMin);
+        m_normalMax->setValue(dev.safeWorkingRange.normalMax);
+        m_allowanceMinus->setValue(dev.safeWorkingRange.allowanceMinus);
+        m_allowancePlus->setValue(dev.safeWorkingRange.allowancePlus);
+        m_safeRangeEnabled->setChecked(dev.safeWorkingRange.enabled);
     } else {
         m_cameraIdEdit->setText(m_originalCameraId);
     }
 }
 
 void CameraInfoEditDialog::onSave() {
+    const auto range = getUpdatedDeviceItem().safeWorkingRange;
+    if (range.enabled && !range.valid()) {
+        m_tabWidget->setCurrentIndex(m_tabWidget->count() - 1);
+        QMessageBox::warning(this, tr("安全工作范围无效"), tr("正常下限不能大于上限，允许偏差必须为非负数。"));
+        return;
+    }
+    if (!m_hardwareIdEdit->text().trimmed().isEmpty() && CameraIdentity::normalize(m_hardwareIdEdit->text()).isEmpty()) {
+        QMessageBox::warning(this, tr("硬件身份无效"), tr("请填写相机返回的有效 ONVIF UUID，不能填写 IP 地址。"));
+        return;
+    }
     if (saveCameraInfo()) {
         accept();
     }
@@ -355,7 +438,7 @@ bool CameraInfoEditDialog::saveCameraInfo() {
     const auto selectedProfile = m_gaugeProfileCombo->currentData().toString();
     if (m_templatesLoading || selectedProfile.isEmpty() || !m_availableProfileIds.contains(selectedProfile)) {
         m_tabWidget->setCurrentIndex(1);
-        QMessageBox::warning(this, tr("验证失败"), tr("请选择有效的表计算法模板；可以点击“管理模板”新增模板。"));
+        QMessageBox::warning(this, tr("验证失败"), tr("请选择有效的表计模板；可以点击“管理模板”新增模板。"));
         return false;
     }
     QString newCamId = getUpdatedCameraId();

@@ -4,6 +4,7 @@
 #include "MySqlRepository.hpp"
 #include "DeviceCodec.hpp"
 #include "InspectionCalibration.hpp"
+#include "EvidenceArchive.hpp"
 #include <QFutureWatcher>
 #include <QtConcurrent/QtConcurrent>
 #include <QDir>
@@ -66,13 +67,14 @@ CapturedTask capture(const InspectionTask& task, const InspectionService::Source
     data.outcome.result.runMode = task.runMode;
     if (cancel->load()) return data;
     if (task.inputKind == InspectionInputKind::HistoricalImage && !task.captureOnly &&
-        !hasSavedDeviceCalibration(task.historicalCalibration)) {
+        !usesHistoricalDatabaseConfiguration(task) && !hasSavedDeviceCalibration(task.historicalCalibration)) {
         data.outcome.errorCode = "HISTORICAL_CALIBRATION_REQUIRED";
         data.outcome.errorMessage = QStringLiteral(u"请先根据本次历史原图完成手动标定");
         return data;
     }
     auto applyHistoricalCalibration = [&]() {
-        if (task.inputKind != InspectionInputKind::HistoricalImage || task.captureOnly) return;
+        if (task.inputKind != InspectionInputKind::HistoricalImage || task.captureOnly ||
+            usesHistoricalDatabaseConfiguration(task)) return;
         if (task.historicalCalibration["calibrated_width"].toInt() != data.frame.cols ||
             task.historicalCalibration["calibrated_height"].toInt() != data.frame.rows)
             throw std::runtime_error("HISTORICAL_CALIBRATION_DIMENSIONS_MISMATCH");
@@ -98,6 +100,7 @@ CapturedTask capture(const InspectionTask& task, const InspectionService::Source
                 throw std::runtime_error("HISTORICAL_IDENTITY_MISMATCH");
             std::vector<uchar> bytes(stored.bytes.begin(), stored.bytes.end());
             data.frame = cv::imdecode(bytes, cv::IMREAD_COLOR);
+            data.outcome.encodedOriginal = bytes;
             if (data.frame.empty() || data.frame.cols != stored.width || data.frame.rows != stored.height)
                 throw std::runtime_error("ORIGINAL_DECODE_FAILED");
             if (task.useHistoricalConfiguration) {
@@ -108,6 +111,11 @@ CapturedTask capture(const InspectionTask& task, const InspectionService::Source
             data.outcome.deviceSnapshot = deviceToJson(data.task.device);
             data.outcome.capturedAt = stored.inspection.capturedAt;
             data.outcome.capturedFrame = data.frame;
+            if (usesHistoricalDatabaseConfiguration(task) && !task.captureOnly &&
+                (!canRecognizeDevice(data.task.device) || data.task.historicalProfile.isEmpty())) {
+                data.outcome.errorCode = "HISTORICAL_CONFIGURATION_MISSING";
+                data.outcome.errorMessage = QStringLiteral(u"该历史任务未保存完整有效的标定或算法配置，无法使用历史配置重分析");
+            }
             return data;
         }
         if (task.inputKind != InspectionInputKind::CameraSnapshot) {
@@ -118,7 +126,12 @@ CapturedTask capture(const InspectionTask& task, const InspectionService::Source
                 data.outcome.errorMessage = QStringLiteral(u"未指定有效图片或历史任务身份");
                 return data;
             }
-            data.frame = cv::imread(task.localImagePath.toStdString());
+            QFile originalFile(task.localImagePath);
+            if (originalFile.open(QIODevice::ReadOnly) && originalFile.size() <= 32*1024*1024) {
+                const auto bytes=originalFile.readAll();
+                data.outcome.encodedOriginal.assign(bytes.begin(),bytes.end());
+                data.frame=cv::imdecode(data.outcome.encodedOriginal,cv::IMREAD_COLOR);
+            }
             if (data.frame.empty()) {
                 data.outcome.errorCode = "IMAGE_READ_FAILED";
                 data.outcome.errorMessage = QStringLiteral(u"指定图片无法读取，未使用其他图像替代");
@@ -176,6 +189,7 @@ CapturedTask capture(const InspectionTask& task, const InspectionService::Source
         } else {
             const auto acquired = isolate ? isolatedCapture(task, cancel) : source->captureSnapshot();
             data.frame = acquired.frame;
+            data.outcome.encodedOriginal = acquired.encodedOriginal;
             data.outcome.captureMethod = acquired.message == "ONVIF_HTTP" ? "ONVIF_HTTP"
                 : task.device.protocolType == CameraProtocolType::ONVIF_RTSP_STREAM ? "RTSP" : "OTHER";
             if (source) source->close();
@@ -274,7 +288,18 @@ InspectionOutcome recognize(CapturedTask data, const std::shared_ptr<std::atomic
 InspectionOutcome persist(InspectionOutcome out, const InspectionTask& task,
                           const std::shared_ptr<std::atomic<bool>>& cancel) {
     if (cancel->load()) return out;
+    const auto snapshotDevice = out.deviceSnapshot.isEmpty() ? task.device : deviceFromJson(out.deviceSnapshot);
+    out.safetyAssessment = snapshotDevice.safeWorkingRange.assess(out.result.value,
+        out.recognitionPerformed && out.result.success && out.errorCode.isEmpty());
     const auto imageStarted = TimingClock::now();
+    const auto processedAt = QDateTime::currentDateTimeUtc();
+    const auto policy = EvidenceArchive::Policy::fromEnvironment();
+    const bool anomaly = EvidenceArchive::abnormal(out);
+    out.archiveMetadata = {{"schema_version",2}, {"anomaly",anomaly}, {"local_root",QFileInfo(task.outputDirectory).absoluteFilePath()},
+        {"retention_days",anomaly ? policy.abnormalDays : policy.normalDays},
+        {"images_expires_at",processedAt.addDays(anomaly ? policy.abnormalDays : policy.normalDays).toString(Qt::ISODateWithMs)},
+        {"software",EvidenceArchive::software()}};
+    QJsonArray imageManifest;
     try {
         // UUID folder prevents overwrites and path traversal through device IDs.
         const QString folder = QDir(task.outputDirectory).filePath(out.taskId);
@@ -282,33 +307,56 @@ InspectionOutcome persist(InspectionOutcome out, const InspectionTask& task,
         auto saveImage = [&](const cv::Mat& mat, const QString& name, QString& path) {
             if (mat.empty()) return;
             std::vector<uchar> bytes;
-            if (!cv::imencode(".png", mat, bytes)) throw std::runtime_error("Image encoding failed");
+            const auto extension = QFileInfo(name).suffix();
+            const std::vector<int> options = extension=="jpg" ? std::vector<int>{cv::IMWRITE_JPEG_QUALITY,90} : std::vector<int>{cv::IMWRITE_PNG_COMPRESSION,3};
+            if (!cv::imencode(("."+extension).toStdString(), mat, bytes, options)) throw std::runtime_error("Image encoding failed");
             const QString target = QDir(folder).filePath(name);
             QSaveFile file(target);
             if (!file.open(QIODevice::WriteOnly) ||
                 file.write(reinterpret_cast<const char*>(bytes.data()), qint64(bytes.size())) != qint64(bytes.size()) ||
                 !file.commit()) throw std::runtime_error("Evidence write failed");
             path = target;
+            imageManifest.append(QJsonObject{{"file",name}, {"bytes",static_cast<double>(bytes.size())},
+                {"sha256",QString::fromLatin1(QCryptographicHash::hash(QByteArray(reinterpret_cast<const char*>(bytes.data()), int(bytes.size())),QCryptographicHash::Sha256).toHex())}});
         };
         // Acquisition evidence is independent of diagnostic rendering. Keep it even
         // when recognition/configuration fails, and never replace it with another frame.
-        saveImage(out.capturedFrame, "original.png", out.originalPath);
-        saveImage(out.result.step2_rectified, "rectified.png", out.rectifiedPath);
-        saveImage(out.result.step4_recognition, "recognition.png", out.recognitionPath);
+        const auto suffix=EvidenceArchive::imageSuffix(out.encodedOriginal);
+        if (!out.capturedFrame.empty() && !suffix.isEmpty()) {
+            const auto bytes=QByteArray(reinterpret_cast<const char*>(out.encodedOriginal.data()),int(out.encodedOriginal.size()));
+            out.originalPath=QDir(folder).filePath("original"+suffix);
+            QSaveFile file(out.originalPath);
+            if (!file.open(QIODevice::WriteOnly) || file.write(bytes)!=bytes.size() || !file.commit()) throw std::runtime_error("Original evidence write failed");
+            imageManifest.append(QJsonObject{{"file","original"+suffix},{"bytes",bytes.size()},
+                {"sha256",QString::fromLatin1(QCryptographicHash::hash(bytes,QCryptographicHash::Sha256).toHex())}});
+            out.archiveMetadata["original_encoding"]="source_bytes";
+        } else {
+            saveImage(out.capturedFrame, "original.png", out.originalPath);
+            out.archiveMetadata["original_encoding"]="lossless_png";
+        }
+        out.archiveMetadata["original_width"]=out.capturedFrame.cols;
+        out.archiveMetadata["original_height"]=out.capturedFrame.rows;
+        saveImage(out.result.step2_rectified, "rectified.jpg", out.rectifiedPath);
+        saveImage(out.result.step4_recognition, "recognition.jpg", out.recognitionPath);
         if (task.runMode == GaugeRunMode::Debug) {
             QString grayPath;
             saveImage(out.result.step3_gray, "gray.png", grayPath);
             QString hudPath;
             saveImage(out.result.diagnosticHudImage, "diagnostic_hud.png", hudPath);
         }
+        out.archiveMetadata["images"]=imageManifest;
         out.timings["image_save_ms"] = elapsedMs(imageStarted);
         QJsonObject record;
+        record["archive"] = out.archiveMetadata;
+        record["safety_assessment"] = out.safetyAssessment;
+        record["pointer_angle_deg"] = out.result.pointer_angle_deg;
+        record["rectified_path"] = out.rectifiedPath;
         record["capture_method"] = out.captureMethod;
         record["timings_path"] = QDir(folder).filePath("timings.json");
         record["mode"] = gaugeRunModeName(task.runMode);
         record["input_kind"] = inspectionInputName(task.inputKind);
         record["parent_task_id"] = task.parentTaskId;
-        record["processed_at"] = QDateTime::currentDateTimeUtc().toString(Qt::ISODateWithMs);
+        record["processed_at"] = processedAt.toString(Qt::ISODateWithMs);
         record["recognition_performed"] = out.recognitionPerformed;
         record["device"] = out.deviceSnapshot;
         record["profile_snapshot"] = out.profileSnapshot;
@@ -318,8 +366,7 @@ InspectionOutcome persist(InspectionOutcome out, const InspectionTask& task,
         record["center_inconsistent"] = out.result.centerInconsistent;
         record["center_offset_px"] = out.result.centerOffsetDist;
         record["warning"] = QString::fromStdString(out.result.warningMessage);
-        if (task.runMode == GaugeRunMode::Debug)
-            record["diagnostics"] = QString::fromStdString(out.result.detailedDebugInfo);
+        record["diagnostics"] = QString::fromStdString(out.result.detailedDebugInfo);
         record["task_id"] = out.taskId;
         record["camera_id"] = out.cameraId;
         record["captured_at"] = out.capturedAt.toString(Qt::ISODateWithMs);
@@ -370,6 +417,8 @@ InspectionOutcome persist(InspectionOutcome out, const InspectionTask& task,
             out.timings["metrics_save_failed"] = true;
         }
     }
+    out.encodedOriginal.clear();
+    out.encodedOriginal.shrink_to_fit();
     // Evidence is on disk; retain scalar results rather than full per-device pipelines.
     if (task.returnImages) return out; // A single GUI task may display its outputs; patrol remains compact.
     GaugeResult compact;
@@ -434,13 +483,27 @@ void InspectionService::stop() {
 void InspectionService::retryDatabaseWrites(const QString& directory) {
     if (m_databaseRetryRunning || !DatabaseSettings::fromEnvironment().enabled) return;
     m_databaseRetryRunning = true;
-    auto* watcher = new QFutureWatcher<QString>(this);
-    connect(watcher, &QFutureWatcher<QString>::finished, this, [this, watcher]() {
+    const auto now=QDateTime::currentDateTimeUtc();
+    const bool maintain=!m_lastEvidenceMaintenance.isValid() || m_lastEvidenceMaintenance.secsTo(now)>=300;
+    using SyncResult=QPair<QString,QString>;
+    auto* watcher = new QFutureWatcher<SyncResult>(this);
+    connect(watcher, &QFutureWatcher<SyncResult>::finished, this, [this, watcher, maintain, now]() {
         m_databaseRetryRunning = false;
-        emit databaseSyncFinished(watcher->result());
+        const auto result=watcher->result();
+        emit databaseSyncFinished(result.first);
+        if(!result.second.isEmpty()) emit evidenceMaintenanceFinished(result.second);
+        if(maintain && !result.second.isEmpty() && !result.second.startsWith("RETENTION_FAILED")) m_lastEvidenceMaintenance=now;
         watcher->deleteLater();
     });
-    watcher->setFuture(QtConcurrent::run(&m_storagePool, [directory]() { return MySqlRepository::retryPending(directory); }));
+    watcher->setFuture(QtConcurrent::run(&m_storagePool, [directory,maintain]() {
+        SyncResult result;
+        result.first=MySqlRepository::retryPending(directory);
+        if(maintain && result.first.isEmpty()) {
+            try { result.second=MySqlRepository().maintainEvidence(directory); }
+            catch(const std::exception& e) { result.second="RETENTION_FAILED: "+QString::fromUtf8(e.what()); }
+        }
+        return result;
+    }));
 }
 
 void InspectionService::exportImage(const cv::Mat& frame, const QString& path) {

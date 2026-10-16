@@ -54,6 +54,7 @@ CREATE TABLE IF NOT EXISTS inspection_history (
     process_status VARCHAR(32) NOT NULL,
     error_code VARCHAR(64) NULL,
     error_message TEXT NULL,
+    result_snapshot JSON NULL,
     UNIQUE KEY uq_task_camera (task_id, camera_id),
     INDEX idx_camera_history (camera_id, processed_at, task_id),
     INDEX idx_history_time (processed_at, task_id),

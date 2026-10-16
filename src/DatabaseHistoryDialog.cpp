@@ -1,4 +1,5 @@
 #include "DatabaseHistoryDialog.hpp"
+#include "InspectionCalibration.hpp"
 #include <QDateTimeEdit>
 #include <QLineEdit>
 #include <QTableWidget>
@@ -100,17 +101,26 @@ void DatabaseHistoryDialog::query() {
         m_rows=result.rows; m_table->setRowCount(m_rows.size());
         for (int i=0;i<m_rows.size();++i) {
             const auto& r=m_rows[i];
-            const auto status=!r.errorCode.isEmpty()?r.errorCode:!r.recognitionPerformed?tr("仅采集"):
+            auto status=!r.errorCode.isEmpty()?r.errorCode:!r.recognitionPerformed?tr("仅采集"):
                 r.success?(r.qualityStatus=="review_required"?tr("待复核"):tr("识别成功")):tr("识别失败");
+            const auto safety = r.resultSnapshot["safety_assessment"].toObject();
+            const bool outsideSafeRange = safety["status"].toString() == "out_of_range";
+            if (outsideSafeRange) status = tr("异常：超出安全工作范围");
             const QStringList values={r.cameraId,r.device.customName,
                 r.capturedAt.isValid()?r.capturedAt.toLocalTime().toString("yyyy-MM-dd HH:mm:ss.zzz"):"--",
                 r.processedAt.toLocalTime().toString("yyyy-MM-dd HH:mm:ss.zzz"),r.inputKind,
-                r.success?QString::number(r.value,'g',12)+" "+r.unit:"--",QString::number(r.confidence*100,'f',1)+"%",
+                r.success?QString::number(r.value,'f',3)+" "+r.unit:"--",QString::number(r.confidence*100,'f',1)+"%",
                 status,r.hasOriginal?tr("可拉取"):tr("不可用"),r.taskId,
                 r.latestReview.isEmpty()?tr("未复核"):r.latestReview["reviewer"].toString()+" · "+
-                    r.latestReview["decision"].toString()+(r.latestReview["value"].isDouble()?" · "+QString::number(r.latestReview["value"].toDouble(),'g',12):QString())};
+                    r.latestReview["decision"].toString()+(r.latestReview["value"].isDouble()?" · "+QString::number(r.latestReview["value"].toDouble(),'f',3):QString())};
             for (int j=0;j<values.size();++j) {
                 auto* item=new QTableWidgetItem(values[j]); item->setToolTip(r.errorMessage); m_table->setItem(i,j,item);
+                if (outsideSafeRange) {
+                    item->setForeground(QColor("#ff5252")); item->setBackground(QColor("#38191f"));
+                    auto font=item->font(); font.setBold(true); item->setFont(font);
+                    item->setToolTip(tr("安全工作范围：[%1，%2] %3")
+                        .arg(safety["safe_min"].toDouble(),0,'f',6).arg(safety["safe_max"].toDouble(),0,'f',6).arg(r.unit));
+                }
             }
         }
         m_previous->setEnabled(m_page>0); m_next->setEnabled(result.error.isEmpty() && m_rows.size()==50);
@@ -162,7 +172,7 @@ void DatabaseHistoryDialog::showOriginal(const StoredImage& stored,const QImage&
     auto* layout=new QVBoxLayout(&viewer);
     auto* identity=new QLabel(tr("设备: %1 | 采集时间: %2 | 原读数: %3 | 图片: %4 × %5")
         .arg(record.cameraId,record.capturedAt.toLocalTime().toString(Qt::ISODateWithMs),
-             record.success?QString::number(record.value,'g',12)+" "+record.unit:"--")
+             record.success?QString::number(record.value,'f',3)+" "+record.unit:"--")
         .arg(stored.width).arg(stored.height),&viewer); layout->addWidget(identity);
     auto* scroll=new QScrollArea(&viewer); auto* imageLabel=new QLabel;
     imageLabel->setPixmap(QPixmap::fromImage(image)); scroll->setWidget(imageLabel); layout->addWidget(scroll,1);
@@ -213,9 +223,15 @@ void DatabaseHistoryDialog::showOriginal(const StoredImage& stored,const QImage&
             return file.open(QIODevice::WriteOnly) && file.write(bytes)==bytes.size() && file.commit()?QString():QString("EXPORT_FAILED");
         }));
     });
+    analyze->setText(tr("使用历史标定和配置重新分析"));
+    analyze->setObjectName("databaseReanalyzeButton");
+    analyze->setToolTip(tr("直接使用该历史任务保存的标定和算法配置，不读取当前设备标定，不需要重新标定。"));
+    analyze->setEnabled(canRecognizeDevice(record.device) && !record.profile.isEmpty());
+    if (!analyze->isEnabled()) analyze->setToolTip(tr("该历史任务缺少有效标定或算法快照，无法直接重分析。"));
     connect(analyze,&QPushButton::clicked,&viewer,[this,&viewer,record]{
         InspectionTask task; task.device=record.device; task.inputKind=InspectionInputKind::HistoricalImage;
         task.databaseOriginalTaskId=task.parentTaskId=record.taskId; task.originalCapturedAt=record.capturedAt;
+        task.useHistoricalConfiguration=true;
         task.historicalProfile=record.profile; m_analyze(task); viewer.accept();
     });
     viewer.exec();

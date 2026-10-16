@@ -1,8 +1,10 @@
 #include "MainWindow.hpp"
+#include "OnvifSoap.hpp"
 #include <QBrush>
 #include <QColor>
 #include "InspectionCalibration.hpp"
 #include "DeviceCodec.hpp"
+#include "DeviceArchiveSummary.hpp"
 #include "RecognitionQuality.hpp"
 #include "CardinalSelectorDialog.hpp"
 #include "ScaleCalibration.hpp"
@@ -14,6 +16,8 @@
 #include <QMessageBox>
 #include <QFileInfo>
 #include <QFile>
+#include <QSaveFile>
+#include "CsvReport.hpp"
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QJsonArray>
@@ -44,12 +48,17 @@ MainWindow::MainWindow(QWidget *parent) : QMainWindow(parent) {
         device.isOnline = online;
         if (online) device.lastSeenTime = QDateTime::currentDateTime().toString("yyyy-MM-dd HH:mm:ss");
         if (auto* row = findListItemByCameraId(cameraId)) updateDeviceListItemWidget(row, device);
+        if (m_deviceListWidget->currentItem() &&
+            m_deviceListWidget->currentItem()->data(Qt::UserRole).toString() == cameraId)
+            updateSelectedDeviceArchive(cameraId);
     });
 
     setupUi();
     applyDarkStyle();
 
     m_inspectionService = new InspectionService(this);
+    connect(m_inspectionService, &InspectionService::evidenceMaintenanceFinished, this,
+        [this](const QString& report) { onLogReceived("[STORAGE] "+report); });
     connect(m_inspectionService, &InspectionService::taskFinished, this, &MainWindow::onInspectionOutcome);
     connect(m_inspectionService, &InspectionService::taskStarted, this, [this](const QString&, const QString& cameraId) {
         m_discoveryService->deferHealthForCapture(cameraId);
@@ -151,6 +160,7 @@ MainWindow::MainWindow(QWidget *parent) : QMainWindow(parent) {
     });
     connect(m_previewService, &CameraPreviewService::frameReady, this,
             [this](const QString& cameraId, const FrameCaptureResult& result) {
+        if (cameraId != m_previewCameraId) return;
         if (!result.ok()) {
             m_cameraHasFrame = false;
         }
@@ -193,7 +203,7 @@ MainWindow::MainWindow(QWidget *parent) : QMainWindow(parent) {
         onLogReceived(tr("[LOCAL-ARCHIVE] 保存已恢复 | 原路径: %1 | 已改用用户数据目录: %2").arg(failedPath, savedPath));
     });
 
-    // Load the device list; preview starts only after user selection.
+    // Load archives without opening a stream; connection is an explicit context-menu action.
     loadAndRestoreSavedDevices();
 
     // Start background periodic network discovery without clearing user list
@@ -232,7 +242,6 @@ MainWindow::MainWindow(QWidget *parent) : QMainWindow(parent) {
     // Setup Live Stream Frame Grabber Timer (25 FPS)
     m_liveTimer = new QTimer(this);
     connect(m_liveTimer, &QTimer::timeout, this, &MainWindow::onUpdateLiveStreamFrame);
-    m_liveTimer->start(40);
 }
 
 void MainWindow::setupUi() {
@@ -337,7 +346,7 @@ QWidget* MainWindow::createLeftSidebar(QWidget *parent) {
     sideLayout->setSpacing(8);
 
     // 1. Auto-Discovery & Devices Box
-    QGroupBox *devBox = new QGroupBox(tr("摄像头设备管理库（点击设备查看实时画面）"), sidebar);
+    QGroupBox *devBox = new QGroupBox(tr("摄像头设备管理库（左键查看档案，右键连接）"), sidebar);
     QVBoxLayout *devLayout = new QVBoxLayout(devBox);
 
     QHBoxLayout *devBtnLayout = new QHBoxLayout();
@@ -415,19 +424,39 @@ QWidget* MainWindow::createLeftSidebar(QWidget *parent) {
     sideLayout->addWidget(fileBox);
 
     // 3. Profile Info Card
-    QGroupBox *profileBox = new QGroupBox(tr("摄像头与仪表规格档案 (GIS/位置/表头)"), sidebar);
+    QGroupBox *profileBox = new QGroupBox(tr("摄像头与仪表规格档案"), sidebar);
     QVBoxLayout *profLayout = new QVBoxLayout(profileBox);
     m_cfgGaugeId = new QLabel(tr("设备/节点编号: -"), profileBox);
     m_cfgLocationInfo = new QLabel(tr("安装位置: -"), profileBox);
-    m_cfgGisInfo = new QLabel(tr("GIS 坐标: -"), profileBox);
+    m_cfgHardwareId = new QLabel(tr("硬件 UUID: -"), profileBox);
     m_cfgGaugeSpec = new QLabel(tr("表头规格: -"), profileBox);
     m_cfgRange = new QLabel(tr("量程范围: -"), profileBox);
 
-    profLayout->addWidget(m_cfgGaugeId);
-    profLayout->addWidget(m_cfgLocationInfo);
-    profLayout->addWidget(m_cfgGisInfo);
-    profLayout->addWidget(m_cfgGaugeSpec);
-    profLayout->addWidget(m_cfgRange);
+    m_cfgNetworkInfo = new QLabel(tr("连接信息: -"), profileBox);
+    m_cfgSafeRange = new QLabel(tr("安全工作范围: -"), profileBox);
+    m_cfgCalibration = new QLabel(tr("表计标定: -"), profileBox);
+    auto* profileContents = new QWidget(profileBox);
+    profileContents->setObjectName("deviceArchiveContents");
+    profileContents->setStyleSheet("QWidget#deviceArchiveContents { background-color: #161822; }");
+    auto* profileFields = new QVBoxLayout(profileContents);
+    profileFields->setContentsMargins(4, 4, 4, 4);
+    profileFields->setSpacing(10);
+    for (auto* label : {m_cfgGaugeId, m_cfgHardwareId, m_cfgNetworkInfo, m_cfgLocationInfo,
+                       m_cfgGaugeSpec, m_cfgRange, m_cfgSafeRange, m_cfgCalibration}) {
+        label->setTextFormat(Qt::PlainText);
+        label->setWordWrap(true);
+        label->setTextInteractionFlags(Qt::TextSelectableByMouse);
+        label->setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Preferred);
+        profileFields->addWidget(label);
+    }
+    auto* profileScroll = new QScrollArea(profileBox);
+    profileScroll->setWidgetResizable(true);
+    profileScroll->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
+    profileScroll->setFrameShape(QFrame::NoFrame);
+    profileScroll->setMinimumHeight(160);
+    profileScroll->setMaximumHeight(300);
+    profileScroll->setWidget(profileContents);
+    profLayout->addWidget(profileScroll);
     sideLayout->addWidget(profileBox);
 
     // 4. Metrics Summary Card
@@ -435,14 +464,12 @@ QWidget* MainWindow::createLeftSidebar(QWidget *parent) {
     QVBoxLayout *resLayout = new QVBoxLayout(resultBox);
 
     m_valLabel = new QLabel(tr("<b>读取数值:</b> <font color='#00e676' size='+2'>--</font>"), resultBox);
-    m_angleLabel = new QLabel(tr("指针角度: --°"), resultBox);
     m_centerLabel = new QLabel(tr("表盘中心: (-- , --) px"), resultBox);
     m_confidenceLabel = new QLabel(tr("识别置信度: -- %"), resultBox);
     m_timeLabel = new QLabel(tr("算法耗时: -- ms"), resultBox);
     m_statusLabel = new QLabel(tr("系统状态: 就绪"), resultBox);
 
     resLayout->addWidget(m_valLabel);
-    resLayout->addWidget(m_angleLabel);
     resLayout->addWidget(m_centerLabel);
     resLayout->addWidget(m_confidenceLabel);
     auto qualityLabel = new QLabel(tr("旁路质量：未评估"), resultBox);
@@ -458,8 +485,7 @@ QWidget* MainWindow::createLeftSidebar(QWidget *parent) {
     connect(m_addDeviceBtn, &QPushButton::clicked, this, &MainWindow::onAddNewDevice);
     connect(m_removeDeviceBtn, &QPushButton::clicked, this, &MainWindow::onRemoveSelectedDevice);
     connect(m_deviceFilterEdit, &QLineEdit::textChanged, this, &MainWindow::onFilterDeviceList);
-    connect(m_deviceListWidget, &QListWidget::itemClicked, this, &MainWindow::onCameraSelectionChanged);
-    connect(m_deviceListWidget, &QListWidget::itemActivated, this, &MainWindow::onCameraSelectionChanged);
+    connect(m_deviceListWidget, &QListWidget::currentItemChanged, this, &MainWindow::onCameraSelectionChanged);
     connect(m_deviceListWidget, &QListWidget::customContextMenuRequested, this, &MainWindow::onDeviceCustomContextMenu);
     connect(m_browseImgBtn, &QPushButton::clicked, this, &MainWindow::onSelectImage);
     connect(m_snapAndRunBtn, &QPushButton::clicked, this, &MainWindow::onCaptureAndRecognizeCurrent);
@@ -546,7 +572,8 @@ QWidget* MainWindow::createLiveStreamStageArea(QWidget *parent) {
 
     tbLayout->addStretch();
 
-    m_toggleLiveBtn = new QPushButton(tr("⏸ 暂停实时预览"), toolbarBox);
+    m_toggleLiveBtn = new QPushButton(tr("实时预览（未连接）"), toolbarBox);
+    m_toggleLiveBtn->setEnabled(false);
     m_toggleLiveBtn->setStyleSheet("QPushButton { background-color: #f57c00; color: white; font-weight: bold; padding: 6px 14px; border-radius: 4px; }"
                                    "QPushButton:hover { background-color: #ff9800; }");
     tbLayout->addWidget(m_toggleLiveBtn);
@@ -584,7 +611,7 @@ QWidget* MainWindow::createLiveStreamStageArea(QWidget *parent) {
     m_liveStreamLabel->setAlignment(Qt::AlignCenter);
     m_liveStreamLabel->setMinimumSize(520, 380);
     m_liveStreamLabel->setStyleSheet("background-color: #0a0b0e; border: 1px solid #232635; border-radius: 4px;");
-    m_liveStreamLabel->setText(tr("<font color='#555868'>请在左侧列表中手动选择设备以查看实时画面</font>"));
+    m_liveStreamLabel->setText(tr("<font color='#555868'>请右键点击设备并选择“连接此设备”以查看实时画面</font>"));
 
     streamLayout->addWidget(m_liveStreamLabel, 1);
     splitter->addWidget(streamBox);
@@ -640,6 +667,11 @@ void MainWindow::applyDarkStyle() {
     QString style = R"(
         QMainWindow { background-color: #101117; }
         QWidget { color: #d1d5db; font-family: 'Segoe UI', Microsoft YaHei, sans-serif; font-size: 13px; }
+        QMenu { background-color: #1f2230; color: #f5f7fa; border: 1px solid #4b526b; padding: 5px; }
+        QMenu::item { background-color: transparent; color: #f5f7fa; padding: 8px 24px 8px 12px; }
+        QMenu::item:selected { background-color: #005b64; color: #ffffff; }
+        QMenu::item:disabled { color: #9299ab; }
+        QMenu::separator { height: 1px; background-color: #4b526b; margin: 5px 8px; }
         QGroupBox { border: 1px solid #272a38; border-radius: 6px; margin-top: 10px; font-weight: bold; background-color: #161822; color: #00e5ff; }
         QGroupBox::title { subcontrol-origin: margin; subcontrol-position: top left; padding: 2px 8px; background-color: #161822; }
         QLineEdit, QComboBox, QSpinBox { background-color: #1f2230; border: 1px solid #33384c; border-radius: 4px; padding: 5px; color: #ffffff; }
@@ -678,10 +710,10 @@ void MainWindow::loadAndRestoreSavedDevices() {
         return;
     }
 
-    if (m_previewService) m_previewService->select(InspectionTask());
+    disconnectCameraPreview();
     m_cameraHasFrame=false;
     m_liveStreamLabel->clear();
-    m_liveStreamLabel->setText(tr("请在左侧列表中手动选择设备以查看实时画面。"));
+    m_liveStreamLabel->setText(tr("请右键点击设备并选择“连接此设备”以查看实时画面。"));
     m_deviceListWidget->clear();
     m_discoveredItemsMap.clear();
 
@@ -706,6 +738,7 @@ void MainWindow::loadAndRestoreSavedDevices() {
     if (m_inspectionTable && !m_isPatrolRunning) {
         m_inspectionTable->setRowCount(devices.size());
         m_inspectionRecords.clear();
+        if (m_safeRangeAlert) m_safeRangeAlert->close();
         m_patrolCameraIdQueue.clear();
 
         QString snapshotDir = QCoreApplication::applicationDirPath() + "/inspection_snapshots";
@@ -838,7 +871,16 @@ void MainWindow::onDiscoveredCameraAdded(const DiscoveredCameraItem& item) {
             ? tr("[DEVICE] 新发现设备 %1 已自动登记并提交数据库同步，写入状态见 MySQL 状态栏。").arg(registered.cameraId)
             : tr("[DEVICE] 新发现设备 %1 已登记到本地档案；启用 MySQL 后可使用数据库设备管理。").arg(registered.cameraId));
     }
+    if (registered.cameraId.isEmpty()) return;
+    const auto previous = m_discoveredItemsMap.value(registered.cameraId);
+    const bool addressChanged = !previous.cameraId.isEmpty() &&
+        (previous.ipOrSn != registered.ipOrSn || previous.rtspUrl != registered.rtspUrl || previous.port != registered.port);
     m_discoveredItemsMap.insert(registered.cameraId, registered);
+    if (m_deviceListWidget->currentItem() &&
+        m_deviceListWidget->currentItem()->data(Qt::UserRole).toString() == registered.cameraId)
+        updateSelectedDeviceArchive(registered.cameraId);
+    if (addressChanged && m_previewCameraId == registered.cameraId)
+        switchActiveCameraSource(registered.cameraId);
     auto* listItem = findListItemByCameraId(registered.cameraId);
     if (!listItem) {
         listItem = new QListWidgetItem(m_deviceListWidget);
@@ -874,7 +916,7 @@ void MainWindow::onAddNewDevice() {
             it->setData(Qt::UserRole, newItem.cameraId);
         }
         updateDeviceListItemWidget(it, newItem);
-        onLogReceived(tr("[DEVICE] 请在设备列表中手动选择该设备以查看实时画面。"));
+        onLogReceived(tr("[DEVICE] 请在设备列表中右键连接该设备以查看实时画面。"));
 
         if (m_statusCameraCountBadge) {
             m_statusCameraCountBadge->setText(tr("📷 在库设备: %1 台").arg(m_discoveredItemsMap.size()));
@@ -903,13 +945,13 @@ void MainWindow::onRemoveSelectedDevice() {
         if (m_deviceListWidget->count() > 0) {
             m_deviceListWidget->clearSelection();
             m_deviceListWidget->setCurrentItem(nullptr);
-            if (m_previewService) m_previewService->select(InspectionTask());
+            disconnectCameraPreview();
             m_cameraHasFrame=false;
             m_liveStreamLabel->clear();
-            m_liveStreamLabel->setText(tr("请在左侧列表中手动选择设备以查看实时画面。"));
+            m_liveStreamLabel->setText(tr("请右键点击设备并选择“连接此设备”以查看实时画面。"));
         } else {
             if (m_singleService) m_singleService->stop();
-            if (m_previewService) m_previewService->select(InspectionTask());
+            disconnectCameraPreview();
             m_hasAnalysisInput = m_hasSnapshotInput = false;
             m_currentFrame.release();
             m_lastCapturedFrame.release();
@@ -928,9 +970,16 @@ void MainWindow::onDeviceCustomContextMenu(const QPoint& pos) {
     if (item) {
         m_deviceListWidget->setCurrentItem(item);
         QString camId = item->data(Qt::UserRole).toString();
-        menu.addAction(tr("⚡ 立即连接此设备"), this, [this, camId]() {
+        menu.addAction(tr("⚡ 连接此设备"), this, [this, camId]() {
             switchActiveCameraSource(camId);
         });
+        auto* disconnectAction = menu.addAction(tr("断开连接"), this, [this, camId]() {
+            if (m_previewCameraId == camId) {
+                disconnectCameraPreview();
+                onLogReceived(tr("[STREAM] 已断开设备 %1 的实时预览连接。").arg(camId));
+            }
+        });
+        disconnectAction->setEnabled(m_previewCameraId == camId);
         menu.addAction(tr("✏️ 编辑设备网络参数与表计档案..."), this, [this, item]() {
             onEditCameraInfo(item);
         });
@@ -981,27 +1030,27 @@ void MainWindow::closeEvent(QCloseEvent *event) {
 
 void MainWindow::onCameraSelectionChanged() {
     QListWidgetItem *curr = m_deviceListWidget->currentItem();
-    if (!curr) return;
-
-    QString camId = curr->data(Qt::UserRole).toString();
-    switchActiveCameraSource(camId);
+    if (!curr) {
+        disconnectCameraPreview();
+        m_selectedCameraId.clear();
+        m_profileReady = false;
+        updateSelectedDeviceArchive(QString());
+        return;
+    }
+    selectCameraForDetails(curr->data(Qt::UserRole).toString());
 }
 
-void MainWindow::switchActiveCameraSource(const QString& camId) {
+void MainWindow::selectCameraForDetails(const QString& camId) {
     if (!m_discoveredItemsMap.contains(camId)) return;
-    m_cameraHasFrame = false;
-    ++m_cameraConnectionGeneration;
-    m_calibrationSnapshot=FrameCaptureResult();
-    m_calibrationSnapshotCamera.clear();
-    m_calibrationSnapshotLoading=false;
+    if (m_selectedCameraId == camId) { updateSelectedDeviceArchive(camId); return; }
+    disconnectCameraPreview();
+    m_selectedCameraId = camId;
     m_calibrationChecked.remove(camId);
-    m_calibrationQueries.clear();
-    m_pendingCalibrationCamera.clear();
     if (m_singleService && m_singleService->isRunning()) m_singleService->stop();
     m_hasAnalysisInput = m_hasSnapshotInput = false;
     m_latestResult = GaugeResult();
     m_valLabel->setText(tr("读取数值: --"));
-    m_statusLabel->setText(tr("已切换设备，请明确选择图像来源。"));
+    m_statusLabel->setText(tr("已选择设备档案；实时预览请通过右键菜单连接。"));
     updateImageCard(m_imgStage1, cv::Mat(), "Original");
     updateImageCard(m_imgStage2, cv::Mat(), "Rectified");
     updateImageCard(m_imgStage3, cv::Mat(), "Grayscale Input");
@@ -1014,17 +1063,87 @@ void MainWindow::switchActiveCameraSource(const QString& camId) {
     m_useSnapshotForRunBtn->setEnabled(false);
     m_saveSnapshotBtn->setEnabled(false);
     updateImageCard(m_capturedSnapshotLabel, cv::Mat(), "Snapshot");
+    applyCameraCalibrationAndProfile(camId);
+}
+
+void MainWindow::disconnectCameraPreview() {
+    m_previewCameraId.clear();
+    ++m_cameraConnectionGeneration;
+    if (m_previewService) m_previewService->select(InspectionTask());
+    if (m_liveTimer) m_liveTimer->stop();
+    m_isLiveStreaming = false;
+    m_cameraHasFrame = false;
+    m_calibrationSnapshot = FrameCaptureResult();
+    m_calibrationSnapshotCamera.clear();
+    m_calibrationSnapshotLoading = false;
+    m_calibrationQueries.clear();
+    m_pendingCalibrationCamera.clear();
+    m_toggleLiveBtn->setEnabled(false);
+    m_toggleLiveBtn->setText(tr("实时预览（未连接）"));
+    m_liveCamInfoBadge->setText(tr("摄像头连接：未连接"));
     m_liveStreamLabel->clear();
+    m_liveStreamLabel->setText(tr("请右键点击设备并选择“连接此设备”以查看实时画面。"));
+}
+
+void MainWindow::switchActiveCameraSource(const QString& camId) {
+    if (!m_discoveredItemsMap.contains(camId)) return;
+    selectCameraForDetails(camId);
+    disconnectCameraPreview();
+    m_previewCameraId = camId;
+    m_isLiveStreaming = true;
+    m_toggleLiveBtn->setEnabled(true);
+    m_toggleLiveBtn->setText(tr("⏸ 暂停实时预览"));
+    if (m_liveTimer) m_liveTimer->start(40);
     m_liveStreamLabel->setText(tr("正在连接所选设备..."));
+    m_liveCamInfoBadge->setText(tr("正在连接设备：%1").arg(camId));
     InspectionTask task;
     task.device = m_discoveredItemsMap.value(camId);
     m_discoveryService->deferHealthForCapture(camId);
+    if (task.device.protocolType==CameraProtocolType::ONVIF_RTSP_STREAM) {
+        const auto device=task.device;
+        const auto generation=m_cameraConnectionGeneration;
+        auto* watcher=new QFutureWatcher<QString>(this);
+        connect(watcher,&QFutureWatcher<QString>::finished,this,[this,watcher,camId,generation]() {
+            const auto error=watcher->result(); watcher->deleteLater();
+            if (generation!=m_cameraConnectionGeneration) return;
+            const auto message=error.isEmpty()
+                ? tr("摄像头时间检查完成：时间正常或已校准。")
+                : tr("摄像头校时失败：%1。实时画面继续连接，请检查设备校时权限、NTP 配置及电脑时间。").arg(error);
+            onLogReceived(tr("[ONVIF TIME] %1: %2").arg(camId,message));
+            if (!error.isEmpty()) QMessageBox::warning(this,tr("摄像头校时提示"),message);
+        });
+        watcher->setFuture(QtConcurrent::run([device]() {
+            QUrl endpoint; endpoint.setScheme("http"); endpoint.setHost(device.ipOrSn);
+            endpoint.setPort(device.port); endpoint.setPath("/onvif/device_service");
+            return OnvifSoap::synchronizeClock(endpoint,device.username,device.password);
+        }));
+    }
     m_previewService->select(task);
     applyCameraCalibrationAndProfile(camId);
 }
 
+void MainWindow::updateSelectedDeviceArchive(const QString& camId) {
+    if (!m_discoveredItemsMap.contains(camId)) {
+        for (auto* label : {m_cfgGaugeId, m_cfgHardwareId, m_cfgNetworkInfo, m_cfgLocationInfo,
+                           m_cfgGaugeSpec, m_cfgRange, m_cfgSafeRange, m_cfgCalibration})
+            label->setText(tr("未选择设备"));
+        return;
+    }
+    const auto summary = DeviceArchiveSummary::fromDevice(m_discoveredItemsMap.value(camId));
+    m_cfgGaugeId->setText(summary.identity);
+    m_cfgHardwareId->setText(summary.hardware);
+    m_cfgNetworkInfo->setText(summary.network);
+    m_cfgLocationInfo->setText(summary.location);
+    m_cfgGaugeSpec->setText(summary.specification);
+    m_cfgSafeRange->setText(summary.safety +
+        (m_profileReady && QString::fromStdString(m_profile.gauge_id) == camId
+            ? tr("\n读数单位：%1").arg(QString::fromStdString(m_profile.unit)) : QString()));
+    m_cfgCalibration->setText(summary.calibration);
+}
+
 void MainWindow::applyCameraCalibrationAndProfile(const QString& camId) {
     if (!m_discoveredItemsMap.contains(camId)) return;
+    updateSelectedDeviceArchive(camId);
     const auto generation = ++m_profileGeneration;
     const auto profileId = m_discoveredItemsMap[camId].defaultProfileId.isEmpty()
         ? QStringLiteral(u"PRESSURE_GAUGE_1.6MPA") : m_discoveredItemsMap[camId].defaultProfileId;
@@ -1067,6 +1186,7 @@ void MainWindow::applyCameraCalibrationAndProfile(const QString& camId) {
         m_profile.calibrated_height = item.calibratedHeight;
         m_profile.auto_detect_roi = false;
         m_profileReady = true;
+        updateSelectedDeviceArchive(camId);
         tryOpenCameraCalibration();
         m_cfgRange->setText(tr("量程范围：%1 ～ %2 %3").arg(m_profile.min_val).arg(m_profile.max_val).arg(QString::fromStdString(m_profile.unit)));
     });
@@ -1076,6 +1196,10 @@ void MainWindow::applyCameraCalibrationAndProfile(const QString& camId) {
     }));
 }
 void MainWindow::onToggleLiveStream() {
+    if (m_previewCameraId.isEmpty()) {
+        m_statusLabel->setText(tr("请在设备右键菜单中连接摄像头。"));
+        return;
+    }
     m_isLiveStreaming = !m_isLiveStreaming;
     if (m_isLiveStreaming) {
         if (m_liveTimer && !m_liveTimer->isActive()) m_liveTimer->start(40);
@@ -1356,7 +1480,8 @@ InspectionTask MainWindow::makeSingleTask() const {
 
 void MainWindow::submitSingleTask(InspectionTask task, bool historicalCalibrated) {
     if (m_singleService->isRunning() || m_historicalCalibrationPending) return;
-    if (task.inputKind == InspectionInputKind::HistoricalImage && !task.captureOnly && !historicalCalibrated) {
+    const bool replayDatabaseSnapshot = usesHistoricalDatabaseConfiguration(task);
+    if (task.inputKind == InspectionInputKind::HistoricalImage && !task.captureOnly && !historicalCalibrated && !replayDatabaseSnapshot) {
         struct Reply { InspectionTask task; cv::Mat frame; QString error; };
         m_historicalCalibrationPending = true;
         m_statusLabel->setText(tr("正在读取历史原图，分析前请完成手动标定…"));
@@ -1426,7 +1551,7 @@ void MainWindow::submitSingleTask(InspectionTask task, bool historicalCalibrated
                     }
                 }
                 if (reply.frame.empty()) throw std::runtime_error("ORIGINAL_DECODE_FAILED");
-                reply.task.useHistoricalConfiguration = true;
+                reply.task.useHistoricalConfiguration = task.useHistoricalConfiguration;
             } catch (const std::exception& e) { reply.error = QString::fromUtf8(e.what()); }
             return reply;
         }));
@@ -1436,13 +1561,15 @@ void MainWindow::submitSingleTask(InspectionTask task, bool historicalCalibrated
         if (m_discoveredItemsMap.contains(task.device.cameraId))
             task.device = m_discoveredItemsMap.value(task.device.cameraId);
     }
-    if (requiresInspectionCalibration(task)) {
+    if (!replayDatabaseSnapshot && requiresInspectionCalibration(task)) {
         const auto message = tr("设备 %1 尚未完成表计标定，不能进行识别。\n请在设备列表中右键该设备，选择“表计标定”并保存。").arg(task.device.cameraId);
         m_statusLabel->setText(tr("请先完成设备 %1 的表计标定。").arg(task.device.cameraId));
         onLogReceived(tr("[CALIBRATION] %1").arg(message));
         QMessageBox::warning(this, tr("请先完成表计标定"), message);
         return;
     }
+    if (replayDatabaseSnapshot)
+        onLogReceived(tr("[HISTORY] 使用历史任务 %1 保存的标定和算法配置直接重分析。").arg(task.databaseOriginalTaskId));
     task.outputDirectory = QCoreApplication::applicationDirPath() + "/inspection_snapshots";
     task.runMode = static_cast<GaugeRunMode>(m_runModeCombo->currentData().toInt());
     task.returnImages = true;
@@ -1502,9 +1629,8 @@ void MainWindow::onRecognitionFinished() {
     m_timeLabel->setText(QString(tr("算法耗时: %.2f ms")).arg(elapsedMs));
 
     if (m_latestResult.success) {
-        m_valLabel->setText(QString(tr("<b>读取数值:</b> <font color='#00e676' size='+2'>%.3f %1</font>"))
-                                .arg(QString::fromStdString(m_latestResult.unit)).arg(m_latestResult.value));
-        m_angleLabel->setText(QString(tr("指针角度: %.1f°")).arg(m_latestResult.pointer_angle_deg));
+        m_valLabel->setText(tr("<b>读取数值:</b> <font color='#00e676' size='+2'>%1 %2</font>")
+                                .arg(m_latestResult.value, 0, 'f', 3).arg(QString::fromStdString(m_latestResult.unit)));
         m_centerLabel->setText(QString(tr("表盘中心: (%.1f, %.1f) px  R=%.1f")).arg(m_latestResult.center.x).arg(m_latestResult.center.y).arg(m_latestResult.radius));
         m_confidenceLabel->setText(QString(tr("识别置信度: %.1f %%")).arg(m_latestResult.confidence * 100.0));
         
@@ -1518,8 +1644,8 @@ void MainWindow::onRecognitionFinished() {
             m_statusLabel->setText(tr("<font color='#00e676'>系统状态: 指定任务识别完成，数据已输出</font>"));
         }
 
-        onLogReceived(tr("[PIPELINE] 指定图像识别完成: 数值=%.3f %1, 耗时=%.2f ms。")
-                          .arg(m_latestResult.value).arg(QString::fromStdString(m_latestResult.unit)).arg(elapsedMs));
+        onLogReceived(tr("[PIPELINE] 指定图像识别完成: 数值=%1 %2, 耗时=%3 ms。")
+                          .arg(m_latestResult.value, 0, 'f', 3).arg(QString::fromStdString(m_latestResult.unit)).arg(elapsedMs, 0, 'f', 2));
     } else {
         QString errStep = QString::fromStdString(m_latestResult.errorStep);
         QString errMsg = QString::fromStdString(m_latestResult.errorMessage);
@@ -1527,7 +1653,6 @@ void MainWindow::onRecognitionFinished() {
 
         m_statusLabel->setText(QString(tr("<font color='#ff5252'>❌ 识别失败 [%1]: %2</font>")).arg(errStep.isEmpty() ? tr("检测阶段") : errStep).arg(errMsg));
         m_valLabel->setText(tr("<b>读取数值:</b> <font color='#ff5252'>-- (识别失败)</font>"));
-        m_angleLabel->setText(QString(tr("指针角度: %.1f° (未通过校验)")).arg(m_latestResult.pointer_angle_deg));
         m_centerLabel->setText(QString(tr("表盘中心: (%.1f, %.1f) px  R=%.1f")).arg(m_latestResult.center.x).arg(m_latestResult.center.y).arg(m_latestResult.radius));
         m_confidenceLabel->setText(QString(tr("识别置信度: <font color='#ff5252'>%.1f %% (未达门限)</font>")).arg(m_latestResult.confidence * 100.0));
 
@@ -1711,6 +1836,7 @@ QWidget* MainWindow::createInspectionStageArea(QWidget *parent) {
         tr("最新读数"), tr("指针偏角"), tr("置信度"), tr("巡检状态"), tr("更新时间"),
         tr("📸 过程分析")
     };
+    m_inspectionTable->setColumnHidden(5, true); // Keep internal column indices stable; angle is not user-facing.
     m_inspectionTable->setHorizontalHeaderLabels(headers);
     m_inspectionTable->horizontalHeader()->setSectionResizeMode(QHeaderView::ResizeToContents);
     m_inspectionTable->horizontalHeader()->setSectionResizeMode(2, QHeaderView::Stretch);
@@ -1737,6 +1863,7 @@ QWidget* MainWindow::createInspectionStageArea(QWidget *parent) {
 }
 
 void MainWindow::onCaptureAndRecognizeCurrent() {
+    if (m_visionTabWidget) m_visionTabWidget->setCurrentIndex(1);
     auto task = makeSingleTask();
     task.inputKind = InspectionInputKind::CameraSnapshot;
     task.preferOnvifSnapshot=true; task.requireOnvifSnapshot=true;
@@ -1777,6 +1904,7 @@ void MainWindow::onStartAllDevicesInspection() {
     }
 
     m_isPatrolRunning = true;
+    if (m_safeRangeAlert) m_safeRangeAlert->close();
     m_patrolCameraIdQueue.clear();
     m_inspectionRecords.clear();
 
@@ -1886,11 +2014,56 @@ void MainWindow::onInspectionOutcome(const InspectionOutcome& outcome) {
     rec.diagnosticText = outcome.errorMessage.isEmpty()
         ? QString::fromUtf8(res.detailedDebugInfo.data(), static_cast<int>(res.detailedDebugInfo.size())) : outcome.errorMessage;
     const bool valid = res.success && outcome.errorCode.isEmpty();
-    m_inspectionTable->item(row, 4)->setText(valid ? QString::asprintf("%.2f %s", rec.readingValue, rec.unit.c_str()) : "--");
+    rec.readingValid = valid;
+    rec.safetyAssessment = outcome.safetyAssessment;
+    if (rec.safetyAssessment.isEmpty())
+        rec.safetyAssessment = rec.device.safeWorkingRange.assess(res.value, valid && outcome.recognitionPerformed);
+    const bool outsideSafeRange = rec.safetyAssessment["status"].toString() == "out_of_range";
+    const bool invalidSafeRange = rec.safetyAssessment["status"].toString() == "invalid_configuration";
+    const QString rangeDetails = tr("设备：%1（%2）\n读数：%3 %4\n安全工作范围：[%5，%6] %4")
+        .arg(rec.customName, rec.cameraId).arg(res.value, 0, 'f', 3).arg(QString::fromStdString(res.unit))
+        .arg(rec.safetyAssessment["safe_min"].toDouble(), 0, 'f', 6)
+        .arg(rec.safetyAssessment["safe_max"].toDouble(), 0, 'f', 6);
+    if (outsideSafeRange) rec.status = tr("异常：超出安全工作范围") +
+        (outcome.errorCode.isEmpty() ? QString() : tr("；任务失败：%1").arg(outcome.errorCode));
+    else if (invalidSafeRange) rec.status = tr("安全工作范围待配置或无效，待复核");
+    if (outsideSafeRange || invalidSafeRange) {
+        rec.diagnosticText += "\n" + (outsideSafeRange ? rangeDetails : rec.status);
+        for (int column = 0; column < m_inspectionTable->columnCount(); ++column) {
+            auto* cell = m_inspectionTable->item(row, column);
+            if (!cell) continue;
+            cell->setForeground(QColor("#ff5252"));
+            cell->setBackground(QColor("#38191f"));
+            auto font = cell->font(); font.setBold(true); cell->setFont(font);
+            cell->setToolTip(rec.diagnosticText);
+        }
+    }
+    if (outsideSafeRange) {
+        if (!m_safeRangeAlert) {
+            m_safeRangeAlert = new QMessageBox(QMessageBox::Warning, tr("巡检异常值提醒"),
+                tr("巡检发现读数超出安全工作范围，请及时核查。"), QMessageBox::Ok, this);
+            m_safeRangeAlert->setAttribute(Qt::WA_DeleteOnClose);
+            m_safeRangeAlert->setModal(false);
+            m_safeRangeAlert->setTextFormat(Qt::PlainText);
+        }
+        m_safeRangeAlert->setInformativeText(rangeDetails);
+        m_safeRangeAlert->setDetailedText(m_safeRangeAlert->detailedText() + "\n" + rangeDetails);
+        m_safeRangeAlert->show();
+        m_safeRangeAlert->raise();
+        onLogReceived(tr("[SAFETY] %1").arg(rangeDetails));
+    }
+    m_inspectionTable->item(row, 4)->setText(valid ? QString::asprintf("%.3f %s", rec.readingValue, rec.unit.c_str()) : "--");
     m_inspectionTable->item(row, 5)->setText(valid ? QString::asprintf("%.1f°", rec.pointerAngle) : "--");
     m_inspectionTable->item(row, 6)->setText(QString::asprintf("%.1f%%", rec.confidence));
     m_inspectionTable->item(row, 7)->setText(rec.status);
     onLogReceived(tr("[CAPTURE] 设备 %1 · 采集方式 %2").arg(outcome.cameraId, outcome.captureMethod));
+    if (!outcome.archiveMetadata.isEmpty()) {
+        qint64 imageBytes=0;
+        for(const auto& image:outcome.archiveMetadata["images"].toArray()) imageBytes+=qint64(image.toObject()["bytes"].toDouble());
+        onLogReceived(tr("[ARCHIVE] 设备 %1 · %2 · 图片保留 %3 天 · 图片合计 %4 KB")
+            .arg(outcome.cameraId).arg(outcome.archiveMetadata["anomaly"].toBool()?tr("异常样本"):tr("正常样本"))
+            .arg(outcome.archiveMetadata["retention_days"].toInt()).arg(imageBytes/1024.0,0,'f',1));
+    }
     const auto& timings = outcome.timings;
     const auto engineSteps = timings["engine_steps"].toObject();
     QStringList details;
@@ -1939,33 +2112,32 @@ void MainWindow::onExportPatrolReport() {
     QString savePath = QFileDialog::getSaveFileName(this, tr("导出巡检数据报表"), defaultName, tr("CSV 电子表格 (*.csv)"));
     if (savePath.isEmpty()) return;
 
-    QFile file(savePath);
-    if (!file.open(QIODevice::WriteOnly | QIODevice::Text)) {
-        QMessageBox::warning(this, tr("保存失败"), tr("无法创建并写入指定的导出文件！"));
+    QSaveFile file(savePath);
+    if (!file.open(QIODevice::WriteOnly)) {
+        QMessageBox::warning(this, tr("保存失败"), tr("无法写入报表：%1").arg(file.errorString()));
         return;
     }
-
-    QTextStream out(&file);
-    out.setCodec("UTF-8");
-    // UTF-8 BOM for Excel
-    out << "\xEF\xBB\xBF";
-    out << "序号,设备编号,测点名称,安装区域/位置,最新读数,单位,指针偏转角度,识别置信度,巡检状态,巡检时间戳\n";
-
+    QList<QStringList> rows;
+    rows.append(QStringList{tr("序号"), tr("设备编号"), tr("测点名称"), tr("安装区域/位置"), tr("最新读数"),
+        tr("单位"), tr("识别置信度"), tr("巡检状态"), tr("巡检时间戳"),
+        tr("正常下限"), tr("正常上限"), tr("允许负偏差"), tr("允许正偏差"), tr("安全下限"), tr("安全上限"), tr("安全范围检查")});
     for (int i = 0; i < m_inspectionRecords.size(); ++i) {
         const auto& r = m_inspectionRecords[i];
-        out << (i + 1) << ","
-            << "\"" << r.cameraId << "\","
-            << "\"" << r.customName << "\","
-            << "\"" << r.locationInfo << "\","
-            << r.readingValue << ","
-            << "\"" << QString::fromStdString(r.unit) << "\","
-            << r.pointerAngle << ","
-            << r.confidence << "%,"
-            << "\"" << r.status << "\","
-            << "\"" << r.timestamp << "\"\n";
+        QStringList row{QString::number(i + 1), r.cameraId, r.customName, r.locationInfo,
+            QString::number(r.readingValue, 'f', 3), QString::fromStdString(r.unit),
+            QString::number(r.confidence) + "%", r.status, r.timestamp};
+        const auto range = r.safetyAssessment;
+        for (const auto& key : {"normal_min", "normal_max", "allowance_minus", "allowance_plus", "safe_min", "safe_max"})
+            row.append(range["enabled"].toBool() && range[key].isDouble() ? QString::number(range[key].toDouble(), 'f', 6) : "");
+        row.append(range["status"].toString() == "out_of_range" ? tr("超范围") :
+            range["status"].toString() == "normal" ? tr("正常") :
+            range["status"].toString() == "disabled" ? tr("未启用") : tr("未完成检查"));
+        rows.append(row);
     }
-
-    file.close();
+    if (!CsvReport::write(file, rows) || !file.commit()) {
+        QMessageBox::warning(this, tr("保存失败"), tr("报表未成功写入：%1").arg(file.errorString()));
+        return;
+    }
     QMessageBox::information(this, tr("导出成功"), tr("已成功导出 %1 条巡检数据至:\n%2").arg(m_inspectionRecords.size()).arg(savePath));
     onLogReceived(tr("[EXPORT] 巡检报表已成功导出至: %1").arg(savePath));
 }
@@ -2035,13 +2207,11 @@ void MainWindow::showInspectionPhotosDialog(int row) {
         return w;
     };
 
-    QString readingStr = (rec.readingValue == 0.0 && !(rec.status.contains("正常") || rec.status.contains("识别成功"))) ? "--" : QString::asprintf("%.2f %s", rec.readingValue, rec.unit.c_str());
-    QString angleStr = (rec.pointerAngle == 0.0 && !(rec.status.contains("正常") || rec.status.contains("识别成功"))) ? "--" : QString::asprintf("%.1f°", rec.pointerAngle);
+    QString readingStr = rec.readingValid ? QString::asprintf("%.3f %s", rec.readingValue, rec.unit.c_str()) : "--";
     QString confStr = (rec.confidence == 0.0 && !(rec.status.contains("正常") || rec.status.contains("识别成功"))) ? "--" : QString::asprintf("%.1f%%", rec.confidence);
     QString timeStr = rec.timestamp.isEmpty() ? "-" : rec.timestamp;
 
     metricsRow->addWidget(makeMetricWidget(tr("最新读数:"), readingStr, "#00e676"));
-    metricsRow->addWidget(makeMetricWidget(tr("指针偏转角:"), angleStr, "#00e5ff"));
     metricsRow->addWidget(makeMetricWidget(tr("识别置信度:"), confStr, "#ffb300"));
     metricsRow->addWidget(makeMetricWidget(tr("巡检抓拍时间:"), timeStr, "#e0e0e0"));
     metricsRow->addStretch();

@@ -42,6 +42,15 @@ int main(int argc, char** argv) {
         const QString id = request["camera_id"].toString();
         if (id == "hang") { QThread::sleep(60); return 3; }
         if (id == "crash") return 3;
+        if (id == "jpeg") {
+            const QString folder=QString::fromLocal8Bit(argv[2]);
+            cv::Mat frame(32,48,CV_8UC3,cv::Scalar(20,90,150));
+            if(!cv::imwrite((folder+"/frame.jpg").toStdString(),frame)) return 3;
+            QFile output(folder+"/result.json");
+            if(!output.open(QIODevice::WriteOnly)) return 3;
+            output.write("{\"failure\":0,\"original_suffix\":\".jpg\",\"original_preserved\":true,\"captured_at_ms\":1700000000000}");
+            return 0;
+        }
         if (id == "healthy" && (!request["_prefer_onvif_snapshot"].toBool() || !request["_require_onvif_snapshot"].toBool())) return 3;
         const QString folder = QString::fromLocal8Bit(argv[2]);
         cv::Mat frame(24, 24, CV_8UC3, cv::Scalar(40, 90, 120));
@@ -68,6 +77,10 @@ int main(int argc, char** argv) {
     cancel->store(false);
     task.device.cameraId = "crash";
     if (isolatedCapture(task, cancel).failure != CaptureFailure::WorkerFailed) return 1;
+    task.device.cameraId="jpeg";
+    const auto jpeg=isolatedCapture(task,cancel);
+    if(!jpeg.ok() || jpeg.encodedOriginal.empty() || jpeg.frame.cols!=48 || jpeg.frame.rows!=32 ||
+       cv::norm(jpeg.frame,cv::imdecode(jpeg.encodedOriginal,cv::IMREAD_COLOR),cv::NORM_INF)!=0) return 1;
     task.device.cameraId = "healthy";
     task.preferOnvifSnapshot = true;
     task.requireOnvifSnapshot = true;

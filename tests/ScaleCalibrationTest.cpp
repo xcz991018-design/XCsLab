@@ -105,7 +105,7 @@ int main(int argc,char** argv) {
         correctedImage->selectScaleRatio(1);QApplication::sendEvent(correctedImage,&clickMax);
         require(correctedImage->getScalePoints().size()==2,"Corrected scale clicks failed");
         QMetaObject::invokeMethod(&dialog,"onConfirmPerspective",Qt::DirectConnection);
-        require(originalImage->isEnabled() && !correctedImage->isEnabled() && correctedImage->getScalePoints().isEmpty(),"Returning to perspective preserved stale annotations");
+        require(originalImage->isEnabled() && !correctedImage->isEnabled() && correctedImage->getScalePoints().size()==2,"Returning to perspective lost center/scale annotations");
         GaugeProfile historicalProfile; historicalProfile.perspective_pts=dialogProfile.perspective_pts;
         const auto beforeCancel=historicalProfile.toJson();
         CardinalSelectorDialog cancelled(dial,historicalProfile,"test",nullptr,true);
@@ -123,6 +123,77 @@ int main(int argc,char** argv) {
         QMetaObject::invokeMethod(&historical,"onSaveAndApply",Qt::DirectConnection);
         require(historical.result()==QDialog::Accepted && historicalProfile.scalePoints.size()==2,
                 "Session calibration required database or failed to apply");
+        GaugeProfile radiusProfile=historicalProfile;
+        const auto oldCenter=radiusProfile.center;
+        const auto oldScales=radiusProfile.scalePoints;
+        const auto oldRim=radiusProfile.perspective_pts;
+        CardinalSelectorDialog radiusOnly(dial,radiusProfile,"test",nullptr,true);
+        auto* radiusSpin=radiusOnly.findChild<QDoubleSpinBox*>();
+        // The center-mask spin is distinguishable from the percentage selector by suffix.
+        for(auto* spin:radiusOnly.findChildren<QDoubleSpinBox*>()) if(spin->suffix().contains("px")) radiusSpin=spin;
+        require(radiusSpin && radiusSpin->isEnabled(),"Existing calibration did not enable radius-only editing");
+        radiusSpin->setValue(63);
+        QMetaObject::invokeMethod(&radiusOnly,"onSaveAndApply",Qt::DirectConnection);
+        require(radiusOnly.result()==QDialog::Accepted && radiusProfile.pointerBaseRadius==63,"Radius-only calibration save failed");
+        require(radiusProfile.center==oldCenter && radiusProfile.scalePoints==oldScales && radiusProfile.perspective_pts==oldRim,
+            "Radius-only edit changed center or scale geometry");
+        for(int edit=0;edit<3;++edit) {
+            GaugeProfile editedProfile=historicalProfile;
+            const auto preservedCenter=editedProfile.center;
+            const auto preservedScales=editedProfile.scalePoints;
+            const auto preservedRim=editedProfile.perspective_pts;
+            CardinalSelectorDialog editDialog(dial,editedProfile,"test",nullptr,true);
+            auto* editImage=editDialog.findChild<InteractiveImageLabel*>("rectifiedCalibrationImage");
+            require(editImage->isEnabled(),"Saved perspective did not unlock direct point editing");
+            editImage->resize(800,800);
+            const QPointF position=edit==0 ? QPointF(430,400) : edit==1 ? QPointF(160,600) : QPointF(650,610);
+            if(edit==0) editImage->selectCenter(); else editImage->selectScaleRatio(edit==1?0:1);
+            QMouseEvent editClick(QEvent::MouseButtonPress,position,Qt::LeftButton,Qt::LeftButton,Qt::NoModifier);
+            QApplication::sendEvent(editImage,&editClick);
+            QMetaObject::invokeMethod(&editDialog,"onSaveAndApply",Qt::DirectConnection);
+            require(editDialog.result()==QDialog::Accepted,"Direct center/endpoint editing required perspective recalibration");
+            require(editedProfile.perspective_pts==preservedRim,"Point editing changed perspective calibration");
+            if(edit==0) require(editedProfile.center!=preservedCenter && editedProfile.scalePoints==preservedScales,
+                "Center-only editing changed scale endpoints");
+            else {
+                require(editedProfile.center==preservedCenter,"Endpoint-only editing changed center");
+                const int changed=edit==1?0:1, unchanged=1-changed;
+                require(editedProfile.scalePoints[changed]!=preservedScales[changed] && editedProfile.scalePoints[unchanged]==preservedScales[unchanged],
+                    "Endpoint-only editing changed the other endpoint");
+            }
+        }
+        for(bool unsavedEdit : {false,true}) {
+            GaugeProfile warpProfile=historicalProfile;
+            const auto originalScales=warpProfile.scalePoints;
+            cv::Point2f expectedSourceCenter=warpProfile.center;
+            CardinalSelectorDialog warpDialog(dial,warpProfile,"test",nullptr,true);
+            auto* warpImage=warpDialog.findChild<InteractiveImageLabel*>("rectifiedCalibrationImage");
+            auto* rimImage=warpDialog.findChild<InteractiveImageLabel*>("perspectiveImage");
+            warpImage->resize(800,800);
+            cv::Mat oldInverse; engine.rectifyPerspective(dial,warpProfile.perspective_pts,oldInverse);
+            if(unsavedEdit) {
+                warpImage->selectCenter();
+                QMouseEvent editedCenter(QEvent::MouseButtonPress,QPointF(440,405),Qt::LeftButton,Qt::LeftButton,Qt::NoModifier);
+                QApplication::sendEvent(warpImage,&editedCenter);
+                std::vector<cv::Point2f> centerInSource{{440,405}};
+                cv::perspectiveTransform(centerInSource,centerInSource,oldInverse);
+                expectedSourceCenter=centerInSource[0];
+            }
+            QMetaObject::invokeMethod(&warpDialog,"onConfirmPerspective",Qt::DirectConnection);
+            auto newRim=warpProfile.perspective_pts; newRim[0]+={20,10}; newRim[1]+={-10,5};
+            rimImage->setImageAndPoints(dial,newRim);
+            QMetaObject::invokeMethod(&warpDialog,"onPointsUpdated",Qt::DirectConnection);
+            cv::Mat newInverse; engine.rectifyPerspective(dial,newRim,newInverse);
+            std::vector<cv::Point2f> expectedCenter{expectedSourceCenter};
+            cv::perspectiveTransform(expectedCenter,expectedCenter,newInverse.inv());
+            require(cv::norm(warpImage->getCenterPoint()-expectedCenter[0])<0.001,"Center did not follow the new homography");
+            require(warpImage->getScalePoints()==ScaleCalibration::transformed(originalScales,newInverse.inv()),"Scale endpoints did not follow the new homography");
+            QMetaObject::invokeMethod(&warpDialog,"onConfirmPerspective",Qt::DirectConnection);
+            QMetaObject::invokeMethod(&warpDialog,"onSaveAndApply",Qt::DirectConnection);
+            require(warpDialog.result()==QDialog::Accepted,"New perspective required all annotations to be repeated");
+            require(warpProfile.perspective_pts==newRim && warpProfile.scalePoints==originalScales &&
+                cv::norm(warpProfile.center-expectedSourceCenter)<0.001,"Perspective save lost source anchors or unsaved edits");
+        }
         std::cout<<"Scale calibration checks passed\n";
     } catch(const std::exception& e) { std::cerr<<e.what()<<'\n';return 1; }
 }

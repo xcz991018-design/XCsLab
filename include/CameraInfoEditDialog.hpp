@@ -7,6 +7,7 @@
 #include <QPushButton>
 #include <QCheckBox>
 #include <QSpinBox>
+#include <QDoubleSpinBox>
 #include <QFormLayout>
 #include <QVBoxLayout>
 #include <QHBoxLayout>
@@ -45,6 +46,7 @@ private:
     bool m_isNewDevice{false};
 
     // Device Network & Registry Parameters
+    QLineEdit *m_hardwareIdEdit{nullptr};
     QLineEdit *m_cameraIdEdit{nullptr};
     QLineEdit *m_customNameEdit{nullptr};
     QComboBox *m_protocolCombo{nullptr};
@@ -66,6 +68,10 @@ private:
     QLineEdit *m_modelNameEdit{nullptr};
     QLineEdit *m_accuracyClassEdit{nullptr};
 
+    QCheckBox *m_safeRangeEnabled{nullptr};
+    QDoubleSpinBox *m_normalMin{nullptr}, *m_normalMax{nullptr};
+    QDoubleSpinBox *m_allowanceMinus{nullptr}, *m_allowancePlus{nullptr};
+    QLabel *m_safeRangePreview{nullptr};
     QPushButton *m_saveBtn{nullptr};
     QPushButton *m_cancelBtn{nullptr};
     QTabWidget *m_tabWidget{nullptr};

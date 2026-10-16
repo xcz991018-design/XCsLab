@@ -26,6 +26,7 @@ struct StoredInspection {
     DiscoveredCameraItem device;
     QJsonObject profile;
     QJsonObject latestReview;
+    QJsonObject resultSnapshot;
 };
 struct StoredImage {
     QByteArray bytes;
@@ -60,6 +61,7 @@ public:
     static QJsonObject sanitizedRegistry(QJsonObject registry);
     static QString retryPending(const QString& evidenceDirectory, int limit = 20);
     static QString registryQueueDirectory();
+    QString maintainEvidence(const QString& directory) const;
 private:
     DatabaseSettings m_settings;
 };

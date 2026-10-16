@@ -10,3 +10,9 @@ inline bool canRecognizeDevice(const DiscoveredCameraItem& device) {
 inline bool requiresInspectionCalibration(const InspectionTask& task) {
     return !task.captureOnly && !canRecognizeDevice(task.device);
 }
+
+// Resolve the authoritative calibration/template from the original DB task.
+inline bool usesHistoricalDatabaseConfiguration(const InspectionTask& task) {
+    return task.inputKind == InspectionInputKind::HistoricalImage &&
+        !task.databaseOriginalTaskId.isEmpty() && task.useHistoricalConfiguration;
+}

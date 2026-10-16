@@ -8,6 +8,7 @@
 #include <QJsonArray>
 
 #include <iostream>
+#include <iomanip>
 #include <memory>
 #include <string>
 #include <chrono>
@@ -124,8 +125,7 @@ int main(int argc, char** argv) {
     std::cout << "\n------------------ RECOGNITION RESULT ------------------\n";
     if (result.success) {
         std::cout << " Gauge ID       : " << profile.gauge_id << "\n";
-        std::cout << " Reading Value  : " << result.value << " " << result.unit << "\n";
-        std::cout << " Pointer Angle  : " << result.pointer_angle_deg << " deg\n";
+        std::cout << " Reading Value  : " << std::fixed << std::setprecision(3) << result.value << " " << result.unit << "\n" << std::defaultfloat << std::setprecision(6);
         std::cout << " Dial Center    : (" << result.center.x << ", " << result.center.y << ")\n";
         std::cout << " Dial Radius    : " << result.radius << " px\n";
         std::cout << " Processing Time: " << elapsedMs << " ms\n";

@@ -2,6 +2,7 @@
 #include <iostream>
 #include <sstream>
 #include "OnvifSoap.hpp"
+#include "CameraIdentity.hpp"
 #include "SnapshotFrameReader.hpp"
 
 ONVIFDeviceManager::ONVIFDeviceManager(const ONVIFDeviceInfo& info)
@@ -170,7 +171,7 @@ std::vector<ONVIFDeviceInfo> ONVIFDeviceManager::probeDevicesWSDiscovery(int tim
                         dev.manufacturer = "Xiongmai Network Camera";
                     }
 
-                    dev.serialNumber = "SN-" + QString::number(qHash(senderIp)).toStdString();
+                    dev.hardwareId = CameraIdentity::discoveryId(datagram).toStdString();
                     dev.rtspUri.clear();
                     dev.port = QUrl(xaddr).port(80);
 
@@ -525,6 +526,7 @@ FrameCaptureResult ONVIFDeviceManager::captureHttpSnapshot() {
     if (isUniformSnapshotFrame(result.frame)) { result.frame.release(); return result; }
     result.failure = CaptureFailure::None;
     result.capturedAt = std::chrono::system_clock::now();
+    result.encodedOriginal.assign(bytes.begin(), bytes.end());
     result.message = "ONVIF_HTTP";
     return result;
 }

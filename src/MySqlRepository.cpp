@@ -7,6 +7,7 @@
 #include "GaugeTemplateStore.hpp"
 #include "GaugeProfile.hpp"
 #include "DeviceCalibration.hpp"
+#include "EvidenceArchive.hpp"
 #include <mysql.h>
 #include <QCryptographicHash>
 #include <QJsonDocument>
@@ -113,6 +114,11 @@ public:
                         fail(QString("MYSQL_TEMPLATE_SCHEMA_CREATE_FAILED: %1").arg(decodeMySqlError(QByteArray(mysql_error(handle)))));
                 }
             } else if (auto* result = mysql_store_result(handle)) mysql_free_result(result);
+            if (mysql_query(handle, "SELECT result_snapshot FROM inspection_history LIMIT 0")) {
+                if (mysql_errno(handle)!=1054) fail("MYSQL_EVIDENCE_SCHEMA_CHECK_FAILED");
+                if (mysql_query(handle, "ALTER TABLE inspection_history ADD COLUMN result_snapshot JSON NULL") && mysql_errno(handle)!=1060)
+                    fail("MYSQL_EVIDENCE_SCHEMA_UPGRADE_FAILED: ALTER permission required");
+            } else if (auto* result=mysql_store_result(handle)) mysql_free_result(result);
             if (mysql_query(handle, "SET time_zone = '+00:00'")) fail("MYSQL_SESSION_SETUP_FAILED");
         }
         catch (...) { mysql_close(handle); handle = nullptr; mysql_thread_end(); throw; }
@@ -220,6 +226,7 @@ StoredInspection toInspection(const Row& r) {
     out.profile = QJsonDocument::fromJson(r[16].value_or(QByteArray())).object();
     out.hasOriginal = str(r[17]) == "1";
     out.latestReview = QJsonDocument::fromJson(r[18].value_or(QByteArray())).object();
+    out.resultSnapshot = QJsonDocument::fromJson(r[19].value_or(QByteArray())).object();
     return out;
 }
 const QByteArray historySelect = "SELECT h.task_id,h.camera_id,h.parent_task_id,h.captured_at,h.processed_at,"
@@ -228,7 +235,7 @@ const QByteArray historySelect = "SELECT h.task_id,h.camera_id,h.parent_task_id,
     "EXISTS(SELECT 1 FROM inspection_evidence e WHERE e.task_id=h.task_id AND e.evidence_kind='original'"
     " AND e.sequence_number=0 AND e.storage_backend='mysql' AND e.availability='available'),"
     "(SELECT JSON_OBJECT('decision',r.decision,'reviewer',r.reviewer_id,'value',r.corrected_value,'comment',r.comment,'time',r.reviewed_at)"
-    " FROM reading_reviews r WHERE r.task_id=h.task_id ORDER BY r.reviewed_at DESC,r.review_id DESC LIMIT 1)"
+    " FROM reading_reviews r WHERE r.task_id=h.task_id ORDER BY r.reviewed_at DESC,r.review_id DESC LIMIT 1),h.result_snapshot"
     " FROM inspection_history h JOIN camera_config_versions v ON v.config_id=h.config_id";
 void writeAtomic(const QString& path, const QJsonObject& object) {
     QSaveFile file(path); const auto bytes = json(object);
@@ -451,8 +458,16 @@ QJsonObject MySqlRepository::inspectionEnvelope(const InspectionTask& task, cons
     record["success"] = out.errorCode.isEmpty() && out.result.success;
     record["value"] = out.result.success ? QJsonValue(out.result.value) : QJsonValue(QJsonValue::Null);
     record["unit"] = QString::fromStdString(out.result.unit); record["confidence"] = out.result.confidence;
+    record["result"] = QJsonObject{{"archive",out.archiveMetadata},{"pointer_angle_deg",out.result.pointer_angle_deg},
+        {"recognition_quality",out.result.recognitionQuality},{"recognition_timings_ms",out.result.stageTimings},
+        {"capture_method",out.captureMethod},{"center_inconsistent",out.result.centerInconsistent},
+        {"center_offset_px",out.result.centerOffsetDist},{"warning",QString::fromStdString(out.result.warningMessage)},
+        {"diagnostics",QString::fromStdString(out.result.detailedDebugInfo)}};
     record["error_code"] = out.errorCode;
     record["recognition_quality"] = out.result.recognitionQuality;
+    auto resultSnapshot = record["result"].toObject();
+    resultSnapshot["safety_assessment"] = out.safetyAssessment;
+    record["result"] = resultSnapshot;
     record["error_message"] = out.errorMessage;
     record["original_path"] = QFileInfo(out.originalPath).absoluteFilePath();
     if (out.originalPath.isEmpty()) record["original_path"] = QString();
@@ -491,13 +506,13 @@ void MySqlRepository::saveInspection(const QJsonObject& r) const {
     const QString quality = !r["recognition_performed"].toBool() ? "not_evaluated" :
         successful ? (r["confidence"].toDouble() < 0.4 ? "review_required" : "accepted") : "failed";
     c.exec("INSERT INTO inspection_history(task_id,camera_id,config_id,parent_task_id,input_kind,run_mode,captured_at,processed_at,"
-        "recognition_performed,recognition_success,reading_value,unit,confidence,quality_status,process_status,error_code,error_message)"
-        " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", {id,camera,config,nullable(r["parent_task_id"].toString()),
+        "recognition_performed,recognition_success,reading_value,unit,confidence,quality_status,process_status,error_code,error_message,result_snapshot)"
+        " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", {id,camera,config,nullable(r["parent_task_id"].toString()),
         r["input_kind"].toString().toUtf8(),r["mode"].toString().toUtf8(),acquired.isValid()?Cell{time(acquired)}:Cell{},time(processed),
         r["recognition_performed"].toBool()?QByteArray("1"):QByteArray("0"),successful?QByteArray("1"):QByteArray("0"),
         r["value"].isDouble()?Cell{QByteArray::number(r["value"].toDouble(),'g',17)}:Cell{},nullable(r["unit"].toString()),
         QByteArray::number(r["confidence"].toDouble(),'g',17),quality.toUtf8(),QByteArray("not_evaluated"),
-        nullable(r["error_code"].toString()),nullable(r["error_message"].toString())});
+        nullable(r["error_code"].toString()),nullable(r["error_message"].toString()),json(r["result"].toObject())});
     for (const auto& kind : {QString("original"),QString("rectified"),QString("recognition")}) {
         Cell imageId; QByteArray digest, byteSize;
         if (kind == "original" && !r["reuse_original_task_id"].toString().isEmpty()) {
@@ -517,9 +532,10 @@ void MySqlRepository::saveInspection(const QJsonObject& r) const {
             std::vector<uchar> buffer(bytes.begin(),bytes.end()); auto image = cv::imdecode(buffer,cv::IMREAD_UNCHANGED);
             if (image.empty()) fail("INVALID_EVIDENCE_IMAGE");
             digest=hash(bytes); byteSize=number(bytes.size());
+            const auto mime=bytes.startsWith(QByteArray::fromHex("ffd8ff")) ? QByteArray("image/jpeg") : QByteArray("image/png");
             c.exec("INSERT INTO image_blobs(mime_type,pixel_width,pixel_height,sha256,byte_size,image_bytes,created_at)"
-                " VALUES('image/png',?,?,?,?,?,?) ON DUPLICATE KEY UPDATE image_id=LAST_INSERT_ID(image_id)",
-                {number(image.cols),number(image.rows),digest,byteSize,bytes,time(QDateTime::currentDateTimeUtc())},4);
+                " VALUES(?,?,?,?,?,?,?) ON DUPLICATE KEY UPDATE image_id=LAST_INSERT_ID(image_id)",
+                {mime,number(image.cols),number(image.rows),digest,byteSize,bytes,time(QDateTime::currentDateTimeUtc())},5);
             imageId=number(mysql_insert_id(c.handle));
         }
         c.exec("INSERT INTO inspection_evidence(task_id,evidence_kind,sequence_number,storage_key,sha256,byte_size,availability,created_at,storage_backend,image_id)"
@@ -646,4 +662,81 @@ QString MySqlRepository::retryPending(const QString& directory,int limit) {
         }
         return firstError.isEmpty() ? registryStatus : firstError;
     } catch (const std::exception& e) { return QString::fromUtf8(e.what()); }
+}
+
+
+QString MySqlRepository::maintainEvidence(const QString& directory) const {
+    if (directory.isEmpty()) return {};
+    const auto now=QDateTime::currentDateTimeUtc();
+    const auto policy=EvidenceArchive::Policy::fromEnvironment();
+    const auto normalCut=time(now.addDays(-policy.normalDays));
+    const auto abnormalCut=time(now.addDays(-policy.abnormalDays));
+    QSet<QString> protectedTasks;
+    const QDir pending(QDir(directory).filePath(".mysql_pending"));
+    for (const auto& name:pending.entryList({"*.json"},QDir::Files)) {
+        QFile file(pending.filePath(name));
+        if (!file.open(QIODevice::ReadOnly)) fail("RETENTION_PENDING_UNREADABLE");
+        const auto doc=QJsonDocument::fromJson(file.readAll());
+        if (!doc.isObject()) fail("RETENTION_PENDING_INVALID");
+        for (const auto& key:{"task_id","parent_task_id","reuse_original_task_id"}) {
+            const auto id=doc.object()[key].toString(); if(!id.isEmpty()) protectedTasks.insert(id);
+        }
+    }
+    Connection c(m_settings);
+    // Unknown legacy results are conservatively retained for the abnormal window.
+    const QByteArray eligible="((h.processed_at<? AND NOT EXISTS(SELECT 1 FROM reading_reviews r WHERE r.task_id=h.task_id AND r.decision IN('corrected','unreadable') AND r.reviewed_at>=?)) OR "
+        "(h.processed_at<? AND h.recognition_success=1 AND h.confidence>=0.4 AND "
+        "JSON_UNQUOTE(JSON_EXTRACT(h.result_snapshot,'$.archive.anomaly'))='false' AND "
+        "NOT EXISTS(SELECT 1 FROM reading_reviews r WHERE r.task_id=h.task_id AND r.decision IN('corrected','unreadable'))))";
+    const Row cutoffs{abnormalCut,abnormalCut,normalCut};
+    int expiredTasks=0,removedBlobs=0,expiredLocal=0,localFailures=0;
+    {
+        Transaction tx(c);
+        const auto tasks=c.exec("SELECT h.task_id FROM inspection_history h WHERE "+eligible+
+            " AND EXISTS(SELECT 1 FROM inspection_evidence e WHERE e.task_id=h.task_id AND e.availability='available')"
+            " ORDER BY h.processed_at LIMIT 500 FOR UPDATE",cutoffs);
+        for(const auto& row:tasks) {
+            const auto id=str(row[0]); if(protectedTasks.contains(id)) continue;
+            c.exec("UPDATE inspection_evidence SET availability='expired',storage_backend='file',storage_key=CONCAT('expired:',task_id,':',evidence_kind),image_id=NULL WHERE task_id=? AND availability='available'",{id.toUtf8()});
+            ++expiredTasks;
+        }
+        // Shared BLOBs are removed only when no task references them, including reanalysis.
+        const auto blobs=c.exec("SELECT b.image_id FROM image_blobs b WHERE NOT EXISTS(SELECT 1 FROM inspection_evidence e WHERE e.image_id=b.image_id) LIMIT 1500 FOR UPDATE");
+        for(const auto& row:blobs) {
+            c.exec("DELETE FROM image_blobs WHERE image_id=? AND NOT EXISTS(SELECT 1 FROM inspection_evidence e WHERE e.image_id=image_blobs.image_id)",{row[0]});
+            ++removedBlobs;
+        }
+        tx.commit();
+    }
+    // Re-evaluate local tasks against the authoritative DB, including manual reviews.
+    // Missing DB records or pending uploads are never eligible for local deletion.
+    const QDir root(directory);
+    Transaction localTx(c);
+    Row localArgs=cutoffs; localArgs.push_back(QFileInfo(directory).absoluteFilePath().toUtf8());
+    const auto localTasks=c.exec("SELECT h.task_id FROM inspection_history h WHERE "+eligible+
+        " AND JSON_EXTRACT(h.result_snapshot,'$.local_images_expired_at') IS NULL"
+        " AND (JSON_EXTRACT(h.result_snapshot,'$.archive.local_root') IS NULL OR JSON_UNQUOTE(JSON_EXTRACT(h.result_snapshot,'$.archive.local_root'))=?)"
+        " AND EXISTS(SELECT 1 FROM inspection_evidence e WHERE e.task_id=h.task_id AND e.availability='expired')"
+        " ORDER BY h.processed_at LIMIT 500",localArgs);
+    for(const auto& row:localTasks) {
+        const auto id=str(row[0]); if(protectedTasks.contains(id)) continue;
+        if(EvidenceArchive::expireLocalImages(directory,id,now)) {
+            ++expiredLocal;
+            c.exec("UPDATE inspection_history SET result_snapshot=JSON_SET(COALESCE(result_snapshot,JSON_OBJECT()),'$.local_images_expired_at',?) WHERE task_id=?",{time(now),id.toUtf8()});
+        } else ++localFailures;
+    }
+    localTx.commit();
+    qint64 localBytes=0;
+    for(const auto& entry:root.entryInfoList(QDir::Dirs|QDir::NoDotAndDotDot)) {
+        if(QUuid(entry.fileName()).isNull() || entry.isSymLink()) continue;
+        for(const auto& image:QDir(entry.absoluteFilePath()).entryInfoList({"*.jpg","*.png"},QDir::Files))
+            if(!image.isSymLink()) localBytes+=image.size();
+    }
+    const auto stored=c.exec("SELECT COALESCE(SUM(byte_size),0) FROM image_blobs");
+    const QStorageInfo disk(QFileInfo(directory).absoluteFilePath());
+    return QString::fromUtf8(QJsonDocument(QJsonObject{{"normal_days",policy.normalDays},{"abnormal_days",policy.abnormalDays},
+        {"expired_database_tasks",expiredTasks},{"removed_unreferenced_blobs",removedBlobs},{"expired_local_tasks",expiredLocal},
+        {"local_cleanup_failures",localFailures},{"database_image_bytes",str(stored[0][0]).toDouble()},
+        {"local_image_bytes",double(localBytes)},{"disk_available_bytes",double(disk.bytesAvailable())},
+        {"low_disk_space",disk.isValid() && disk.bytesAvailable()<2LL*1024*1024*1024}}).toJson(QJsonDocument::Compact));
 }

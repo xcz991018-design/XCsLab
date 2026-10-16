@@ -19,6 +19,7 @@
 #include <QPushButton>
 #include <QTemporaryDir>
 #include <QTimer>
+#include <QTabWidget>
 #include <iostream>
 #include <memory>
 #include <mutex>
@@ -159,7 +160,18 @@ int main(int argc, char** argv) {
         });
         remove->click(); waitUntil([&]() { return list->isEnabled() && list->count() == 3; });
         require(changes == 4 && store.load(error) && !store.ids().contains("UI_CREATED_COPY"), "UI delete failed");
-        CameraInfoEditDialog device("", nullptr, true, backend); auto* picker = device.findChild<QComboBox*>("deviceGaugeTemplate");
+        CameraInfoEditDialog device("", nullptr, true, backend);
+        auto* enabled = device.findChild<QCheckBox*>("safeRangeEnabled");
+        auto* normalMin = device.findChild<QDoubleSpinBox*>("safeNormalMin");
+        auto* normalMax = device.findChild<QDoubleSpinBox*>("safeNormalMax");
+        auto* minus = device.findChild<QDoubleSpinBox*>("safeAllowanceMinus");
+        auto* plus = device.findChild<QDoubleSpinBox*>("safeAllowancePlus");
+        require(enabled && normalMin && normalMax && minus && plus && enabled->isChecked(), "Range controls/default missing");
+        enabled->setChecked(true); normalMin->setValue(1); normalMax->setValue(2); minus->setValue(0.1); plus->setValue(0.2);
+        const auto configuredRange = device.getUpdatedDeviceItem().safeWorkingRange;
+        require(configuredRange.enabled && configuredRange.valid() && configuredRange.lower() == 0.9 && configuredRange.upper() == 2.2,
+            "Range editor did not produce configured bounds");
+        auto* picker = device.findChild<QComboBox*>("deviceGaugeTemplate");
         require(picker && !picker->isEnabled(), "Picker read blocked UI");
         waitUntil([&]() { return picker->isEnabled() && picker->count() == 3; });
         picker->setCurrentIndex(picker->findData("TEMPERATURE_TEST"));
@@ -194,6 +206,12 @@ int main(int argc, char** argv) {
         require(migrated.size() == 2 && migrated[0]["pointerMinWidth"].toDouble() == 5 &&
                 migrated[0]["pointerMaxWidth"].toDouble() == GaugeProfile().pointerMaxWidth &&
                 !migrated[0].contains("parent_model_path"), "Migration lost resolved global parameters");
+        auto* deviceTabs = device.findChild<QTabWidget*>();
+        require(deviceTabs && deviceTabs->count() == 2, "Safety range must share the gauge archive tab");
+        deviceTabs->setCurrentIndex(1);
+        device.show(); app.processEvents(); QDir().mkpath("test_outputs");
+        require(device.grab().save(QDir::currentPath() + "/test_outputs/device_safe_range.png"), "Range editor preview failed");
+        device.hide();
         manager.show(); app.processEvents(); QDir().mkpath("test_outputs");
         require(manager.grab().save(QDir::currentPath() + "/test_outputs/gauge_template_manager.png"), "Preview failed");
         std::cout << "Database-only templates, optimistic revisions, async GUI, usage protection and one-time migration passed\n";

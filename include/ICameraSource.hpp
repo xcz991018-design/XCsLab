@@ -24,6 +24,7 @@ inline const char* captureFailureName(CaptureFailure error) {
     return "INVALID_INPUT";
 }
 struct FrameCaptureResult {
+    std::vector<uchar> encodedOriginal; // Exact HTTP payload, never recompressed.
     cv::Mat frame;
     CaptureFailure failure{CaptureFailure::None};
     std::string message;

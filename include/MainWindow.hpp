@@ -17,6 +17,8 @@
 #include <QTimer>
 #include <QCheckBox>
 #include <QSet>
+#include <QPointer>
+#include <QMessageBox>
 
 #include <QTabWidget>
 #include <QTableWidget>
@@ -47,6 +49,7 @@ struct InspectionRecord {
     QString customName;
     QString locationInfo;
     double readingValue{0.0};
+    bool readingValid{false};
     std::string unit{"MPa"};
     double pointerAngle{0.0};
     double confidence{0.0};
@@ -61,6 +64,7 @@ struct InspectionRecord {
     QString originalPath;
     QString step4Path;
     QString diagnosticText;
+    QJsonObject safetyAssessment;
 };
 
 class MainWindow : public QMainWindow {
@@ -73,7 +77,10 @@ public:
 protected:
     void closeEvent(QCloseEvent *event) override;
 
+private:
+    QPointer<QMessageBox> m_safeRangeAlert;
 private slots:
+    void updateSelectedDeviceArchive(const QString& camId);
     void onSelectImage();
     void onManageGaugeTemplates();
     void onRunRecognition();
@@ -128,6 +135,10 @@ private:
     QListWidgetItem* findListItemByCameraId(const QString& camId);
     void updateImageCard(QLabel* label, const cv::Mat& mat, const QString& title);
     static QImage cvMatToQImage(const cv::Mat& mat);
+    void selectCameraForDetails(const QString& camId);
+    void disconnectCameraPreview();
+    QString m_selectedCameraId;
+    QString m_previewCameraId;
     void switchActiveCameraSource(const QString& camId);
     void applyCameraCalibrationAndProfile(const QString& camId);
     void checkCameraCalibration(const QString& camId);
@@ -165,7 +176,6 @@ private:
 
     // Metrics Display Cards
     QLabel *m_valLabel{nullptr};
-    QLabel *m_angleLabel{nullptr};
     QLabel *m_centerLabel{nullptr};
     QLabel *m_timeLabel{nullptr};
     QLabel *m_confidenceLabel{nullptr};
@@ -174,9 +184,12 @@ private:
     // Config Details Labels
     QLabel *m_cfgGaugeId{nullptr};
     QLabel *m_cfgRange{nullptr};
-    QLabel *m_cfgGisInfo{nullptr};
+    QLabel *m_cfgHardwareId{nullptr};
     QLabel *m_cfgLocationInfo{nullptr};
     QLabel *m_cfgGaugeSpec{nullptr};
+    QLabel *m_cfgNetworkInfo{nullptr};
+    QLabel *m_cfgSafeRange{nullptr};
+    QLabel *m_cfgCalibration{nullptr};
 
     // Vision Area Tabbed View
     QTabWidget *m_visionTabWidget{nullptr};
@@ -192,7 +205,7 @@ private:
     QLabel *m_snapshotInfoLabel{nullptr};
     QTimer *m_liveTimer{nullptr};
     cv::Mat m_lastCapturedFrame;
-    bool m_isLiveStreaming{true};
+    bool m_isLiveStreaming{false};
 
     // 4 Core Pipeline Stage Image Display Labels
     QLabel *m_imgStage1{nullptr}; // Step 1: 图像/视频采集原帧 (Original Stream Frame)

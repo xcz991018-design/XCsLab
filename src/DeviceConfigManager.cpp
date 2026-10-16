@@ -15,17 +15,11 @@
 #include <QUrl>
 #include <QHostAddress>
 #include <QStandardPaths>
+#include "CameraIdentity.hpp"
 
 namespace {
-QString networkAddress(const QJsonObject& device) {
-    const auto type = deviceFromJson(device).protocolType;
-    if (type != CameraProtocolType::ONVIF_RTSP_STREAM && type != CameraProtocolType::SDK_JLINK) return {};
-    QHostAddress address;
-    if (!address.setAddress(device["ip_or_sn"].toString().trimmed())) return {};
-    return address.toString();
-}
 bool automaticId(const QString& id) {
-    return id.startsWith("CAM_ONVIF_") || id.startsWith("CAM_IP_");
+    return id.startsWith("CAM_ONVIF_") || id.startsWith("CAM_IP_") || id.startsWith("CAM_UUID_");
 }
 bool mergeDuplicateDevices(QJsonObject& root) {
     QJsonArray retained;
@@ -33,12 +27,11 @@ bool mergeDuplicateDevices(QJsonObject& root) {
     bool changed = false;
     for (const auto& value : root["devices"].toArray()) {
         auto incoming = value.toObject();
-        const auto address = networkAddress(incoming);
+        const auto identity = CameraIdentity::normalize(incoming["hardware_id"].toString());
         int match = -1;
-        for (int i = 0; !address.isEmpty() && i < retained.size(); ++i) {
+        for (int i = 0; !identity.isEmpty() && i < retained.size(); ++i) {
             const auto existing = retained[i].toObject();
-            if (networkAddress(existing) == address &&
-                (automaticId(existing["camera_id"].toString()) || automaticId(incoming["camera_id"].toString()))) {
+            if (CameraIdentity::normalize(existing["hardware_id"].toString()) == identity) {
                 match = i; break;
             }
         }
@@ -211,6 +204,7 @@ bool DeviceConfigManager::load(const QString& configPath) {
         if (item.cameraId.isEmpty()) continue;
         item.isOnline = false; // Current connectivity must be checked after restoring the archive.
 
+        if (obj["safe_working_range"].toObject()["defaults_version"].toInt() < 2) migrated = true;
         m_devices.insert(item.cameraId, item);
     }
 
@@ -363,27 +357,36 @@ bool DeviceConfigManager::hasDevice(const QString& cameraId) const {
 
 DiscoveredCameraItem DeviceConfigManager::registerDiscoveredDevice(const DiscoveredCameraItem& item, bool autoSave) {
     DiscoveredCameraItem registered = item;
+    registered.hardwareId = CameraIdentity::normalize(item.hardwareId);
+    // A scan without a verified stable identity cannot claim a persisted archive.
+    if (registered.hardwareId.isEmpty()) return {};
     bool newDevice = false;
     bool needsSave = false;
     {
         QMutexLocker locker(&m_mutex);
-        const auto address = networkAddress(deviceToJson(item, false));
-        auto match = m_devices.find(item.cameraId);
-        if (match == m_devices.end() && !address.isEmpty()) {
-            for (auto it = m_devices.begin(); it != m_devices.end(); ++it) {
-                if (networkAddress(deviceToJson(it.value(), false)) == address) { match = it; break; }
-            }
+        auto match = m_devices.end();
+        for (auto it = m_devices.begin(); it != m_devices.end(); ++it) {
+            if (CameraIdentity::normalize(it->hardwareId) == registered.hardwareId) { match = it; break; }
         }
+        registered.cameraId = CameraIdentity::archiveId(registered.hardwareId);
         if (match != m_devices.end()) {
             registered = match.value();
-            // Discovery refreshes reachability without replacing configured connection or calibration.
+            const auto oldHost = registered.ipOrSn;
+            if (oldHost != item.ipOrSn || registered.port != item.port) {
+                registered.ipOrSn = item.ipOrSn;
+                registered.port = item.port;
+                // Keep vendor path, stream selection, credentials and calibrated archive key.
+                QUrl uri(registered.rtspUrl);
+                if (!uri.host().isEmpty()) { uri.setHost(item.ipOrSn); registered.rtspUrl = uri.toString(); }
+                needsSave = true;
+            }
             registered.isOnline = item.isOnline;
             registered.lastSeenTime = item.lastSeenTime;
         } else newDevice = true;
         if (registered.lastSeenTime.isEmpty())
             registered.lastSeenTime = QDateTime::currentDateTime().toString("yyyy-MM-dd HH:mm:ss");
         m_devices.insert(registered.cameraId, registered);
-        needsSave = newDevice || m_registrySavePending;
+        needsSave = needsSave || newDevice || m_registrySavePending;
     }
     if (autoSave && needsSave) save();
     return registered;
@@ -395,6 +398,7 @@ void DeviceConfigManager::addOrUpdateDevice(const DiscoveredCameraItem& item, bo
         if (m_devices.contains(item.cameraId)) {
             // Merge existing config (preserve user customName, credentials)
             auto& existing = m_devices[item.cameraId];
+            if (!item.hardwareId.isEmpty()) existing.hardwareId = CameraIdentity::normalize(item.hardwareId);
             if (!item.customName.isEmpty()) existing.customName = item.customName;
             if (!item.ipOrSn.isEmpty()) existing.ipOrSn = item.ipOrSn;
             if (item.protocolType != CameraProtocolType::LOCAL_FILE || existing.protocolType == CameraProtocolType::LOCAL_FILE) {
@@ -419,6 +423,7 @@ void DeviceConfigManager::addOrUpdateDevice(const DiscoveredCameraItem& item, bo
             existing.gaugeType = item.gaugeType;
             existing.manufacturer = item.manufacturer;
             existing.accuracyClass = item.accuracyClass;
+            existing.safeWorkingRange = item.safeWorkingRange;
         } else {
             DiscoveredCameraItem newItem = item;
             if (newItem.lastSeenTime.isEmpty()) {

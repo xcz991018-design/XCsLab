@@ -29,7 +29,13 @@ int main(int argc, char** argv) {
     const auto record = QJsonDocument::fromJson(file.readAll()).object();
     const auto device = deviceFromJson(record["device"].toObject());
     const auto frozen = record["profile_snapshot"].toObject();
-    QString imagePath = QFileInfo(cli.value("record")).dir().filePath("original.png");
+    const auto folder=QFileInfo(cli.value("record")).dir();
+    QString imagePath;
+    for (const auto& entry : record["archive"].toObject()["images"].toArray()) {
+        const auto name=entry.toObject()["file"].toString();
+        if (name=="original.jpg" || name=="original.png") imagePath=folder.filePath(name);
+    }
+    if (imagePath.isEmpty()) imagePath=folder.filePath("original.png");
     const auto frame = cv::imread(imagePath.toStdString());
     if (frame.empty() || frozen.isEmpty()) return 2;
     GaugeProfile base;

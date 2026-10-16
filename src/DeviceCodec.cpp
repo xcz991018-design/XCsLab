@@ -1,5 +1,6 @@
 #include "DeviceCodec.hpp"
 #include <QUrl>
+#include "CameraIdentity.hpp"
 #include "DeviceCalibration.hpp"
 static QString protocolToString(CameraProtocolType type) {
     switch (type) {
@@ -24,6 +25,7 @@ static CameraProtocolType stringToProtocol(const QString& str) {
 DiscoveredCameraItem deviceFromJson(const QJsonObject& obj) {
     DiscoveredCameraItem item;
     item.cameraId = obj.value("camera_id").toString();
+    item.hardwareId = CameraIdentity::normalize(obj.value("hardware_id").toString());
 
 
     item.customName = obj.value("custom_name").toString();
@@ -39,6 +41,7 @@ DiscoveredCameraItem deviceFromJson(const QJsonObject& obj) {
     item.defaultProfileId = obj.value("default_profile_id").toString("PRESSURE_GAUGE_1.6MPA");
     item.isOnline = obj.value("is_online").toBool(true);
     item.lastSeenTime = obj.value("last_seen_time").toString();
+    item.safeWorkingRange = SafeWorkingRange::fromJson(obj.value("safe_working_range").toObject());
 
     // Asset & Physical Installation Metadata (no fake defaults, strictly read from configuration)
     item.substation = obj.value("substation").toString("").trimmed();
@@ -73,6 +76,7 @@ DiscoveredCameraItem deviceFromJson(const QJsonObject& obj) {
 QJsonObject deviceToJson(const DiscoveredCameraItem& item, bool includeSecrets) {
     QJsonObject obj;
     obj["camera_id"] = item.cameraId;
+    obj["hardware_id"] = CameraIdentity::normalize(item.hardwareId);
     obj["custom_name"] = item.customName;
     obj["ip_or_sn"] = item.ipOrSn;
     obj["protocol_type"] = protocolToString(item.protocolType);
@@ -86,6 +90,7 @@ QJsonObject deviceToJson(const DiscoveredCameraItem& item, bool includeSecrets) 
     obj["default_profile_id"] = item.defaultProfileId;
     obj["is_online"] = item.isOnline;
     obj["last_seen_time"] = item.lastSeenTime;
+    obj["safe_working_range"] = item.safeWorkingRange.toJson();
 
     // Asset & Physical Installation Metadata
     obj["substation"] = item.substation;

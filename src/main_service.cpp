@@ -94,6 +94,8 @@ int main(int argc, char** argv) {
         tasks.append(task);
     }
     InspectionService service(nullptr, concurrency);
+    QObject::connect(&service, &InspectionService::evidenceMaintenanceFinished, &app,
+        [](const QString& report) { QTextStream(stdout)<<"[STORAGE] "<<report<<"\n"; });
     QTimer syncTimer;
     if (DatabaseSettings::fromEnvironment().enabled) {
         QObject::connect(&syncTimer, &QTimer::timeout, &service, [&]() { service.retryDatabaseWrites(parser.value("output")); });
@@ -108,7 +110,7 @@ int main(int argc, char** argv) {
             QTextStream(stderr) << "MYSQL_PENDING " << out.taskId << " " << out.databaseError << "\n";
         }
         QTextStream(stdout) << out.cameraId << " " << out.errorCode << " "
-                           << (out.errorCode.isEmpty() && out.result.success ? QString::number(out.result.value) : "--") << "\n";
+                           << (out.errorCode.isEmpty() && out.result.success ? QString::number(out.result.value, 'f', 3) : "--") << "\n";
     });
     QObject::connect(&service, &InspectionService::finished, &app, [&](bool cancelled) {
         if (!interval) app.exit(failed || cancelled ? 1 : 0);

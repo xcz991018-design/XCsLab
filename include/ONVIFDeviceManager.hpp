@@ -20,7 +20,8 @@ struct ONVIFDeviceInfo {
     int port{80};
     std::string manufacturer{"Hikvision Network Camera"};
     std::string model{"DS-2CD2087G2-L"};
-    std::string serialNumber{"HKV-2026-ONVIF-991"};
+    std::string hardwareId; // Device-supplied WS-Discovery endpoint UUID.
+    std::string serialNumber;
     std::string firmwareVersion{"V5.7.10"};
     std::string profileToken{"Profile_1_MainStream"};
     std::string rtspUri;

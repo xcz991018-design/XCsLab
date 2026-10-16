@@ -3,6 +3,7 @@
 #include "DeviceCodec.hpp"
 #include "InspectionService.hpp"
 #include "DeviceConfigManager.hpp"
+#include "CameraIdentity.hpp"
 #include "CameraPreviewService.hpp"
 #include "FileCameraSource.hpp"
 #include "SDKCameraSourceStub.hpp"
@@ -107,6 +108,8 @@ int main(int argc, char** argv) {
     // A later ONVIF scan must resolve to the existing physical camera archive.
     DiscoveredCameraItem configured;
     configured.cameraId = "CAM_IP_192_168_110_11";
+    configured.hardwareId = "11111111-1111-4111-8111-111111111111";
+    configured.rtspUrl = "rtsp://operator:secret@192.168.110.11:8554/vendor/path?channel=2";
     configured.ipOrSn = "192.168.110.11";
     configured.protocolType = CameraProtocolType::SDK_JLINK;
     configured.customName = "Configured gauge";
@@ -136,16 +139,36 @@ int main(int argc, char** argv) {
         manager.getAllDevices().size() != 3) return fail(__LINE__);
     discovered.cameraId = "CAM_ONVIF_192_168_110_12";
     discovered.ipOrSn = "192.168.110.12";
+    discovered.hardwareId = "22222222-2222-4222-8222-222222222222";
     manager.registerDiscoveredDevice(discovered, false);
     if (manager.getAllDevices().size() != 4) return fail(__LINE__);
+    // IP changes update the endpoint, never the archive key or saved calibration.
+    auto moved = configured;
+    moved.ipOrSn = "10.10.10.21";
+    moved.cameraId = "different-discovery-label";
+    const auto relocated = manager.registerDiscoveredDevice(moved, false);
+    if (relocated.cameraId != configured.cameraId || relocated.centerX != 999 ||
+        relocated.password != configured.password || relocated.ipOrSn != moved.ipOrSn ||
+        relocated.rtspUrl != "rtsp://operator:secret@10.10.10.21:8554/vendor/path?channel=2" ||
+        manager.getAllDevices().size() != 4) return fail(__LINE__);
+    auto unknown = moved;
+    unknown.hardwareId.clear();
+    if (!manager.registerDiscoveredDevice(unknown, false).cameraId.isEmpty()) return fail(__LINE__);
+    // A different physical camera reusing an IP cannot inherit the original calibration.
+    auto replacement = discovered;
+    replacement.ipOrSn = moved.ipOrSn;
+    const auto separate = manager.registerDiscoveredDevice(replacement, false);
+    if (separate.cameraId == configured.cameraId || separate.hasCalibration) return fail(__LINE__);
     // Simulate a legacy registry containing both protocol identities.
     discovered.cameraId = "CAM_ONVIF_192_168_110_11";
     discovered.ipOrSn = configured.ipOrSn;
+    discovered.hardwareId = configured.hardwareId;
     manager.addOrUpdateDevice(discovered, false);
     if (!manager.save(registryPath) || !manager.load(registryPath)) return fail(__LINE__);
     const auto restored = manager.getDevice(configured.cameraId);
     if (manager.getAllDevices().size() != 4 || manager.hasDevice(discovered.cameraId) ||
-        restored.centerX != 999 || restored.password != configured.password) return fail(__LINE__);
+        restored.centerX != 999 || restored.password != configured.password ||
+        restored.ipOrSn != moved.ipOrSn || restored.hardwareId != configured.hardwareId) return fail(__LINE__);
     QFile savedRegistry(registryPath);
     if (!savedRegistry.open(QIODevice::ReadOnly)) return fail(__LINE__);
     const auto savedRoot=QJsonDocument::fromJson(savedRegistry.readAll()).object();
@@ -343,8 +366,22 @@ int main(int argc, char** argv) {
     const auto expiredPreview = run(task);
     if (expiredPreview.errorCode != "STALE_FRAME" || !expiredPreview.originalPath.isEmpty() ||
         acquisitions != initialAcquisitions) return fail(__LINE__);
+    // Disconnect while a source is still opening: no late frame or cached snapshot may survive.
+    task.device.cameraId = "first";
+    preview.select(task);
     preview.select(InspectionTask());
+    preview.requestFrame();
     if (preview.snapshot("second").ok()) return fail(__LINE__);
+    received = false;
+    QTimer::singleShot(160, &loop, &QEventLoop::quit);
+    loop.exec();
+    if (received || oldDelivered || preview.snapshot("first").ok()) return fail(__LINE__);
+    // Disconnect is reversible; it must not permanently stop the preview backend.
+    task.device.cameraId = "second";
+    preview.select(task);
+    timeout.start(5000);
+    loop.exec();
+    if (!received || !preview.snapshot("second").ok()) return fail(__LINE__);
     preview.stop();
     std::cout << "Explicit inputs, no fallback, typed failures, historical identity and nonblocking preview switching passed\n";
     return 0;

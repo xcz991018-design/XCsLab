@@ -45,6 +45,9 @@ struct InspectionTask {
 };
 
 struct InspectionOutcome {
+    std::vector<uchar> encodedOriginal;
+    QJsonObject archiveMetadata;
+    QJsonObject safetyAssessment; // Frozen task thresholds and unrounded reading evaluation.
     QString captureMethod;
     QJsonObject timings; // Milliseconds, measured using a monotonic clock.
     QString taskId;
@@ -91,6 +94,7 @@ signals:
     void finished(bool cancelled);
     void imageExported(const QString& path, const QString& error);
     void databaseSyncFinished(const QString& error);
+    void evidenceMaintenanceFinished(const QString& report);
 private:
     void dispatch();
     void complete(InspectionOutcome outcome);
@@ -107,4 +111,5 @@ private:
     int m_completed{0};
     bool m_running{false};
     bool m_databaseRetryRunning{false};
+    QDateTime m_lastEvidenceMaintenance;
 };

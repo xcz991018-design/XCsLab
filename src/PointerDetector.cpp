@@ -532,6 +532,31 @@ EdgeTrack PointerDetector::trackEdgeInCorridor(
         return track;
     }
 
+    // A detected peak may still fail raw-support validation. Such peaks must not
+    // bridge an arbitrarily long occlusion and invalidate the entire base segment.
+    // Terminate at the first over-limit unsupported run, retaining the verified
+    // hub-connected prefix. Never synthesize support beyond the occlusion.
+    int unsupportedRun = 0;
+    size_t supportedPrefix = rawPoints.size();
+    for (size_t i=0; i<rawPoints.size(); ++i) {
+        unsupportedRun = rawPoints[i].hasRawSupport ? 0 : unsupportedRun+1;
+        if (unsupportedRun > maxConsecutiveGap) {
+            supportedPrefix = i+1-static_cast<size_t>(unsupportedRun);
+            break;
+        }
+    }
+    if (supportedPrefix < rawPoints.size()) {
+        rawPoints.resize(supportedPrefix);
+        while (!rawPoints.empty() && !rawPoints.back().hasRawSupport) rawPoints.pop_back();
+        verifiedSupportCount = 0; sumStrength = 0; strengths.clear(); jumpCount = 0;
+        for(size_t i=0;i<rawPoints.size();++i) {
+            verifiedSupportCount += rawPoints[i].hasRawSupport ? 1 : 0;
+            sumStrength += rawPoints[i].strength;
+            strengths.push_back(rawPoints[i].strength);
+            if(i && std::abs(rawPoints[i].t-rawPoints[i-1].t)>maxJump*0.75) ++jumpCount;
+        }
+    }
+    if (rawPoints.size() < 6) return track;
     track.points = rawPoints;
     track.validPointCount = static_cast<int>(rawPoints.size());
     track.verifiedSupportCount = verifiedSupportCount;
@@ -656,9 +681,9 @@ PointerCandidateRegion PointerDetector::evaluateCandidateRegion(
     double maxResThresh = (m_config.maxLineFitResidualPx > 0.0) ? m_config.maxLineFitResidualPx : 2.2;
     // Unilateral edge complementation: if one side is fully valid and long, and the other side has decent points,
     // prevent unilateral text occlusion from rejecting the entire candidate
-    if (!region.leftEdge.valid && region.rightEdge.valid && region.leftEdge.points.size() >= 6 && region.leftEdge.lineFitResidual <= maxResThresh * 1.25) {
+    if (!region.leftEdge.valid && region.rightEdge.valid && region.leftEdge.verifiedSupportCount >= 6 && region.leftEdge.straightness > 0 && region.leftEdge.lineFitResidual <= maxResThresh * 1.25) {
         region.leftEdge.valid = true;
-    } else if (region.leftEdge.valid && !region.rightEdge.valid && region.rightEdge.points.size() >= 6 && region.rightEdge.lineFitResidual <= maxResThresh * 1.25) {
+    } else if (region.leftEdge.valid && !region.rightEdge.valid && region.rightEdge.verifiedSupportCount >= 6 && region.rightEdge.straightness > 0 && region.rightEdge.lineFitResidual <= maxResThresh * 1.25) {
         region.rightEdge.valid = true;
     }
 

@@ -1,5 +1,6 @@
 #include "IsolatedCapture.hpp"
 #include "DeviceCodec.hpp"
+#include "EvidenceArchive.hpp"
 #include <QCoreApplication>
 #include <QProcess>
 #include <QTemporaryDir>
@@ -22,10 +23,13 @@ FrameCaptureResult readWorkerResult(const QString& folder, const QJsonObject& js
     result.message = json.value("message").toString().toStdString();
     if (result.failure == CaptureFailure::None) {
         const int sequence = json.value("sequence").toInt();
-        QFile image(folder + (sequence > 0 ? QString("/frame_%1.png").arg(sequence) : QString("/frame.png")));
+        const auto suffix = json["original_suffix"].toString(".png");
+        if (suffix!=".png" && suffix!=".jpg") { result.failure=CaptureFailure::WorkerFailed; return result; }
+        QFile image(folder + (sequence > 0 ? QString("/frame_%1").arg(sequence) : QString("/frame")) + suffix);
         if (image.open(QIODevice::ReadOnly)) {
             const auto bytes = image.readAll();
             result.frame = cv::imdecode(std::vector<uchar>(bytes.begin(), bytes.end()), cv::IMREAD_COLOR);
+            if (json["original_preserved"].toBool()) result.encodedOriginal.assign(bytes.begin(), bytes.end());
         }
         if (result.frame.empty()) result.failure = CaptureFailure::NoFrame;
         result.capturedAt = std::chrono::system_clock::time_point(std::chrono::milliseconds(
@@ -34,13 +38,17 @@ FrameCaptureResult readWorkerResult(const QString& folder, const QJsonObject& js
     return result;
 }
 bool saveWorkerResult(const QString& folder, const FrameCaptureResult& result, int sequence) {
+    const auto suffix = EvidenceArchive::imageSuffix(result.encodedOriginal);
+    const bool preserved = !suffix.isEmpty();
     if (result.ok()) {
-        std::vector<uchar> bytes;
-        if (!cv::imencode(".png", result.frame, bytes)) return false;
-        QSaveFile image(folder + (sequence > 0 ? QString("/frame_%1.png").arg(sequence) : QString("/frame.png")));
+        std::vector<uchar> bytes = preserved ? result.encodedOriginal : std::vector<uchar>();
+        if (!preserved && !cv::imencode(".png", result.frame, bytes)) return false;
+        QSaveFile image(folder + (sequence > 0 ? QString("/frame_%1").arg(sequence) : QString("/frame")) + (preserved ? suffix : ".png"));
         if (!image.open(QIODevice::WriteOnly) || image.write(reinterpret_cast<const char*>(bytes.data()), bytes.size()) != qint64(bytes.size()) || !image.commit()) return false;
     }
     QJsonObject json;
+    json["original_suffix"] = preserved ? suffix : ".png";
+    json["original_preserved"] = preserved;
     json["sequence"] = sequence;
     json["failure"] = static_cast<int>(result.failure);
     json["message"] = QString::fromStdString(result.message);
@@ -100,7 +108,8 @@ FrameCaptureResult IsolatedPreview::read(const InspectionTask& task, const std::
                 result = readWorkerResult(state.directory.path(), json);
                 metadata.close();
                 QFile::remove(metadataPath);
-                QFile::remove(state.directory.filePath(QString("frame_%1.png").arg(sequence)));
+                const auto suffix=json["original_suffix"].toString(".png");
+                if (suffix==".jpg" || suffix==".png") QFile::remove(state.directory.filePath(QString("frame_%1").arg(sequence)+suffix));
                 return result;
             }
         }

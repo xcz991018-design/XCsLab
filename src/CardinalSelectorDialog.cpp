@@ -238,6 +238,7 @@ void InteractiveImageLabel::mouseReleaseEvent(QMouseEvent *event) {
 CardinalSelectorDialog::CardinalSelectorDialog(const cv::Mat& frame, GaugeProfile& profile, const QString& cameraId, QWidget *parent, bool historicalSession)
     : QDialog(parent), m_frame(frame.clone()), m_profile(profile), m_cameraId(cameraId) {
     m_historicalSession = historicalSession;
+    m_sourceCenter=profile.center; m_sourceScalePoints=profile.scalePoints;
     setupUi();
     
     bool ptsValid = (m_profile.perspective_pts.size() == 4);
@@ -263,6 +264,9 @@ CardinalSelectorDialog::CardinalSelectorDialog(const cv::Mat& frame, GaugeProfil
         m_baseRadiusSpinBox->setValue(m_profile.pointerBaseRadius);
     }
     updatePreview();
+    if (ptsValid && cv::isContourConvex(m_currentPts) &&
+        ScaleCalibration::valid(m_profile.scalePoints,m_frame.cols,m_frame.rows,m_profile.center))
+        onConfirmPerspective(); // Existing completed calibration is editable immediately.
 }
 
 void CardinalSelectorDialog::setupUi() {
@@ -395,9 +399,10 @@ void CardinalSelectorDialog::onPointsUpdated() {
 void CardinalSelectorDialog::onConfirmPerspective() {
     if (m_saving) return;
     if (m_perspectiveConfirmed) {
-        // Changing the warp invalidates every downstream annotation.
-        m_perspectiveConfirmed=false; m_centerConfirmed=false; m_loadExistingPoints=false;
-        m_previewLabel->setScalePoints({});
+        // Freeze current edits in source pixels before changing the homography.
+        const auto annotations=sourceAnnotations();
+        m_sourceCenter=annotations.first; m_sourceScalePoints=annotations.second;
+        m_perspectiveConfirmed=false; m_centerConfirmed=false;
         m_previewLabel->selectScaleRatio(-1);
         m_previewLabel->setEnabled(false); m_interactiveLabel->setEnabled(true);
         m_scaleControls->setEnabled(false); m_baseRadiusSpinBox->setEnabled(false);
@@ -412,14 +417,27 @@ void CardinalSelectorDialog::onConfirmPerspective() {
     for (auto pt:m_currentPts) if (!std::isfinite(pt.x) || !std::isfinite(pt.y) || pt.x<0 || pt.y<0 || pt.x>=m_frame.cols || pt.y>=m_frame.rows) return;
     updatePreview();
     if (m_inverseHomography.empty()) return;
-    m_perspectiveConfirmed=true; m_centerConfirmed=false;
+    m_perspectiveConfirmed=true;
+    ScaleCalibration::Mapping existingMapping;
+    const auto existingCenter=m_previewLabel->getCenterPoint();
+    const auto existingScales=m_previewLabel->getScalePoints();
+    m_centerConfirmed=
+        ScaleCalibration::valid(existingScales,m_profile.rectified_size,m_profile.rectified_size,existingCenter) &&
+        ScaleCalibration::build(existingScales,existingCenter,{},m_profile.clockwise,existingMapping);
     m_interactiveLabel->setEnabled(false); m_previewLabel->setEnabled(true);
     m_scaleControls->setEnabled(true); m_baseRadiusSpinBox->setEnabled(true);
     m_autoBtn->setEnabled(false); m_resetBtn->setEnabled(false);
     m_confirmPerspectiveBtn->setText(tr("返回修改四切点"));
-    m_previewLabel->selectCenter();
-    m_scaleStatus->setText(tr("四切点已确认，请在右侧矫正图点击指针旋转轴心。"));
-    m_saveStatus->setText(tr("第二步：在矫正图完成轴心和刻度标定后保存。"));
+    if (!m_centerConfirmed) {
+        m_previewLabel->selectCenter();
+        m_scaleStatus->setText(tr("四切点已确认，请在右侧矫正图点击指针旋转轴心。"));
+    } else {
+        m_previewLabel->selectScaleRatio(-1);
+        updatePreview();
+    }
+    m_saveStatus->setText(m_centerConfirmed
+        ? tr("轴心和刻度点已映射到当前矫正图，请检查并按需调整后保存。")
+        : tr("第二步：在矫正图完成轴心和刻度标定后保存。"));
 }
 
 void CardinalSelectorDialog::updatePreview() {
@@ -433,15 +451,15 @@ void CardinalSelectorDialog::updatePreview() {
         auto rectified=engine.rectifyPerspective(m_frame,m_currentPts,m_inverseHomography,m_profile.rectified_size,m_profile.rectified_margin);
         cv::Point2f center(-1,-1);
         QJsonArray scales;
-        if (m_loadExistingPoints && m_profile.center.x>=0 && m_profile.center.y>=0) {
-            std::vector<cv::Point2f> c{m_profile.center};
+        if (m_sourceCenter.x>=0 && m_sourceCenter.y>=0) {
+            std::vector<cv::Point2f> c{m_sourceCenter};
             cv::perspectiveTransform(c,c,m_inverseHomography.inv()); center=c[0];
-            scales=ScaleCalibration::transformed(m_profile.scalePoints,m_inverseHomography.inv());
+            scales=ScaleCalibration::transformed(m_sourceScalePoints,m_inverseHomography.inv());
         }
         m_previewLabel->setImageAndPoints(rectified,{},center);
         m_previewLabel->setScalePoints(scales);
         m_previewLabel->setPointerBaseRadius(m_baseRadiusSpinBox->value());
-        m_scaleStatus->setText(tr("请先确认左侧四切点，再在右侧矫正图标定轴心和刻度。"));
+        m_scaleStatus->setText(tr("请调整并确认左侧四切点；已有轴心和刻度点会同步映射到右侧矫正图，请检查后按需调整。"));
         return;
     }
     auto center=m_previewLabel->getCenterPoint();
@@ -463,12 +481,33 @@ void CardinalSelectorDialog::onAutoDetect() {
 }
 
 void CardinalSelectorDialog::onReset() {
-    m_loadExistingPoints=false;
     onAutoDetect();
 }
 
 void CardinalSelectorDialog::reject() {
     if (!m_saving) QDialog::reject();
+}
+
+std::pair<cv::Point2f,QJsonArray> CardinalSelectorDialog::sourceAnnotations() const {
+    const auto rectifiedCenter=m_previewLabel->getCenterPoint();
+    const auto rectifiedScales=m_previewLabel->getScalePoints();
+    cv::Point2f center(-1,-1);
+    if(rectifiedCenter.x>=0 && rectifiedCenter.y>=0) {
+        std::vector<cv::Point2f> transformedCenter{rectifiedCenter};
+        cv::perspectiveTransform(transformedCenter,transformedCenter,m_inverseHomography);
+        center=transformedCenter[0];
+        if(m_sourceCenter.x>=0 && m_sourceCenter.y>=0) {
+            std::vector<cv::Point2f> originalCenter{m_sourceCenter};
+            cv::perspectiveTransform(originalCenter,originalCenter,m_inverseHomography.inv());
+            if(originalCenter[0]==rectifiedCenter) center=m_sourceCenter;
+        }
+    }
+    auto scales=ScaleCalibration::transformed(rectifiedScales,m_inverseHomography);
+    const auto originals=ScaleCalibration::transformed(m_sourceScalePoints,m_inverseHomography.inv());
+    for(int i=0;i<scales.size();++i)
+        for(int j=0;j<originals.size();++j)
+            if(rectifiedScales[i]==originals[j]) { scales[i]=m_sourceScalePoints[j]; break; }
+    return {center,scales};
 }
 
 void CardinalSelectorDialog::onSaveAndApply() {
@@ -485,12 +524,9 @@ void CardinalSelectorDialog::onSaveAndApply() {
         !ScaleCalibration::build(rectifiedScales,rectifiedCenter,{},m_profile.clockwise,mapping)) {
         m_saveStatus->setText(tr("无法保存：请检查矫正图的轴心、刻度点及增长方向。")); return;
     }
-    // Persist inverse-mapped source points to retain the existing device and
-    // historical calibration format. Runtime reapplies this same homography.
-    std::vector<cv::Point2f> sourceCenter{rectifiedCenter};
-    cv::perspectiveTransform(sourceCenter,sourceCenter,m_inverseHomography);
-    const auto center=sourceCenter[0];
-    const auto scales=ScaleCalibration::transformed(rectifiedScales,m_inverseHomography);
+    const auto annotations=sourceAnnotations();
+    const auto center=annotations.first;
+    const auto scales=annotations.second;
     QJsonObject calibration{{"perspective_correction_enabled", true},
         {"calibrated_width", m_frame.cols}, {"calibrated_height", m_frame.rows},
         {"center_x", center.x}, {"center_y", center.y}, {"pointer_base_radius", radius}};
