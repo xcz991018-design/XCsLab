@@ -1,3 +1,4 @@
+#include "UiTheme.hpp"
 #include "GaugeTemplateDialog.hpp"
 #include "DeviceConfigManager.hpp"
 #include <QCheckBox>
@@ -27,12 +28,12 @@ public:
     TemplateEditor(const QJsonObject& original, const QJsonObject& effective, bool creating, QWidget* parent)
         : QDialog(parent), m_original(original) {
         setObjectName("gaugeTemplateEditor");
-        setWindowTitle(creating ? tr("新增表计算法模板") : tr("编辑表计算法模板"));
+        setWindowTitle(creating ? tr("新增表计模板") : tr("编辑表计模板"));
         resize(620, 660);
         auto* layout = new QVBoxLayout(this);
         auto* tabs = new QTabWidget(this);
         m_tabs = tabs;
-        const QStringList titles{tr("量程与刻度"), tr("指针检测"), tr("抗干扰"), tr("尾部与灰度"), tr("评分权重")};
+        const QStringList titles{tr("量程与刻度")};
         QVector<QFormLayout*> forms;
         for (const auto& title : titles) {
             auto* panel = new QWidget;
@@ -57,6 +58,7 @@ public:
         hint->setWordWrap(true);
         forms[0]->addRow(hint);
         for (const auto& field : GaugeTemplateStore::fields()) {
+            if (field.page != 0) continue;
             auto value = original[field.key];
             if (value.isUndefined()) for (const auto& alias : field.aliases)
                 if (original.contains(alias)) { value = original[alias]; break; }
@@ -107,6 +109,7 @@ public:
         profile["gauge_id"] = m_id->text().trimmed();
         profile["unit"] = m_unit->text().trimmed();
         for (const auto& field : GaugeTemplateStore::fields()) {
+            if (field.page != 0) continue;
             const auto* editor = m_editors[field.key];
             const QJsonValue value = field.defaultValue.isBool()
                 ? QJsonValue(static_cast<const QCheckBox*>(editor)->isChecked())
@@ -145,7 +148,7 @@ GaugeTemplateDialog::GaugeTemplateDialog(QWidget* parent, GaugeTemplateBackend b
     : QDialog(parent), m_store(std::move(backend)), m_usageLookup(std::move(usageLookup)) {
     m_pool.setMaxThreadCount(1);
     setObjectName("gaugeTemplateManager");
-    setWindowTitle(tr("表计算法模板管理"));
+    setWindowTitle(tr("表计模板管理"));
     resize(820, 520);
     setStyleSheet(
         "QDialog, QWidget { background-color: #161822; color: #d1d5db; font-family: 'Microsoft YaHei'; font-size: 13px; }"
@@ -157,8 +160,9 @@ GaugeTemplateDialog::GaugeTemplateDialog(QWidget* parent, GaugeTemplateBackend b
         "QTabBar::tab { padding: 8px 12px; background-color: #272a3a; }"
         "QTabBar::tab:selected { color: #00e5ff; background-color: #1f2230; }"
     );
+    setStyleSheet(styleSheet() + UiTheme::scrollAndTableStyle());
     auto* layout = new QVBoxLayout(this);
-    auto* hint = new QLabel(tr("模板直接保存到 MySQL 数据库。保存后立即生效，历史任务保留原有配置快照。"), this);
+    auto* hint = new QLabel(tr("模板直接保存到 数据库。保存后立即生效，历史任务保留原有配置快照。"), this);
     hint->setWordWrap(true);
     layout->addWidget(hint);
     auto* content = new QHBoxLayout;
@@ -218,7 +222,7 @@ QStringList GaugeTemplateDialog::usedBy(const QString& id) const {
     if (m_usageLookup) return m_usageLookup(id);
     QStringList devices = m_store.usedBy(id);
     for (const auto& device : DeviceConfigManager::instance().getAllDevices())
-        if ((device.defaultProfileId.isEmpty() ? QStringLiteral(u"PRESSURE_GAUGE_1.6MPA") : device.defaultProfileId) == id)
+        if (device.defaultProfileId == id)
             devices.append(device.cameraId);
     devices.removeDuplicates(); return devices;
 }
@@ -242,7 +246,7 @@ void GaugeTemplateDialog::reload(const QString& selected) {
         if (result.ok) m_list->addItems(m_store.ids());
         setBusy(false);
         m_add->setEnabled(result.ok);
-        m_status->setText(result.ok ? tr("数据库中共 %1 个模板").arg(m_list->count()) : tr("数据库模板加载失败：%1").arg(result.error));
+        m_status->setText(result.ok ? QString() : tr("数据库模板加载失败：%1").arg(result.error));
         int row = m_store.ids().indexOf(selected);
         if (row < 0 && m_list->count()) row = 0;
         m_list->setCurrentRow(row);
@@ -260,7 +264,7 @@ void GaugeTemplateDialog::updateSelection() {
     m_copy->setEnabled(selected && !m_busy);
     m_edit->setEnabled(selected && !m_busy);
     m_delete->setEnabled(selected && m_deletionAvailable && !m_busy);
-    if (!selected) { m_details->setText(tr("尚无模板。点击“新增模板”设置量程、刻度和算法参数。")); return; }
+    if (!selected) { m_details->setText(tr("尚无模板。点击“新增模板”设置量程与刻度。")); return; }
     const auto id = m_list->currentItem()->text();
     const auto profile = m_store.effectiveProfile(id);
     const auto devices = usedBy(id);

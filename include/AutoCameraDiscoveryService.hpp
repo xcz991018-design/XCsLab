@@ -38,14 +38,15 @@ struct DiscoveredCameraItem {
     QString username{"admin"};
     QString password{""};
     bool isOnline{true};
-    QString defaultProfileId{"PRESSURE_GAUGE_1.6MPA"};
+    QString defaultProfileId;
     QString lastSeenTime;
     SafeWorkingRange safeWorkingRange;
 
     // Asset & Physical Installation Metadata (no defaults, requires explicit input)
     QString substation;
     QString area;
-    QString installationLocation;
+    QString installationLocation; // Required installation point (legacy JSON key retained).
+    QString installationPosition; // Optional physical position description.
     QString deviceTag;
     QString gaugeType;
     QString manufacturer;
@@ -75,7 +76,7 @@ Q_DECLARE_METATYPE(DiscoveredCameraItem)
 /**
  * @brief Automatic Camera Plug-and-Play & Network Discovery Service.
  * 
- * Periodically or on-demand scans the local network using ONVIF WS-Discovery,
+ * On-demand scans the local network using ONVIF WS-Discovery,
  * GB28181 Catalog Probe, and Vendor SDK Enumeration APIs. Automatically reports
  * newly connected cameras to the system GUI.
  */
@@ -86,8 +87,9 @@ public:
     explicit AutoCameraDiscoveryService(QObject *parent = nullptr);
     ~AutoCameraDiscoveryService() override;
 
-    void startAutoScan(int intervalMs = 300000);
-    void stopAutoScan();
+    void startHealthMonitoring();
+    void stopHealthMonitoring();
+    bool knownOnlineState(const QString& cameraId, bool& online) const;
     void recordCaptureState(const QString& cameraId, bool online);
     void deferHealthForCapture(const QString& cameraId);
     void recordInspectionState(const QString& cameraId, const QString& errorCode, bool captured);
@@ -102,15 +104,13 @@ signals:
     void discoveryCompleted(int totalCount);
 
 private slots:
-    void onScanTimerTimeout();
     void pollHealth();
 
 private:
-    void executeDiscoveryProcess(bool manual);
-    void startDiscovery(bool manual);
-    void publishHealth(const QString& cameraId, bool online, bool changed);
+    void executeDiscoveryProcess();
+    void startDiscovery();
+    void publishHealth(const QString& cameraId, bool online, bool changed, const QString& details = {});
 
-    QTimer *m_scanTimer{nullptr};
     QMutex m_mutex;
     bool m_isScanning{false};
     QFuture<void> m_scanFuture;
@@ -119,6 +119,10 @@ private:
     QElapsedTimer m_clock;
     CameraHealthSchedule m_health;
     QHash<QString, QPointer<QTcpSocket>> m_healthSockets;
+    QHash<QString, qint64> m_captureFailureChecks;
+    QSet<QString> m_urgentHealthChecks;
+    QHash<QString, QString> m_healthDiagnostics;
+    QHash<QString, qint64> m_healthDiagnosticTimes;
     int m_healthCursor{0};
     qint64 m_healthWindow{-1};
     int m_healthStarted{0};

@@ -21,18 +21,16 @@ struct DeviceArchiveSummary {
             .arg(text(device.protocolName), text(device.ipOrSn)).arg(device.port).arg(device.rtspPort)
             .arg(stream.isEmpty() ? QObject::tr("由 ONVIF 查询") : stream, text(device.username),
                 device.isOnline ? QObject::tr("在线") : QObject::tr("离线"), text(device.lastSeenTime));
-        result.location = QObject::tr("变电站/厂区：%1\n安装区域：%2\n安装点位：%3\n设备标签：%4")
-            .arg(text(device.substation), text(device.area), text(device.installationLocation), text(device.deviceTag));
-        result.specification = QObject::tr("表计模板：%1\n表计类型：%2\n生产厂家：%3\n规格型号：%4\n精度等级：%5")
-            .arg(text(device.defaultProfileId), text(device.gaugeType), text(device.manufacturer), text(device.modelName), text(device.accuracyClass));
+        result.location = QObject::tr("安装点位：%1\n设备标签：%2\n安装位置：%3")
+            .arg(text(device.installationLocation), text(device.deviceTag), text(device.installationPosition));
+        result.specification = QObject::tr("表计模板：%1\n生产厂家：%2")
+            .arg(text(device.defaultProfileId), text(device.manufacturer));
         const auto& range = device.safeWorkingRange;
         if (!range.valid()) result.safety = QObject::tr("安全范围检查：%1\n安全工作范围：待配置或配置无效")
             .arg(range.enabled ? QObject::tr("已启用") : QObject::tr("未启用"));
-        else result.safety = QObject::tr("安全范围检查：%1\n正常工作范围：[%2，%3]\n允许偏差：−%4 / ＋%5\n安全工作范围：[%6，%7]（单位与表计模板一致）")
+        else result.safety = QObject::tr("安全范围检查：%1\n正常工作范围：[%2，%3]（单位与表计模板一致）")
             .arg(range.enabled ? QObject::tr("已启用") : QObject::tr("未启用"))
-            .arg(range.normalMin, 0, 'f', 6).arg(range.normalMax, 0, 'f', 6)
-            .arg(range.allowanceMinus, 0, 'f', 6).arg(range.allowancePlus, 0, 'f', 6)
-            .arg(range.lower(), 0, 'f', 6).arg(range.upper(), 0, 'f', 6);
+            .arg(range.normalMin, 0, 'f', 3).arg(range.normalMax, 0, 'f', 3);
         result.calibration = hasSavedDeviceCalibration(deviceToJson(device).value("calibration").toObject()) ?
             QObject::tr("表计标定：已标定；刻度点：%1 个").arg(device.scalePoints.size()) : QObject::tr("表计标定：未标定");
         return result;

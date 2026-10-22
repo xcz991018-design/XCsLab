@@ -14,11 +14,11 @@
 
 DatabaseConnectionDialog::DatabaseConnectionDialog(QWidget* parent,const QString& path)
     : QDialog(parent),m_path(path.isEmpty()?DatabaseSettingsStore::defaultPath():path) {
-    setWindowTitle(tr("MySQL 连接配置")); setObjectName("mysqlConnectionDialog"); resize(580,530);
+    setWindowTitle(tr("数据库 连接配置")); setObjectName("mysqlConnectionDialog"); resize(580,530);
     m_pool.setMaxThreadCount(1);
     const auto current=path.isEmpty()?DatabaseSettings::fromEnvironment():DatabaseSettingsStore::load(path);
     auto* layout=new QVBoxLayout(this);
-    m_enabled=new QCheckBox(tr("启用 MySQL 存储"),this);
+    m_enabled=new QCheckBox(tr("启用 数据库 存储"),this);
     m_enabled->setObjectName("mysqlEnabled"); m_enabled->setChecked(current.enabled || !QFileInfo::exists(m_path));
     layout->addWidget(m_enabled);
     m_form=new QWidget(this); auto* form=new QFormLayout(m_form);
@@ -39,7 +39,7 @@ DatabaseConnectionDialog::DatabaseConnectionDialog(QWidget* parent,const QString
     explanation->setWordWrap(true); layout->addWidget(explanation);
     auto* file=new QLabel(tr("配置文件: %1").arg(m_path),this); file->setWordWrap(true); file->setTextInteractionFlags(Qt::TextSelectableByMouse); layout->addWidget(file);
     if (!qEnvironmentVariable("GAUGE_MYSQL_DATABASE").isEmpty()) {
-        auto* overrideMessage=new QLabel(tr("当前启动环境包含 MySQL 配置，它优先于保存的配置。保存后请关闭程序，"
+        auto* overrideMessage=new QLabel(tr("当前启动环境包含 数据库 配置，它优先于保存的配置。保存后请关闭程序，"
             "通过不带这些环境变量的方式启动（例如双击程序）。"),this);
         overrideMessage->setWordWrap(true); layout->addWidget(overrideMessage);
     }

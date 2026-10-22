@@ -1,0 +1,8 @@
+cmake_minimum_required(VERSION 3.16)
+project(clock_sync_test LANGUAGES CXX)
+set(CMAKE_CXX_STANDARD 17)
+find_package(Qt5 REQUIRED COMPONENTS Core Network)
+add_executable(clock_sync_test main.cpp)
+target_compile_options(clock_sync_test PRIVATE /utf-8)
+target_include_directories(clock_sync_test PRIVATE ../../include)
+target_link_libraries(clock_sync_test PRIVATE Qt5::Core Qt5::Network)

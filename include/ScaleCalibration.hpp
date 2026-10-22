@@ -1,4 +1,5 @@
 #pragma once
+#include <QStringList>
 #include <QJsonArray>
 #include <QJsonObject>
 #include <opencv2/opencv.hpp>
@@ -80,5 +81,34 @@ inline double ratio(const Mapping& mapping, double offset) {
             return mapping.ratios[i-1]+t*(mapping.ratios[i]-mapping.ratios[i-1]);
         }
     return 1;
+}
+inline QStringList geometryIssues(const QJsonArray& points,cv::Point2f center,bool clockwise,double radius) {
+    QStringList issues;
+    ScaleCalibration::Mapping mapping;
+    if(!ScaleCalibration::build(points,center,{},clockwise,mapping)) {
+        issues<<QStringLiteral(u"刻度增长方向或排列无效。"); return issues;
+    }
+    if(points.size()<5) {
+        issues<<QStringLiteral(u"刻度点少于 5 个，无法充分检查局部几何误差。"); return issues;
+    }
+    std::vector<double> speeds;
+    for(size_t i=1;i<mapping.offsets.size();++i) {
+        const double dr=mapping.ratios[i]-mapping.ratios[i-1];
+        speeds.push_back((mapping.offsets[i]-mapping.offsets[i-1])/dr);
+    }
+    auto ordered=speeds; std::sort(ordered.begin(),ordered.end());
+    const double median=ordered[ordered.size()/2];
+    for(double v:speeds) if(v<median*.55 || v>median*1.8) {
+        issues<<QStringLiteral(u"局部角度与数值跨度差异较大：请核对漏刻度、数值归属、轴心及残余畸变。"); break;
+    }
+    // Ellipse evidence is advisory: click depth can also change the point locus.
+    std::vector<cv::Point2f> positions;
+    for(const auto& v:points) { auto p=v.toObject(); positions.emplace_back(float(p["x"].toDouble()),float(p["y"].toDouble())); }
+    const auto ellipse=cv::fitEllipse(positions);
+    const double minor=std::min(ellipse.size.width,ellipse.size.height);
+    const double major=std::max(ellipse.size.width,ellipse.size.height);
+    if(minor>radius*.5 && major<radius*3 && (major/minor>1.18 || cv::norm(ellipse.center-center)>radius*.08))
+        issues<<QStringLiteral(u"刻度点分布存在偏心或非圆形迹象；可能含残余畸变或点击深度差异，请复核真实刻度线。");
+    return issues;
 }
 }

@@ -9,6 +9,7 @@
 #include <QFileInfo>
 #include <QCoreApplication>
 #include <QTabWidget>
+#include <QTabBar>
 #include <QScrollArea>
 #include <QGroupBox>
 #include <QDebug>
@@ -19,12 +20,26 @@
 
 namespace {
 struct TemplateChoices { QStringList ids; QString error; };
+// Round presentation only; keep the stored spin-box value's existing precision.
+class SafeRangeSpinBox : public QDoubleSpinBox {
+public:
+    using QDoubleSpinBox::QDoubleSpinBox;
+protected:
+    QString textFromValue(double value) const override {
+        auto format = locale();
+        format.setNumberOptions(format.numberOptions() | QLocale::OmitGroupSeparator);
+        return format.toString(value, 'f', 3);
+    }
+};
 }
 
-CameraInfoEditDialog::CameraInfoEditDialog(const QString& cameraId, QWidget *parent, bool isNewDevice, GaugeTemplateBackend backend)
-    : QDialog(parent), m_templateBackend(std::move(backend)), m_originalCameraId(cameraId), m_isNewDevice(isNewDevice) {
+CameraInfoEditDialog::CameraInfoEditDialog(const QString& cameraId, QWidget *parent, bool isNewDevice, GaugeTemplateBackend backend, bool archiveOnly)
+    : QDialog(parent), m_templateBackend(std::move(backend)), m_originalCameraId(cameraId), m_isNewDevice(isNewDevice), m_archiveOnly(archiveOnly) {
     setupUi();
     loadCameraInfo();
+    m_tabWidget->removeTab(m_archiveOnly ? 0 : 1);
+    m_tabWidget->tabBar()->hide();
+    setWindowTitle(m_archiveOnly ? tr("设备安装档案") : tr("设备网络配置"));
 }
 
 QString CameraInfoEditDialog::getUpdatedCameraId() const {
@@ -41,54 +56,54 @@ DiscoveredCameraItem CameraInfoEditDialog::getUpdatedDeviceItem() const {
     }
     const QString previousAddress = item.ipOrSn;
     const QString previousStreamUrl = item.rtspUrl;
-    item.cameraId = getUpdatedCameraId();
-    item.hardwareId = CameraIdentity::normalize(m_hardwareIdEdit->text());
-    item.customName = m_customNameEdit ? m_customNameEdit->text().trimmed() : "";
-    item.ipOrSn = m_ipEdit ? m_ipEdit->text().trimmed() : "192.168.1.101";
+    if (!m_archiveOnly) {
+        item.cameraId = getUpdatedCameraId();
+        item.hardwareId = CameraIdentity::normalize(m_hardwareIdEdit->text());
+        item.customName = m_customNameEdit ? m_customNameEdit->text().trimmed() : "";
+        item.ipOrSn = m_ipEdit ? m_ipEdit->text().trimmed() : "192.168.1.101";
 
-    int protoIdx = m_protocolCombo ? m_protocolCombo->currentIndex() : 0;
-    switch (protoIdx) {
-        case 0:
-            item.protocolType = CameraProtocolType::ONVIF_RTSP_STREAM;
-            item.protocolName = "ONVIF (RTSP)";
-            break;
-        case 1:
-            item.protocolType = CameraProtocolType::SDK_JLINK;
-            item.protocolName = "雄迈 JLink SDK";
-            break;
-        case 2:
-            item.protocolType = CameraProtocolType::GB28181_PS_STREAM;
-            item.protocolName = "国标 GB28181";
-            break;
-        case 3:
-        default:
-            item.protocolType = CameraProtocolType::LOCAL_FILE;
-            item.protocolName = "智能图像采集终端";
-            break;
+        int protoIdx = m_protocolCombo ? m_protocolCombo->currentIndex() : 0;
+        switch (protoIdx) {
+            case 0:
+                item.protocolType = CameraProtocolType::ONVIF_RTSP_STREAM;
+                item.protocolName = "ONVIF (RTSP)";
+                break;
+            case 1:
+                item.protocolType = CameraProtocolType::SDK_JLINK;
+                item.protocolName = "雄迈 JLink SDK";
+                break;
+            case 2:
+                item.protocolType = CameraProtocolType::GB28181_PS_STREAM;
+                item.protocolName = "国标 GB28181";
+                break;
+            case 3:
+            default:
+                item.protocolType = CameraProtocolType::LOCAL_FILE;
+                item.protocolName = "智能图像采集终端";
+                break;
+        }
+
+
+        item.port = m_portSpin ? m_portSpin->value() : 80;
+        item.rtspPort = m_rtspPortSpin ? m_rtspPortSpin->value() : 554;
+        item.rtspUrl = m_rtspUrlEdit ? m_rtspUrlEdit->text().trimmed() : "";
+        item.username = m_usernameEdit ? m_usernameEdit->text().trimmed() : "";
+        item.password = m_passwordEdit ? m_passwordEdit->text() : "";
+
+        if (m_isNewDevice || previousAddress != item.ipOrSn || previousStreamUrl != item.rtspUrl)
+            item.isOnline = false;
+
     }
+    if (m_archiveOnly) {
+        item.defaultProfileId = m_gaugeProfileCombo->currentData().toString();
+        // Asset & Physical Installation Metadata
+        item.installationPosition = m_installationPositionEdit->text().trimmed();
+        item.installationLocation = m_locationEdit ? m_locationEdit->text().trimmed() : "";
+        item.deviceTag = m_deviceTagEdit ? m_deviceTagEdit->text().trimmed() : "";
+        item.manufacturer = m_manufacturerEdit ? m_manufacturerEdit->text().trimmed() : "";
+        item.safeWorkingRange = {m_safeRangeEnabled->isChecked(), m_normalMin->value(), m_normalMax->value()};
 
-    item.modelName = m_modelNameEdit ? m_modelNameEdit->text().trimmed() : "Network Camera";
-    item.port = m_portSpin ? m_portSpin->value() : 80;
-    item.rtspPort = m_rtspPortSpin ? m_rtspPortSpin->value() : 554;
-    item.rtspUrl = m_rtspUrlEdit ? m_rtspUrlEdit->text().trimmed() : "";
-    item.username = m_usernameEdit ? m_usernameEdit->text().trimmed() : "";
-    item.password = m_passwordEdit ? m_passwordEdit->text() : "";
-    item.defaultProfileId = m_gaugeProfileCombo ? m_gaugeProfileCombo->currentData().toString() : QString();
-    if (m_isNewDevice || previousAddress != item.ipOrSn || previousStreamUrl != item.rtspUrl)
-        item.isOnline = false;
-
-    // Asset & Physical Installation Metadata
-    item.substation = m_substationEdit ? m_substationEdit->text().trimmed() : "";
-    item.area = m_areaEdit ? m_areaEdit->text().trimmed() : "";
-    item.installationLocation = m_locationEdit ? m_locationEdit->text().trimmed() : "";
-    item.deviceTag = m_deviceTagEdit ? m_deviceTagEdit->text().trimmed() : "";
-    item.gaugeType = m_gaugeTypeEdit ? m_gaugeTypeEdit->text().trimmed() : "";
-    item.manufacturer = m_manufacturerEdit ? m_manufacturerEdit->text().trimmed() : "";
-    item.modelName = m_modelNameEdit ? m_modelNameEdit->text().trimmed() : item.modelName;
-    item.accuracyClass = m_accuracyClassEdit ? m_accuracyClassEdit->text().trimmed() : "";
-    item.safeWorkingRange = {m_safeRangeEnabled->isChecked(), m_normalMin->value(), m_normalMax->value(),
-        m_allowanceMinus->value(), m_allowancePlus->value()};
-
+    }
     return item;
 }
 
@@ -106,6 +121,7 @@ void CameraInfoEditDialog::refreshProfiles(const QString& selected) {
         m_templatesLoading = false;
         m_availableProfileIds = result.ids;
         m_gaugeProfileCombo->clear();
+        m_gaugeProfileCombo->addItem(tr("请选择表计模板（必选）"), QString());
         for (const auto& available : result.ids) m_gaugeProfileCombo->addItem(available, available);
         if (!id.isEmpty()) {
             int index = m_gaugeProfileCombo->findData(id);
@@ -113,10 +129,10 @@ void CameraInfoEditDialog::refreshProfiles(const QString& selected) {
             m_gaugeProfileCombo->setCurrentIndex(index);
         }
         m_gaugeProfileCombo->setEnabled(result.error.isEmpty());
-        if (m_saveBtn) m_saveBtn->setEnabled(result.error.isEmpty() && !result.ids.isEmpty());
+        if (m_saveBtn) m_saveBtn->setEnabled(!m_archiveOnly || (result.error.isEmpty() && !result.ids.isEmpty()));
         m_gaugeProfileCombo->setToolTip(result.error);
         if (m_templateStatus) m_templateStatus->setText(result.error.isEmpty()
-            ? result.ids.isEmpty() ? tr("数据库暂无模板，请点击“管理模板”新增。") : tr("模板来自 MySQL 数据库")
+            ? result.ids.isEmpty() ? tr("数据库暂无模板，请点击“管理模板”新增。") : tr("模板来自 数据库")
             : tr("模板加载失败：%1").arg(result.error));
     });
     watcher->setFuture(QtConcurrent::run([backend = m_templateBackend]() {
@@ -140,7 +156,7 @@ void CameraInfoEditDialog::setupUi() {
     mainLayout->setContentsMargins(14, 14, 14, 14);
     mainLayout->setSpacing(12);
 
-    QLabel *headerLabel = new QLabel(m_isNewDevice ? tr("🌟 登记并配置新摄像头接入网络参数:") : tr("✏️ 修改摄像头节点网络连接属性与表计档案:"), this);
+    QLabel *headerLabel = new QLabel(m_isNewDevice ? tr("登记新摄像头网络参数；添加后请单独填写表计档案并标定。") : (m_archiveOnly ? tr("填写设备安装档案，并主动选择表计模板：") : tr("修改摄像头网络连接参数：")), this);
     headerLabel->setStyleSheet("font-size: 14px; font-weight: bold; color: #00e5ff; padding-bottom: 2px;");
     mainLayout->addWidget(headerLabel);
 
@@ -207,7 +223,7 @@ void CameraInfoEditDialog::setupUi() {
 
     m_tabWidget->addTab(netTab, tr("🌐 网络配置"));
 
-    // ================= Tab 2: 表计规格与安装档案 =================
+    // ================= Tab 2: 设备安装档案 =================
     QWidget *gaugeTab = new QWidget(m_tabWidget);
     gaugeTab->setObjectName("deviceGaugeArchive");
     gaugeTab->setStyleSheet("QWidget#deviceGaugeArchive { background-color: #14151c; }");
@@ -217,14 +233,11 @@ void CameraInfoEditDialog::setupUi() {
 
     m_gaugeProfileCombo = new QComboBox(gaugeTab);
     m_gaugeProfileCombo->setObjectName("deviceGaugeTemplate");
-    refreshProfiles();
+    if (m_archiveOnly) refreshProfiles();
     m_gaugeProfileCombo->setStyleSheet("QComboBox { color: #ffd700; font-weight: bold; }");
 
-    m_substationEdit = new QLineEdit(gaugeTab);
-    m_substationEdit->setPlaceholderText(tr("例如: 南京一期变电站 (必填)"));
-
-    m_areaEdit = new QLineEdit(gaugeTab);
-    m_areaEdit->setPlaceholderText(tr("例如: 10kV 高压室 (必填)"));
+    m_installationPositionEdit = new QLineEdit(gaugeTab);
+    m_installationPositionEdit->setPlaceholderText(tr("例如：柜体右上方（可选）"));
 
     m_locationEdit = new QLineEdit(gaugeTab);
     m_locationEdit->setPlaceholderText(tr("例如: #3 变压器压力监控位 (必填)"));
@@ -232,17 +245,11 @@ void CameraInfoEditDialog::setupUi() {
     m_deviceTagEdit = new QLineEdit(gaugeTab);
     m_deviceTagEdit->setPlaceholderText(tr("例如: PT-2026-01 (必填)"));
 
-    m_gaugeTypeEdit = new QLineEdit(gaugeTab);
-    m_gaugeTypeEdit->setPlaceholderText(tr("例如: 弹簧管耐震压力表 (必填)"));
 
     m_manufacturerEdit = new QLineEdit(gaugeTab);
-    m_manufacturerEdit->setPlaceholderText(tr("例如: 红旗仪表有限公司 (必填)"));
+    m_manufacturerEdit->setPlaceholderText(tr("例如: 红旗仪表有限公司（可选）"));
 
-    m_modelNameEdit = new QLineEdit(gaugeTab);
-    m_modelNameEdit->setPlaceholderText(tr("例如: Y-100BF (必填)"));
 
-    m_accuracyClassEdit = new QLineEdit(gaugeTab);
-    m_accuracyClassEdit->setPlaceholderText(tr("例如: 1.6级 (必填)"));
 
     auto* profileRow = new QWidget(gaugeTab);
     auto* profileLayout = new QHBoxLayout(profileRow);
@@ -262,21 +269,17 @@ void CameraInfoEditDialog::setupUi() {
     m_templateStatus->setWordWrap(true);
     m_templateStatus->setTextFormat(Qt::PlainText);
     gaugeForm->addRow(m_templateStatus);
-    gaugeForm->addRow(tr("<font color='#ff5252'>*</font> 变电站/厂区 (substation):"), m_substationEdit);
-    gaugeForm->addRow(tr("<font color='#ff5252'>*</font> 安装区域 (area):"), m_areaEdit);
     gaugeForm->addRow(tr("<font color='#ff5252'>*</font> 安装点位 (installation_location):"), m_locationEdit);
     gaugeForm->addRow(tr("<font color='#ff5252'>*</font> 设备标签 (device_tag):"), m_deviceTagEdit);
-    gaugeForm->addRow(tr("<font color='#ff5252'>*</font> 表计类型 (gauge_type):"), m_gaugeTypeEdit);
-    gaugeForm->addRow(tr("<font color='#ff5252'>*</font> 生产厂家 (manufacturer):"), m_manufacturerEdit);
-    gaugeForm->addRow(tr("<font color='#ff5252'>*</font> 规格型号 (model_name):"), m_modelNameEdit);
-    gaugeForm->addRow(tr("<font color='#ff5252'>*</font> 精度等级 (accuracy_class):"), m_accuracyClassEdit);
+    gaugeForm->addRow(tr("安装位置（可选）:"), m_installationPositionEdit);
+    gaugeForm->addRow(tr("生产厂家（可选）:"), m_manufacturerEdit);
 
     auto* gaugeScroll = new QScrollArea(m_tabWidget);
     gaugeScroll->setWidgetResizable(true);
     gaugeScroll->setStyleSheet("QScrollArea { background-color: #14151c; }");
     gaugeScroll->setFrameShape(QFrame::NoFrame);
     gaugeScroll->setWidget(gaugeTab);
-    m_tabWidget->addTab(gaugeScroll, tr("⚙️ 表计规格与安装点位档案"));
+    m_tabWidget->addTab(gaugeScroll, tr("⚙️ 设备安装档案"));
 
     auto* rangeTab = new QGroupBox(tr("安全工作范围"), gaugeTab);
     rangeTab->setObjectName("deviceSafeRange");
@@ -286,45 +289,37 @@ void CameraInfoEditDialog::setupUi() {
     m_safeRangeEnabled->setObjectName("safeRangeEnabled");
     m_safeRangeEnabled->setChecked(true);
     m_safeRangeEnabled->setStyleSheet("QCheckBox { color: #d8dee9; font-weight: bold; }");
-    const auto makeBound = [&](const char* name, bool allowance) {
-        auto* spin = new QDoubleSpinBox(rangeTab);
+    const auto makeBound = [&](const char* name) {
+        auto* spin = new SafeRangeSpinBox(rangeTab);
         spin->setObjectName(name);
         spin->setDecimals(6);
-        spin->setRange(allowance ? 0.0 : -1e12, 1e12);
+        spin->setRange(-1e12, 1e12);
         spin->setSingleStep(0.01);
         return spin;
     };
-    m_normalMin = makeBound("safeNormalMin", false);
-    m_normalMax = makeBound("safeNormalMax", false);
-    m_allowanceMinus = makeBound("safeAllowanceMinus", true);
-    m_allowancePlus = makeBound("safeAllowancePlus", true);
+    m_normalMin = makeBound("safeNormalMin");
+    m_normalMax = makeBound("safeNormalMax");
     rangeForm->addRow(m_safeRangeEnabled);
     auto* normalBounds = new QHBoxLayout();
     normalBounds->addWidget(m_normalMin);
     normalBounds->addWidget(new QLabel(tr("至"), rangeTab));
     normalBounds->addWidget(m_normalMax);
     rangeForm->addRow(tr("正常工作范围:"), normalBounds);
-    auto* allowances = new QHBoxLayout();
-    allowances->addWidget(new QLabel(tr("−"), rangeTab));
-    allowances->addWidget(m_allowanceMinus);
-    allowances->addWidget(new QLabel(tr("＋"), rangeTab));
-    allowances->addWidget(m_allowancePlus);
-    rangeForm->addRow(tr("允许偏差:"), allowances);
     m_safeRangePreview = new QLabel(rangeTab);
     m_safeRangePreview->setWordWrap(true);
     rangeForm->addRow(m_safeRangePreview);
-    auto* hint = new QLabel(tr("数值单位与表计读数一致。安全范围 = [正常下限 − 负偏差，正常上限 ＋ 正偏差]，包含边界。\n使用未四舍五入的读数判断；超范围时巡检行醒目标注并弹窗提醒。"), rangeTab);
+    auto* hint = new QLabel(tr("数值单位与表计读数一致。安全范围 = [正常下限，正常上限]，包含边界。\n使用未四舍五入的读数判断；超范围时巡检行醒目标注并弹窗提醒。"), rangeTab);
     hint->setWordWrap(true);
     rangeForm->addRow(hint);
     const auto updateRange = [this]() {
         const bool enabled = m_safeRangeEnabled->isChecked();
-        for (auto* spin : {m_normalMin, m_normalMax, m_allowanceMinus, m_allowancePlus}) spin->setEnabled(enabled);
+        for (auto* spin : {m_normalMin, m_normalMax}) spin->setEnabled(enabled);
         const auto range = getUpdatedDeviceItem().safeWorkingRange;
         m_safeRangePreview->setText(!enabled ? tr("未启用范围检查") : !range.valid() ? tr("范围无效：正常下限不能大于上限") :
-            tr("实际安全工作范围：[%1，%2]").arg(range.lower(), 0, 'f', 6).arg(range.upper(), 0, 'f', 6));
+            tr("实际安全工作范围：[%1，%2]").arg(range.lower(), 0, 'f', 3).arg(range.upper(), 0, 'f', 3));
     };
     connect(m_safeRangeEnabled, &QCheckBox::toggled, this, updateRange);
-    for (auto* spin : {m_normalMin, m_normalMax, m_allowanceMinus, m_allowancePlus})
+    for (auto* spin : {m_normalMin, m_normalMax})
         connect(spin, QOverload<double>::of(&QDoubleSpinBox::valueChanged), this, updateRange);
     updateRange();
     gaugeForm->insertRow(2, rangeTab);
@@ -333,7 +328,7 @@ void CameraInfoEditDialog::setupUi() {
     // Action Buttons
     QHBoxLayout *btnLayout = new QHBoxLayout();
     m_saveBtn = new QPushButton(tr("💾 保存设备配置并立即生效"), this);
-    m_saveBtn->setEnabled(!m_templatesLoading && !m_availableProfileIds.isEmpty());
+    m_saveBtn->setEnabled(!m_archiveOnly || (!m_templatesLoading && !m_availableProfileIds.isEmpty()));
     m_cancelBtn = new QPushButton(tr("取消"), this);
 
     m_saveBtn->setStyleSheet("QPushButton { background-color: #00897b; color: white; font-weight: bold; padding: 8px 20px; border-radius: 4px; font-size: 13px; }"
@@ -362,14 +357,10 @@ void CameraInfoEditDialog::loadCameraInfo() {
         m_rtspPortSpin->setValue(554);
 
         // No fake default values, require explicit user input
-        m_substationEdit->clear();
-        m_areaEdit->clear();
+        m_installationPositionEdit->clear();
         m_locationEdit->clear();
         m_deviceTagEdit->clear();
-        m_gaugeTypeEdit->clear();
         m_manufacturerEdit->clear();
-        m_modelNameEdit->clear();
-        m_accuracyClassEdit->clear();
         return;
     }
 
@@ -396,22 +387,16 @@ void CameraInfoEditDialog::loadCameraInfo() {
             m_protocolCombo->setCurrentIndex(3);
         }
 
-        if (!dev.defaultProfileId.isEmpty()) {
+        if (m_archiveOnly && !dev.defaultProfileId.isEmpty()) {
             refreshProfiles(dev.defaultProfileId);
         }
 
-        m_substationEdit->setText(dev.substation);
-        m_areaEdit->setText(dev.area);
+        m_installationPositionEdit->setText(dev.installationPosition);
         m_locationEdit->setText(dev.installationLocation);
         m_deviceTagEdit->setText(dev.deviceTag);
-        m_gaugeTypeEdit->setText(dev.gaugeType);
         m_manufacturerEdit->setText(dev.manufacturer);
-        m_modelNameEdit->setText(dev.modelName);
-        m_accuracyClassEdit->setText(dev.accuracyClass);
         m_normalMin->setValue(dev.safeWorkingRange.normalMin);
         m_normalMax->setValue(dev.safeWorkingRange.normalMax);
-        m_allowanceMinus->setValue(dev.safeWorkingRange.allowanceMinus);
-        m_allowancePlus->setValue(dev.safeWorkingRange.allowancePlus);
         m_safeRangeEnabled->setChecked(dev.safeWorkingRange.enabled);
     } else {
         m_cameraIdEdit->setText(m_originalCameraId);
@@ -420,12 +405,12 @@ void CameraInfoEditDialog::loadCameraInfo() {
 
 void CameraInfoEditDialog::onSave() {
     const auto range = getUpdatedDeviceItem().safeWorkingRange;
-    if (range.enabled && !range.valid()) {
+    if (m_archiveOnly && range.enabled && !range.valid()) {
         m_tabWidget->setCurrentIndex(m_tabWidget->count() - 1);
-        QMessageBox::warning(this, tr("安全工作范围无效"), tr("正常下限不能大于上限，允许偏差必须为非负数。"));
+        QMessageBox::warning(this, tr("安全工作范围无效"), tr("正常下限不能大于上限。"));
         return;
     }
-    if (!m_hardwareIdEdit->text().trimmed().isEmpty() && CameraIdentity::normalize(m_hardwareIdEdit->text()).isEmpty()) {
+    if (!m_archiveOnly && !m_hardwareIdEdit->text().trimmed().isEmpty() && CameraIdentity::normalize(m_hardwareIdEdit->text()).isEmpty()) {
         QMessageBox::warning(this, tr("硬件身份无效"), tr("请填写相机返回的有效 ONVIF UUID，不能填写 IP 地址。"));
         return;
     }
@@ -436,12 +421,13 @@ void CameraInfoEditDialog::onSave() {
 
 bool CameraInfoEditDialog::saveCameraInfo() {
     const auto selectedProfile = m_gaugeProfileCombo->currentData().toString();
-    if (m_templatesLoading || selectedProfile.isEmpty() || !m_availableProfileIds.contains(selectedProfile)) {
-        m_tabWidget->setCurrentIndex(1);
+    if (m_archiveOnly && (m_templatesLoading || selectedProfile.isEmpty() || !m_availableProfileIds.contains(selectedProfile))) {
+        m_tabWidget->setCurrentIndex(0);
         QMessageBox::warning(this, tr("验证失败"), tr("请选择有效的表计模板；可以点击“管理模板”新增模板。"));
         return false;
     }
     QString newCamId = getUpdatedCameraId();
+    if (!m_archiveOnly) {
     if (newCamId.isEmpty()) {
         if (m_tabWidget) m_tabWidget->setCurrentIndex(0);
         QMessageBox::warning(this, tr("验证失败"), tr("设备编号 (camera_id) 不能为空，请输入设备唯一编号！"));
@@ -472,63 +458,24 @@ bool CameraInfoEditDialog::saveCameraInfo() {
         }
     }
 
+    }
+    if (m_archiveOnly) {
     // Strict validation for Tab 2 (Physical Installation & Gauge Spec Metadata)
-    if (m_substationEdit && m_substationEdit->text().trimmed().isEmpty()) {
-        if (m_tabWidget) m_tabWidget->setCurrentIndex(1);
-        QMessageBox::warning(this, tr("验证失败"), tr("【所属变电站/厂区 (substation)】为必填项，必须输入真实点位信息！"));
-        m_substationEdit->setFocus();
-        return false;
-    }
-
-    if (m_areaEdit && m_areaEdit->text().trimmed().isEmpty()) {
-        if (m_tabWidget) m_tabWidget->setCurrentIndex(1);
-        QMessageBox::warning(this, tr("验证失败"), tr("【安装区域 (area)】为必填项，必须输入真实安装区域！"));
-        m_areaEdit->setFocus();
-        return false;
-    }
-
     if (m_locationEdit && m_locationEdit->text().trimmed().isEmpty()) {
-        if (m_tabWidget) m_tabWidget->setCurrentIndex(1);
+        if (m_tabWidget) m_tabWidget->setCurrentIndex(0);
         QMessageBox::warning(this, tr("验证失败"), tr("【物理安装点位 (installation_location)】为必填项，必须输入具体的安装位置！"));
         m_locationEdit->setFocus();
         return false;
     }
 
     if (m_deviceTagEdit && m_deviceTagEdit->text().trimmed().isEmpty()) {
-        if (m_tabWidget) m_tabWidget->setCurrentIndex(1);
+        if (m_tabWidget) m_tabWidget->setCurrentIndex(0);
         QMessageBox::warning(this, tr("验证失败"), tr("【设备标签/位号 (device_tag)】为必填项，必须输入现场设备位号！"));
         m_deviceTagEdit->setFocus();
         return false;
     }
 
-    if (m_gaugeTypeEdit && m_gaugeTypeEdit->text().trimmed().isEmpty()) {
-        if (m_tabWidget) m_tabWidget->setCurrentIndex(1);
-        QMessageBox::warning(this, tr("验证失败"), tr("【表计类型 (gauge_type)】为必填项，必须输入表计类型！"));
-        m_gaugeTypeEdit->setFocus();
-        return false;
     }
-
-    if (m_manufacturerEdit && m_manufacturerEdit->text().trimmed().isEmpty()) {
-        if (m_tabWidget) m_tabWidget->setCurrentIndex(1);
-        QMessageBox::warning(this, tr("验证失败"), tr("【生产厂家 (manufacturer)】为必填项，必须输入仪表生产厂家！"));
-        m_manufacturerEdit->setFocus();
-        return false;
-    }
-
-    if (m_modelNameEdit && m_modelNameEdit->text().trimmed().isEmpty()) {
-        if (m_tabWidget) m_tabWidget->setCurrentIndex(1);
-        QMessageBox::warning(this, tr("验证失败"), tr("【规格型号 (model_name)】为必填项，必须输入仪表型号！"));
-        m_modelNameEdit->setFocus();
-        return false;
-    }
-
-    if (m_accuracyClassEdit && m_accuracyClassEdit->text().trimmed().isEmpty()) {
-        if (m_tabWidget) m_tabWidget->setCurrentIndex(1);
-        QMessageBox::warning(this, tr("验证失败"), tr("【精度等级 (accuracy_class)】为必填项，必须输入仪表精度等级！"));
-        m_accuracyClassEdit->setFocus();
-        return false;
-    }
-
     // 1. Save to DeviceConfigManager (devices.json)
     DiscoveredCameraItem item = getUpdatedDeviceItem();
     if (!m_isNewDevice && newCamId != m_originalCameraId) {
@@ -540,7 +487,7 @@ bool CameraInfoEditDialog::saveCameraInfo() {
         return false;
     }
     QMessageBox::information(this, tr("档案已保存"),
-        tr("摄像头网络参数已保存至 %1；数据库启用时，档案已提交后台同步，结果见日志。")
+        tr("设备配置已保存至 %1；数据库启用时，档案已提交后台同步，结果见日志。")
             .arg(DeviceConfigManager::instance().getConfigPath()));
     return true;
 }

@@ -16,9 +16,12 @@
 #include <QSplitter>
 #include <QTimer>
 #include <QCheckBox>
+#include <QSpinBox>
 #include <QSet>
 #include <QPointer>
 #include <QMessageBox>
+#include <QSystemTrayIcon>
+#include "InspectionAlarmDialog.hpp"
 
 #include <QTabWidget>
 #include <QTableWidget>
@@ -74,20 +77,29 @@ public:
     explicit MainWindow(QWidget *parent = nullptr);
     ~MainWindow() override;
 
+signals:
+    void logoutRequested();
+
 protected:
     void closeEvent(QCloseEvent *event) override;
 
 private:
-    QPointer<QMessageBox> m_safeRangeAlert;
+    QPointer<InspectionAlarmDialog> m_safeRangeAlert;
+    QSystemTrayIcon* m_trayIcon{nullptr};
+    bool m_quitting{false};
+    bool m_backgroundHintShown{false};
+    void setupSystemTray();
+    void restoreMainWindow();
 private slots:
     void updateSelectedDeviceArchive(const QString& camId);
     void onSelectImage();
     void onManageGaugeTemplates();
     void onRunRecognition();
     void onRecognitionFinished();
+    void logRecognitionStageTimings(const QString& context, const QJsonObject& engineSteps);
     void onCameraSelectionChanged();
     void onCalibrateCardinalPoints();
-    void onEditCameraInfo(QListWidgetItem *item);
+    void onEditCameraInfo(QListWidgetItem *item, bool archiveOnly = false);
 
     // Auto Discovery & System Slots
     void onTriggerAutoDiscovery();
@@ -103,14 +115,11 @@ private slots:
 
     // Stage 0: Live Stream & Capture Slots
     void onToggleLiveStream();
-    void onCaptureCameraSnapshot();
-    void onSaveSnapshotImage();
-    void onUseSnapshotForRecognition();
     void onUpdateLiveStreamFrame();
     void onTabChanged(int index);
 
     // Inspection & Patrol Slots
-    void onCaptureAndRecognizeCurrent();
+    void onCaptureAndRecognizeCurrent(const QString& cameraId);
     void onStartAllDevicesInspection();
     void onStopAllDevicesInspection();
     void onInspectionOutcome(const InspectionOutcome& outcome);
@@ -124,10 +133,18 @@ private:
     void createTopBanner(QVBoxLayout *rootLayout);
     QWidget* createLeftSidebar(QWidget *parent);
     QWidget* createCenterVisionArea(QWidget *parent);
+    void showVisionPage(QWidget* page, const QString& title);
+    void updatePatrolControls(bool stopping = false);
     QWidget* createLiveStreamStageArea(QWidget *parent);
     QWidget* createInspectionStageArea(QWidget *parent);
     QWidget* createBottomLogConsole(QWidget *parent);
     void showInspectionPhotosDialog(int row);
+    QPushButton* createDeviceLiveButton(const QString& cameraId);
+    void openDeviceLivePreview(const QString& cameraId);
+    void checkAndSynchronizeCameraClock(const QString& cameraId);
+    QTimer* m_clockCheckTimer{nullptr};
+    QSet<QString> m_clockChecksInFlight;
+    QHash<QString, QDateTime> m_lastClockCheck;
 
     void applyDarkStyle();
     void loadAndRestoreSavedDevices();
@@ -139,6 +156,7 @@ private:
     void disconnectCameraPreview();
     QString m_selectedCameraId;
     QString m_previewCameraId;
+    QSet<QString> m_offlineCameraIds; // Confirmed failures in this session; restored archives start unknown.
     void switchActiveCameraSource(const QString& camId);
     void applyCameraCalibrationAndProfile(const QString& camId);
     void checkCameraCalibration(const QString& camId);
@@ -156,9 +174,6 @@ private:
     bool m_calibrationSnapshotLoading{false};
 
     // Top Status Bar Badges
-    QLabel *m_statusChannelBadge{nullptr};
-    QLabel *m_statusProberBadge{nullptr};
-    QLabel *m_statusFpsBadge{nullptr};
     QLabel *m_statusCameraCountBadge{nullptr};
 
     // Left Sidebar Widgets
@@ -167,12 +182,6 @@ private:
     QPushButton *m_removeDeviceBtn{nullptr};
     QLineEdit *m_deviceFilterEdit{nullptr};
     QListWidget *m_deviceListWidget{nullptr};
-    QLineEdit *m_imagePathEdit{nullptr};
-    QPushButton *m_browseImgBtn{nullptr};
-    QPushButton *m_snapAndRunBtn{nullptr};
-    QPushButton *m_batchPatrolBtn{nullptr};
-    QComboBox *m_runModeCombo{nullptr};
-    QPushButton *m_runBtn{nullptr};
 
     // Metrics Display Cards
     QLabel *m_valLabel{nullptr};
@@ -193,18 +202,15 @@ private:
 
     // Vision Area Tabbed View
     QTabWidget *m_visionTabWidget{nullptr};
+    QWidget *m_livePage{nullptr};
+    QWidget *m_recognitionPage{nullptr};
+    QWidget *m_inspectionPage{nullptr};
 
-    // Stage 0: 摄像头实时流与抓图 Stage Widgets
+    // Stage 0: 摄像头实时预览 Stage Widgets
     QLabel *m_liveStreamLabel{nullptr};
-    QLabel *m_capturedSnapshotLabel{nullptr};
     QPushButton *m_toggleLiveBtn{nullptr};
-    QPushButton *m_captureBtn{nullptr};
-    QPushButton *m_saveSnapshotBtn{nullptr};
-    QPushButton *m_useSnapshotForRunBtn{nullptr};
     QLabel *m_liveCamInfoBadge{nullptr};
-    QLabel *m_snapshotInfoLabel{nullptr};
     QTimer *m_liveTimer{nullptr};
-    cv::Mat m_lastCapturedFrame;
     bool m_isLiveStreaming{false};
 
     // Original capture and final recognition image displays
@@ -230,9 +236,7 @@ private:
     CameraPreviewService* m_previewService{nullptr};
     InspectionTask m_singleSubmittedTask;
     InspectionTask m_analysisInput;
-    InspectionTask m_snapshotInput;
     bool m_hasAnalysisInput{false};
-    bool m_hasSnapshotInput{false};
     bool m_registryLoaded{false};
     QFutureWatcher<bool>* m_registryWatcher{nullptr};
     QTimer* m_databaseSyncTimer{nullptr};
@@ -250,9 +254,10 @@ private:
     QProgressBar *m_inspectionProgressBar{nullptr};
     QLabel *m_inspectionSummaryLabel{nullptr};
     QPushButton *m_startPatrolBtn{nullptr};
-    QPushButton *m_stopPatrolBtn{nullptr};
+
     QPushButton *m_exportReportBtn{nullptr};
     QCheckBox *m_autoPatrolCheck{nullptr};
+    QSpinBox *m_autoPatrolInterval{nullptr};
     QTimer *m_autoPatrolTimer{nullptr};
     InspectionService* m_inspectionService{nullptr};
     bool m_isPatrolRunning{false};

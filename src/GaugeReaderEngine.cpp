@@ -1,5 +1,6 @@
 #include "GaugeReaderEngine.hpp"
 #include "ScaleCalibration.hpp"
+#include "AutoDialCalibration.hpp"
 #include "RecognitionQuality.hpp"
 #include <cmath>
 #include <iostream>
@@ -115,118 +116,8 @@ bool GaugeReaderEngine::locateDialCircle(const cv::Mat& gray, cv::Point2f& cente
 }
 
 std::vector<cv::Point2f> GaugeReaderEngine::autoDetectCardinalPoints(const cv::Mat& image) {
-    if (image.empty()) return {};
-
-    int h = image.rows;
-    int w = image.cols;
-    double imgArea = static_cast<double>(h * w);
-
-    cv::Mat gray;
-    if (image.channels() == 3) {
-        cv::cvtColor(image, gray, cv::COLOR_BGR2GRAY);
-    } else {
-        gray = image.clone();
-    }
-
-    // 1. Try detecting full outer dial circle via HoughCircles first
-    cv::Point2f autoCenter;
-    float autoRadius = 0.0f;
-    if (locateDialCircle(gray, autoCenter, autoRadius) && autoRadius > 30.0f) {
-        float rPad = autoRadius * 1.05f; // Add 5% padding margin to include full outer bezel & numbers
-        std::vector<cv::Point2f> pts(4);
-        pts[0] = cv::Point2f(autoCenter.x, autoCenter.y - rPad); // 12H Top
-        pts[1] = cv::Point2f(autoCenter.x + rPad, autoCenter.y); // 3H Right
-        pts[2] = cv::Point2f(autoCenter.x, autoCenter.y + rPad); // 6H Bottom
-        pts[3] = cv::Point2f(autoCenter.x - rPad, autoCenter.y); // 9H Left
-
-        float margin = 5.0f;
-        for (auto& pt : pts) {
-            pt.x = std::max(margin, std::min(pt.x, static_cast<float>(w) - margin));
-            pt.y = std::max(margin, std::min(pt.y, static_cast<float>(h) - margin));
-        }
-        return pts;
-    }
-
-    cv::Mat blurred;
-    cv::GaussianBlur(gray, blurred, cv::Size(5, 5), 0);
-
-    cv::Mat thresh;
-    cv::threshold(blurred, thresh, 0, 255, cv::THRESH_BINARY + cv::THRESH_OTSU);
-
-    std::vector<std::vector<cv::Point>> cnts;
-    cv::findContours(thresh, cnts, cv::RETR_TREE, cv::CHAIN_APPROX_NONE);
-
-    std::vector<cv::Point> bestCnt;
-    double maxArea = 0.0;
-
-    auto evaluateContours = [&](const std::vector<std::vector<cv::Point>>& candidates) {
-        for (const auto& c : candidates) {
-            double area = cv::contourArea(c);
-            if (area > 0.01 * imgArea && area < 0.90 * imgArea && c.size() >= 5) {
-                cv::RotatedRect ellipse = cv::fitEllipse(c);
-                float d1 = ellipse.size.width;
-                float d2 = ellipse.size.height;
-                float maxD = std::max(d1, d2);
-                float minD = std::min(d1, d2);
-                float ratio = (maxD > 0.0f) ? (minD / maxD) : 0.0f;
-
-                if (ratio > 0.4f && area > maxArea) {
-                    maxArea = area;
-                    bestCnt = c;
-                }
-            }
-        }
-    };
-
-    evaluateContours(cnts);
-
-    if (bestCnt.empty()) {
-        cv::Mat edged;
-        cv::Canny(blurred, edged, 50, 200);
-        std::vector<std::vector<cv::Point>> cntsCanny;
-        cv::findContours(edged, cntsCanny, cv::RETR_EXTERNAL, cv::CHAIN_APPROX_NONE);
-        evaluateContours(cntsCanny);
-    }
-
-    std::vector<cv::Point2f> cardinalPts(4);
-
-    if (!bestCnt.empty()) {
-        cv::Point topPt = bestCnt[0];
-        cv::Point bottomPt = bestCnt[0];
-        cv::Point leftPt = bestCnt[0];
-        cv::Point rightPt = bestCnt[0];
-
-        for (const auto& p : bestCnt) {
-            if (p.y < topPt.y) topPt = p;
-            if (p.y > bottomPt.y) bottomPt = p;
-            if (p.x < leftPt.x) leftPt = p;
-            if (p.x > rightPt.x) rightPt = p;
-        }
-
-        cardinalPts[0] = cv::Point2f(static_cast<float>(topPt.x), static_cast<float>(topPt.y));        // 12H Top
-        cardinalPts[1] = cv::Point2f(static_cast<float>(rightPt.x), static_cast<float>(rightPt.y));    // 3H Right
-        cardinalPts[2] = cv::Point2f(static_cast<float>(bottomPt.x), static_cast<float>(bottomPt.y));  // 6H Bottom
-        cardinalPts[3] = cv::Point2f(static_cast<float>(leftPt.x), static_cast<float>(leftPt.y));      // 9H Left
-
-        float pad = 10.0f;
-        for (auto& pt : cardinalPts) {
-            pt.x = std::max(pad, std::min(pt.x, static_cast<float>(w) - pad));
-            pt.y = std::max(pad, std::min(pt.y, static_cast<float>(h) - pad));
-        }
-        return cardinalPts;
-    }
-
-    // Fallback: Default 4 points around center
-    float cx = w * 0.5f;
-    float cy = h * 0.5f;
-    float r = std::min(w, h) * 0.35f;
-
-    cardinalPts[0] = cv::Point2f(cx, cy - r); // Top (12H)
-    cardinalPts[1] = cv::Point2f(cx + r, cy); // Right (3H)
-    cardinalPts[2] = cv::Point2f(cx, cy + r); // Bottom (6H)
-    cardinalPts[3] = cv::Point2f(cx - r, cy); // Left (9H)
-
-    return cardinalPts;
+    const auto result=AutoDialCalibration::detect(image);
+    return result.valid()?result.points:std::vector<cv::Point2f>{};
 }
 
 cv::Mat GaugeReaderEngine::rectifyPerspective(const cv::Mat& src, const std::vector<cv::Point2f>& quadPts, cv::Mat& invH, int outSize, int margin) {

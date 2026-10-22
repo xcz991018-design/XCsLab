@@ -51,12 +51,12 @@ DatabaseSettings DatabaseSettingsStore::load(const QString& requestedPath) {
     DatabaseSettings s; s.host="127.0.0.1"; s.tlsMode="required";
     QFile file(requestedPath.isEmpty()?defaultPath():requestedPath);
     if (!file.exists()) return s;
-    if (!file.open(QIODevice::ReadOnly)) { s.configurationError=QStringLiteral(u"\u65e0\u6cd5\u8bfb\u53d6 MySQL \u914d\u7f6e\u6587\u4ef6\u3002"); return s; }
+    if (!file.open(QIODevice::ReadOnly)) { s.configurationError=QStringLiteral(u"\u65e0\u6cd5\u8bfb\u53d6 数据库 \u914d\u7f6e\u6587\u4ef6\u3002"); return s; }
     QJsonParseError parse;
     const auto document=QJsonDocument::fromJson(file.readAll(),&parse);
     const auto obj=document.object();
     if (parse.error!=QJsonParseError::NoError || !document.isObject() || obj.value("version").toInt()!=1) {
-        s.configurationError=QStringLiteral(u"MySQL \u914d\u7f6e\u6587\u4ef6\u683c\u5f0f\u65e0\u6548\uff0c\u8bf7\u91cd\u65b0\u4fdd\u5b58\u914d\u7f6e\u3002"); return s;
+        s.configurationError=QStringLiteral(u"数据库 \u914d\u7f6e\u6587\u4ef6\u683c\u5f0f\u65e0\u6548\uff0c\u8bf7\u91cd\u65b0\u4fdd\u5b58\u914d\u7f6e\u3002"); return s;
     }
     s.enabled=obj["enabled"].toBool();
     s.host=obj["host"].toString(); s.database=obj["database"].toString(); s.user=obj["user"].toString();
@@ -81,10 +81,10 @@ QString DatabaseSettingsStore::save(const DatabaseSettings& settings,const QStri
     obj["tls_mode"]=settings.tlsMode; obj["ca_file"]=settings.caFile;
     obj["password_dpapi"]=QString::fromLatin1(encrypted.toBase64());
     const auto path=requestedPath.isEmpty()?defaultPath():requestedPath;
-    if (!QDir().mkpath(QFileInfo(path).absolutePath())) return QStringLiteral(u"\u65e0\u6cd5\u521b\u5efa MySQL \u914d\u7f6e\u76ee\u5f55\u3002");
+    if (!QDir().mkpath(QFileInfo(path).absolutePath())) return QStringLiteral(u"\u65e0\u6cd5\u521b\u5efa 数据库 \u914d\u7f6e\u76ee\u5f55\u3002");
     QSaveFile file(path); const auto bytes=QJsonDocument(obj).toJson();
-    if (!file.open(QIODevice::WriteOnly)) return QStringLiteral(u"\u65e0\u6cd5\u5199\u5165 MySQL \u914d\u7f6e\u6587\u4ef6\u3002");
+    if (!file.open(QIODevice::WriteOnly)) return QStringLiteral(u"\u65e0\u6cd5\u5199\u5165 数据库 \u914d\u7f6e\u6587\u4ef6\u3002");
     file.setPermissions(QFileDevice::ReadOwner|QFileDevice::WriteOwner);
-    if (file.write(bytes)!=bytes.size() || !file.commit()) return QStringLiteral(u"\u4fdd\u5b58 MySQL \u914d\u7f6e\u5931\u8d25\uff0c\u539f\u914d\u7f6e\u4fdd\u6301\u4e0d\u53d8\u3002");
+    if (file.write(bytes)!=bytes.size() || !file.commit()) return QStringLiteral(u"\u4fdd\u5b58 数据库 \u914d\u7f6e\u5931\u8d25\uff0c\u539f\u914d\u7f6e\u4fdd\u6301\u4e0d\u53d8\u3002");
     return {};
 }

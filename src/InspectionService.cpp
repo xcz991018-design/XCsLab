@@ -1,3 +1,4 @@
+#include "DeviceConnection.hpp"
 #include "InspectionService.hpp"
 #include "IsolatedCapture.hpp"
 #include "FileCameraSource.hpp"
@@ -86,9 +87,9 @@ CapturedTask capture(const InspectionTask& task, const InspectionService::Source
     // Historical database tasks validate their frozen device after it is loaded.
     if (task.inputKind != InspectionInputKind::HistoricalImage &&
         (task.databaseOriginalTaskId.isEmpty() || !task.useHistoricalConfiguration) &&
-        requiresInspectionCalibration(task)) {
-        data.outcome.errorCode = "CALIBRATION_REQUIRED";
-        data.outcome.errorMessage = QStringLiteral(u"请先完成设备 %1 的表计标定").arg(task.device.cameraId);
+        !task.captureOnly && !recognitionMissingRequirements(task.device).isEmpty()) {
+        data.outcome.errorCode = "DEVICE_CONFIGURATION_REQUIRED";
+        data.outcome.errorMessage = recognitionMissingRequirements(task.device).join(QStringLiteral(u"；"));
         return data;
     }
     try {
@@ -215,6 +216,12 @@ CapturedTask capture(const InspectionTask& task, const InspectionService::Source
 InspectionOutcome recognize(CapturedTask data, const std::shared_ptr<std::atomic<bool>>& cancel) {
     auto& out = data.outcome;
     if (cancel->load() || !out.errorCode.isEmpty()) return out;
+    if (!data.task.captureOnly && !usesHistoricalDatabaseConfiguration(data.task) &&
+        !recognitionMissingRequirements(data.task.device).isEmpty()) {
+        out.errorCode = "DEVICE_CONFIGURATION_REQUIRED";
+        out.errorMessage = recognitionMissingRequirements(data.task.device).join(QStringLiteral(u"；"));
+        return out;
+    }
     if (requiresInspectionCalibration(data.task)) {
         out.errorCode = "CALIBRATION_REQUIRED";
         out.errorMessage = QStringLiteral(u"请先完成设备 %1 的表计标定").arg(data.task.device.cameraId);
@@ -228,8 +235,7 @@ InspectionOutcome recognize(CapturedTask data, const std::shared_ptr<std::atomic
             // but an algorithm run never falls back to local files or defaults.
             if (data.task.captureOnly && !DatabaseSettings::fromEnvironment().enabled) return out;
             try {
-                const auto id = data.task.device.defaultProfileId.isEmpty()
-                    ? QStringLiteral(u"PRESSURE_GAUGE_1.6MPA") : data.task.device.defaultProfileId;
+                const auto id = data.task.device.defaultProfileId;
                 const auto record = MySqlRepository().loadTemplate(id);
                 frozen = QJsonObject{{"profiles", QJsonArray{record.definition}},
                                      {"_database_template_id", record.id},
@@ -464,6 +470,9 @@ InspectionService::~InspectionService() {
 bool InspectionService::start(const QList<InspectionTask>& tasks) {
     if (m_running || tasks.isEmpty()) return false;
     m_tasks = tasks;
+    m_retryIndices.clear();
+    m_restartIndices.clear();
+    m_taskCancels.clear();
     const auto queuedAt = TimingClock::now();
     for (auto& task : m_tasks) {
         task.taskId = QUuid::createUuid().toString(QUuid::WithoutBraces);
@@ -478,6 +487,24 @@ bool InspectionService::start(const QList<InspectionTask>& tasks) {
 
 void InspectionService::stop() {
     if (m_cancel) m_cancel->store(true);
+    for (const auto& cancel : m_taskCancels) cancel->store(true);
+}
+
+void InspectionService::updateDeviceConnection(const DiscoveredCameraItem& device) {
+    // Called only on the scheduler/GUI thread. Workers keep immutable task copies.
+    if (!m_running || m_cancel->load()) return;
+    for (int index=0;index<m_tasks.size();++index) {
+        auto& task=m_tasks[index];
+        if (task.device.cameraId!=device.cameraId || task.inputKind!=InspectionInputKind::CameraSnapshot ||
+            sameDeviceConnection(task.device,device)) continue;
+        if (index<m_next && !m_taskCancels.contains(index) && !m_retryIndices.contains(index)) continue;
+        ::updateDeviceConnection(task.device,device);
+        task.previewSnapshot.release(); task.previewCapturedAt=QDateTime();
+        if (m_taskCancels.contains(index)) {
+            m_restartIndices.insert(index);
+            m_taskCancels[index]->store(true);
+        }
+    }
 }
 
 void InspectionService::retryDatabaseWrites(const QString& directory) {
@@ -491,7 +518,32 @@ void InspectionService::retryDatabaseWrites(const QString& directory) {
         m_databaseRetryRunning = false;
         const auto result=watcher->result();
         emit databaseSyncFinished(result.first);
-        if(!result.second.isEmpty()) emit evidenceMaintenanceFinished(result.second);
+        const auto maintenance = QJsonDocument::fromJson(result.second.toUtf8()).object();
+        const bool cleaned = maintenance["expired_database_tasks"].toInt() > 0 ||
+            maintenance["expired_local_tasks"].toInt() > 0 ||
+            maintenance["removed_unreferenced_blobs"].toInt() > 0 ||
+            maintenance["local_removed_images"].toDouble() > 0;
+        if (cleaned) {
+            const auto localCount = qint64(maintenance["local_removed_images"].toDouble());
+            const auto databaseCount = maintenance["removed_unreferenced_blobs"].toInt();
+            const auto formatBytes = [](double bytes) {
+                if (bytes >= 1024.0*1024*1024) return QString::number(bytes/(1024.0*1024*1024), 'f', 2) + " GB";
+                if (bytes >= 1024.0*1024) return QString::number(bytes/(1024.0*1024), 'f', 2) + " MB";
+                if (bytes >= 1024.0) return QString::number(bytes/1024.0, 'f', 2) + " KB";
+                return QString::number(bytes, 'f', 0) + " B";
+            };
+            const auto localBytes = maintenance["local_reclaimed_bytes"].toDouble();
+            const auto databaseBytes = maintenance["database_reclaimed_bytes"].toDouble();
+            auto summary = tr("图片清理完成：清理图片共 %1 份（本地 %2 张，数据库 %3 份），回收存储空间 %4（本地 %5，数据库 %6）。过期记录：数据库 %7 个任务，本地 %8 个任务。")
+                .arg(localCount + databaseCount).arg(localCount).arg(databaseCount)
+                .arg(formatBytes(localBytes + databaseBytes), formatBytes(localBytes), formatBytes(databaseBytes))
+                .arg(maintenance["expired_database_tasks"].toInt()).arg(maintenance["expired_local_tasks"].toInt());
+            if (maintenance["local_cleanup_failures"].toInt() > 0)
+                summary += tr("本地清理失败 %1 个任务，将后续重试。").arg(maintenance["local_cleanup_failures"].toInt());
+            emit evidenceMaintenanceFinished(summary);
+        } else if (result.second.startsWith("RETENTION_FAILED")) {
+            emit evidenceMaintenanceFinished(tr("图片清理失败：%1").arg(result.second.mid(QStringLiteral("RETENTION_FAILED: ").size())));
+        }
         if(maintain && !result.second.isEmpty() && !result.second.startsWith("RETENTION_FAILED")) m_lastEvidenceMaintenance=now;
         watcher->deleteLater();
     });
@@ -529,26 +581,28 @@ void InspectionService::exportImage(const cv::Mat& frame, const QString& path) {
 }
 
 void InspectionService::dispatch() {
-    while (!m_cancel->load() && m_active < m_limit && m_next < m_tasks.size()) {
-        const auto task = m_tasks[m_next++];
-        const auto cancel = m_cancel;
+    while (!m_cancel->load() && m_active < m_limit && (!m_retryIndices.isEmpty() || m_next < m_tasks.size())) {
+        const int index = m_retryIndices.isEmpty() ? m_next++ : m_retryIndices.takeFirst();
+        const auto task = m_tasks[index];
+        const auto cancel = std::make_shared<std::atomic<bool>>(false);
+        m_taskCancels.insert(index,cancel);
         ++m_active;
         emit taskStarted(task.taskId, task.device.cameraId);
         auto* captureWatcher = new QFutureWatcher<CapturedTask>(this);
-        connect(captureWatcher, &QFutureWatcher<CapturedTask>::finished, this, [this, captureWatcher, task, cancel]() {
+        connect(captureWatcher, &QFutureWatcher<CapturedTask>::finished, this, [this, captureWatcher, task, cancel, index]() {
             auto captured = captureWatcher->result();
             captureWatcher->deleteLater();
-            if (cancel->load()) { complete(captured.outcome); return; }
+            if (cancel->load()) { complete(captured.outcome, index); return; }
             auto* recognitionWatcher = new QFutureWatcher<InspectionOutcome>(this);
-            connect(recognitionWatcher, &QFutureWatcher<InspectionOutcome>::finished, this, [this, recognitionWatcher, task, cancel]() {
+            connect(recognitionWatcher, &QFutureWatcher<InspectionOutcome>::finished, this, [this, recognitionWatcher, task, cancel, index]() {
                 auto outcome = recognitionWatcher->result();
                 recognitionWatcher->deleteLater();
-                if (cancel->load()) { complete(outcome); return; }
+                if (cancel->load()) { complete(outcome, index); return; }
                 auto* storageWatcher = new QFutureWatcher<InspectionOutcome>(this);
-                connect(storageWatcher, &QFutureWatcher<InspectionOutcome>::finished, this, [this, storageWatcher]() {
+                connect(storageWatcher, &QFutureWatcher<InspectionOutcome>::finished, this, [this, storageWatcher, index]() {
                     auto outcome = storageWatcher->result();
                     storageWatcher->deleteLater();
-                    complete(std::move(outcome));
+                    complete(std::move(outcome), index);
                 });
                 const auto storageQueued = TimingClock::now();
                 storageWatcher->setFuture(QtConcurrent::run(&m_storagePool, [outcome, task, cancel, storageQueued]() mutable {
@@ -574,7 +628,7 @@ void InspectionService::dispatch() {
             return captured;
         }));
     }
-    if (m_active == 0 && (m_cancel->load() || m_next == m_tasks.size())) {
+    if (m_active == 0 && (m_cancel->load() || (m_next == m_tasks.size() && m_retryIndices.isEmpty()))) {
         const bool cancelled = m_cancel->load();
         m_running = false;
         m_tasks.clear();
@@ -582,8 +636,17 @@ void InspectionService::dispatch() {
     }
 }
 
-void InspectionService::complete(InspectionOutcome outcome) {
+void InspectionService::complete(InspectionOutcome outcome, int index) {
     --m_active;
+    m_taskCancels.remove(index);
+    if (m_restartIndices.remove(index) && !m_cancel->load()) {
+        // A new attempt gets a fresh evidence ID; any already committed history remains immutable.
+        m_tasks[index].taskId=QUuid::createUuid().toString(QUuid::WithoutBraces);
+        m_tasks[index].queuedAt=TimingClock::now();
+        m_retryIndices.append(index);
+        dispatch();
+        return;
+    }
     if (!m_cancel->load()) {
         ++m_completed;
         emit taskFinished(outcome);

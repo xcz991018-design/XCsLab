@@ -68,6 +68,7 @@ set(CLI_SOURCES
 
 # GUI Target Sources
 set(GUI_SOURCES
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/AccessControl.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/GaugeTemplateStore.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/GaugeTemplateDialog.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/include/GaugeTemplateDialog.hpp"
@@ -83,6 +84,8 @@ set(GUI_SOURCES
     "${CMAKE_CURRENT_SOURCE_DIR}/src/InspectionService.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/include/MainWindow.hpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/include/CardinalSelectorDialog.hpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/include/LiquidSurface.hpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/include/AutoDialCalibration.hpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/include/CameraInfoEditDialog.hpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/include/PointerDetector.hpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/include/GB28181StreamManager.hpp"

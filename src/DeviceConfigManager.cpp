@@ -1,3 +1,4 @@
+#include "AccessControl.hpp"
 #include "DeviceConfigManager.hpp"
 #include "DeviceCodec.hpp"
 #include "MySqlRepository.hpp"
@@ -375,6 +376,7 @@ void DeviceConfigManager::addOrUpdateDevice(const DiscoveredCameraItem& item, bo
             existing.substation = item.substation;
             existing.area = item.area;
             existing.installationLocation = item.installationLocation;
+            existing.installationPosition = item.installationPosition;
             existing.deviceTag = item.deviceTag;
             existing.gaugeType = item.gaugeType;
             existing.manufacturer = item.manufacturer;
@@ -395,6 +397,7 @@ void DeviceConfigManager::addOrUpdateDevice(const DiscoveredCameraItem& item, bo
 }
 
 bool DeviceConfigManager::removeDevice(const QString& cameraId, bool autoSave) {
+    if (!AccessControl::administrator()) return false;
     bool removed = false;
     {
         QMutexLocker locker(&m_mutex);

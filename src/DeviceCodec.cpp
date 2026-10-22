@@ -38,7 +38,7 @@ DiscoveredCameraItem deviceFromJson(const QJsonObject& obj) {
     item.rtspUrl = obj.value("rtsp_url").toString();
     item.username = obj.value("username").toString("");
     item.password = obj.value("password").toString("");
-    item.defaultProfileId = obj.value("default_profile_id").toString("PRESSURE_GAUGE_1.6MPA");
+    item.defaultProfileId = obj.value("default_profile_id").toString();
     item.isOnline = obj.value("is_online").toBool(true);
     item.lastSeenTime = obj.value("last_seen_time").toString();
     item.safeWorkingRange = SafeWorkingRange::fromJson(obj.value("safe_working_range").toObject());
@@ -47,6 +47,7 @@ DiscoveredCameraItem deviceFromJson(const QJsonObject& obj) {
     item.substation = obj.value("substation").toString("").trimmed();
     item.area = obj.value("area").toString("").trimmed();
     item.installationLocation = obj.value("installation_location").toString(obj.value("location").toString("")).trimmed();
+    item.installationPosition = obj.value("installation_position").toString().trimmed();
     item.deviceTag = obj.value("device_tag").toString("").trimmed();
     item.gaugeType = obj.value("gauge_type").toString("").trimmed();
     item.manufacturer = obj.value("manufacturer").toString("").trimmed();
@@ -96,6 +97,7 @@ QJsonObject deviceToJson(const DiscoveredCameraItem& item, bool includeSecrets) 
     obj["substation"] = item.substation;
     obj["area"] = item.area;
     obj["installation_location"] = item.installationLocation;
+    obj["installation_position"] = item.installationPosition;
     obj["device_tag"] = item.deviceTag;
     obj["gauge_type"] = item.gaugeType;
     obj["manufacturer"] = item.manufacturer;

@@ -10,6 +10,28 @@
 #define M_PI 3.14159265358979323846
 #endif
 
+namespace {
+struct SearchTiming { double region = 0, sections = 0, scoring = 0, tail = 0; };
+thread_local SearchTiming* activeSearchTiming = nullptr;
+struct SearchTimingScope {
+    SearchTiming* previous;
+    explicit SearchTimingScope(SearchTiming& timing) : previous(activeSearchTiming) { activeSearchTiming = &timing; }
+    ~SearchTimingScope() { activeSearchTiming = previous; }
+};
+// Each parallel candidate owns its counters; no shared updates in the hot loops.
+struct SearchPhaseTimer {
+    double* output;
+    std::chrono::steady_clock::time_point started = std::chrono::steady_clock::now();
+    explicit SearchPhaseTimer(double* value) : output(value) {}
+    void next(double* value) {
+        const auto now = std::chrono::steady_clock::now();
+        if (output) *output += std::chrono::duration<double, std::milli>(now-started).count();
+        output = value; started = now;
+    }
+    ~SearchPhaseTimer() { next(nullptr); }
+};
+}
+
 PointerDetector::PointerDetector()
     : m_config(PointerDetectorConfig()), m_model(PointerShapeModel()) {}
 
@@ -1198,6 +1220,7 @@ RadialDirectionProfile PointerDetector::evaluateRadialDirectionProfile(
     double thetaDeg) {
 
     RadialDirectionProfile prof;
+    SearchPhaseTimer phase(activeSearchTiming ? &activeSearchTiming->region : nullptr);
     double emitTheta = normalizeAngle(thetaDeg);
     prof.angle = emitTheta;
 
@@ -1210,6 +1233,7 @@ RadialDirectionProfile PointerDetector::evaluateRadialDirectionProfile(
     // If the left/right tracks are not long, straight, parallel, and starting near pointerBaseRadius,
     // IMMEDIATELY REJECT! Do NOT perform radial cross-section synthesis for invalid geometry!
     PointerCandidateRegion reg = evaluateCandidateRegion(gray, features, effectivePivot, emitTheta);
+    phase.next(activeSearchTiming ? &activeSearchTiming->sections : nullptr);
     prof.candidateRegion = reg;
     prof.leftLength = reg.leftEdge.length;
     prof.rightLength = reg.rightEdge.length;
@@ -1301,6 +1325,7 @@ RadialDirectionProfile PointerDetector::evaluateRadialDirectionProfile(
     }
 
     prof.sections = allSections;
+    phase.next(activeSearchTiming ? &activeSearchTiming->scoring : nullptr);
     int totalSections = static_cast<int>(allSections.size());
     if (totalSections == 0) return prof;
 
@@ -1552,6 +1577,14 @@ RadialDirectionProfile PointerDetector::evaluateRadialDirectionProfile(
         m_config.wTrackingJumpPenalty * prof.trackingJumpPenalty
     ) * offsetPenalty;
 
+    // Local edge quality alone can favor a short seam on a counterweight over
+    // the full needle (especially when the needle has a displaced shadow).
+    // Scale that quality by observed body coverage. This is a soft score: an
+    // occluded needle remains eligible, while a short clean fragment cannot
+    // receive the same evidence weight as a long coherent pair of edges.
+    const double referenceBodyLength = std::max(m_config.minCommonLengthPx, maxLenPossible * 0.5);
+    prof.bodyScore *= std::clamp(prof.validLength / std::max(1.0, referenceBodyLength), 0.0, 1.0);
+
     // Section XVI: First Layer Geometry Gate check - ABSOLUTE HARD REJECTION
     // If the candidate region failed geometric validation (not long, not parallel, not straight, or not starting at base),
     // IMMEDIATELY ZERO THE BODY SCORE! Never allow false curved tracks into candidate pool!
@@ -1607,6 +1640,7 @@ TailDirectionProfile PointerDetector::evaluateTailProfile(
     double thetaDeg) {
 
     TailDirectionProfile prof;
+    SearchPhaseTimer phase(activeSearchTiming ? &activeSearchTiming->tail : nullptr);
     double emitTheta = normalizeAngle(thetaDeg);
     prof.angle = emitTheta;
 
@@ -1642,6 +1676,24 @@ TailDirectionProfile PointerDetector::evaluateTailProfile(
 
     float minPeakScore = static_cast<float>(std::min(30.0, std::max(18.0, m_config.rawGradientThreshold * 0.55)));
 
+    // Reuse scratch storage across radial slices, local to this candidate/thread.
+    struct LocalPeak {
+        double t, mag, dirScore, score, intensity;
+        float stepContrast;
+    };
+    const int numT = static_cast<int>(std::round((maxHalfW * 2.0) / stepT));
+    std::vector<LocalPeak> leftPeaks, rightPeaks, sliceSamples;
+    std::vector<double> quantileScratch;
+    leftPeaks.reserve(numT + 1);
+    rightPeaks.reserve(numT + 1);
+    sliceSamples.reserve(numT + 1);
+    quantileScratch.reserve(numT + 1);
+    // Only the selected order statistic is used; sorting all samples is unnecessary.
+    auto selectQuantile = [](std::vector<double>& values, size_t index) {
+        std::nth_element(values.begin(), values.begin() + index, values.end());
+        return values[index];
+    };
+
     for (double r = rStart; r <= rEnd; r += stepR) {
         // Hub start proximity check: tail must start close to pointerBaseRadius
         if (validSections.empty() && (r - rStart) > maxStartGap) {
@@ -1650,21 +1702,9 @@ TailDirectionProfile PointerDetector::evaluateTailProfile(
 
         cv::Point2d rayCenter = effectivePivot + u * r;
 
-        struct LocalPeak {
-            double t;
-            double mag;
-            double dirScore;
-            double score;
-            double intensity;
-            float stepContrast;
-        };
-
-        std::vector<LocalPeak> leftPeaks;
-        std::vector<LocalPeak> rightPeaks;
-
-        int numT = static_cast<int>(std::round((maxHalfW * 2.0) / stepT));
-        std::vector<LocalPeak> sliceSamples;
-        sliceSamples.reserve(numT + 1);
+        leftPeaks.clear();
+        rightPeaks.clear();
+        sliceSamples.clear();
 
         for (int i = 0; i <= numT; ++i) {
             double t = -maxHalfW + i * stepT;
@@ -1675,10 +1715,28 @@ TailDirectionProfile PointerDetector::evaluateTailProfile(
                 continue;
             }
 
-            float mag = sampleBilinear(features.gradMag, static_cast<float>(pt.x), static_cast<float>(pt.y));
-            float ux = sampleBilinear(features.gradUnitX, static_cast<float>(pt.x), static_cast<float>(pt.y));
-            float uy = sampleBilinear(features.gradUnitY, static_cast<float>(pt.x), static_cast<float>(pt.y));
-            float intensity = sampleBilinear(gray, static_cast<float>(pt.x), static_cast<float>(pt.y));
+            // These four maps share coordinates; compute interpolation weights once.
+            // The margin check above guarantees all four neighbouring pixels exist.
+            const float px = static_cast<float>(pt.x), py = static_cast<float>(pt.y);
+            const int x0 = static_cast<int>(std::floor(px)), y0 = static_cast<int>(std::floor(py));
+            const float fx = px - x0, fy = py - y0;
+            const float w00 = (1.0f-fx)*(1.0f-fy), w10 = fx*(1.0f-fy);
+            const float w01 = (1.0f-fx)*fy, w11 = fx*fy;
+            auto sampleGradient = [&](const cv::Mat& map) {
+                const auto* row0 = map.ptr<float>(y0);
+                const auto* row1 = map.ptr<float>(y0+1);
+                return w00*row0[x0] + w10*row0[x0+1] + w01*row1[x0] + w11*row1[x0+1];
+            };
+            float mag = sampleGradient(features.gradMag);
+            float ux = sampleGradient(features.gradUnitX);
+            float uy = sampleGradient(features.gradUnitY);
+            // Preserve the generic sampler's support for non-8-bit grayscale inputs.
+            float intensity;
+            if (gray.type() == CV_8U) {
+                const auto* row0 = gray.ptr<uchar>(y0);
+                const auto* row1 = gray.ptr<uchar>(y0+1);
+                intensity = w00*row0[x0] + w10*row0[x0+1] + w01*row1[x0] + w11*row1[x0+1];
+            } else intensity = sampleBilinear(gray, px, py);
 
             float dirScore = std::abs(static_cast<float>(ux * v.x + uy * v.y));
             float instantScore = mag * dirScore;
@@ -1707,7 +1765,7 @@ TailDirectionProfile PointerDetector::evaluateTailProfile(
             bool alignCondition = (cur.dirScore >= tailMinNormalAlign || (cur.stepContrast >= 20.0f && cur.dirScore >= 0.35f));
             bool strengthCondition = (cur.score >= minPeakScore || cur.stepContrast >= 20.0f);
 
-            if (alignCondition && strengthCondition && peakCondition) {
+            if (!m_config.requireDarkPointer && alignCondition && strengthCondition && peakCondition) {
                 if (cur.t < -minW * 0.30 && cur.t >= -maxHalfW + 1.0) {
                     leftPeaks.push_back(cur);
                 } else if (cur.t > minW * 0.30 && cur.t <= maxHalfW - 1.0) {
@@ -1723,14 +1781,14 @@ TailDirectionProfile PointerDetector::evaluateTailProfile(
         double maxAllowedCenterT = std::max(m_config.maxCenterOffset * 1.2, maxHalfW * 0.45);
 
         auto backgroundGray = [&](bool left) {
-            std::vector<double> values;
+            auto& values = quantileScratch;
+            values.clear();
             for (const auto& sample : sliceSamples) {
                 if ((left && sample.t < -minW) || (!left && sample.t > minW))
                     values.push_back(sample.intensity);
             }
             if (values.empty()) return 255.0;
-            std::sort(values.begin(), values.end());
-            return values[static_cast<size_t>((values.size() - 1) * 0.75)];
+            return selectQuantile(values, static_cast<size_t>((values.size() - 1) * 0.75));
         };
         const double backgroundL = backgroundGray(true);
         const double backgroundR = backgroundGray(false);
@@ -1795,18 +1853,17 @@ TailDirectionProfile PointerDetector::evaluateTailProfile(
                 idxL = std::max(0, std::min(static_cast<int>(sliceSamples.size()) - 1, idxL));
                 idxR = std::max(0, std::min(static_cast<int>(sliceSamples.size()) - 1, idxR));
 
-                std::vector<double> insideInts;
-                insideInts.reserve(std::max(0, idxR - idxL));
+                auto& insideInts = quantileScratch;
+                insideInts.clear();
                 for (int k = idxL + 1; k < idxR; ++k) {
                     insideInts.push_back(sliceSamples[k].intensity);
                 }
 
                 double robustInside = 0.0;
                 if (!insideInts.empty()) {
-                    std::sort(insideInts.begin(), insideInts.end());
                     // 采用第 35% 分位数作为深色实体的代表灰度，抗内部微弱反光
                     size_t pIdx = std::min(insideInts.size() - 1, static_cast<size_t>(insideInts.size() * 0.35));
-                    robustInside = insideInts[pIdx];
+                    robustInside = selectQuantile(insideInts, pIdx);
                 } else {
                     robustInside = (l.intensity + rk.intensity) * 0.5;
                 }
@@ -1814,7 +1871,8 @@ TailDirectionProfile PointerDetector::evaluateTailProfile(
                 // Verify each edge independently against a sustained background
                 // band, rather than calling the edge pixel itself "outside".
                 auto bandGray = [&](double t, double sign, double first, double last) {
-                    std::vector<double> values;
+                    auto& values = quantileScratch;
+                    values.clear();
                     for (double d = first; d <= last; d += stepT) {
                         double sampleT = t + sign * d;
                         if (std::abs(sampleT) > maxHalfW) continue;
@@ -1823,8 +1881,7 @@ TailDirectionProfile PointerDetector::evaluateTailProfile(
                         values.push_back(sampleBilinear(gray, static_cast<float>(p.x), static_cast<float>(p.y)));
                     }
                     if (values.size() < 5) return -1.0;
-                    std::sort(values.begin(), values.end());
-                    return values[values.size() / 2];
+                    return selectQuantile(values, values.size() / 2);
                 };
                 double outsideL = bandGray(l.t, -1, 3.0, 9.0);
                 double outsideR = bandGray(rk.t, 1, 3.0, 9.0);
@@ -1944,9 +2001,7 @@ TailDirectionProfile PointerDetector::evaluateTailProfile(
         for (double w : widths) sumW += w;
         prof.meanWidth = sumW / widths.size();
 
-        std::vector<double> sortedW = widths;
-        std::sort(sortedW.begin(), sortedW.end());
-        prof.medianWidth = sortedW[sortedW.size() / 2];
+        prof.medianWidth = selectQuantile(widths, widths.size() / 2);
 
         double avgCenterOffset = sumCenterOffset / prof.validSectionCount;
         prof.symmetryScore = 1.0 / (1.0 + 0.002 * avgCenterOffset * avgCenterOffset);
@@ -1955,11 +2010,10 @@ TailDirectionProfile PointerDetector::evaluateTailProfile(
         prof.contrastScore = std::min(1.5, avgEdgeStr / 40.0);
 
         if (!tailInsides.empty()) {
-            std::vector<double> sortedTIns = tailInsides;
-            std::sort(sortedTIns.begin(), sortedTIns.end());
+
             // 取第 35% 分位数作为针尾深色主体代表值，排除局部包含白底的影响
-            size_t tIdx = std::min(sortedTIns.size() - 1, static_cast<size_t>(sortedTIns.size() * 0.35));
-            prof.meanInsideGray = sortedTIns[tIdx];
+            size_t tIdx = std::min(tailInsides.size() - 1, static_cast<size_t>(tailInsides.size() * 0.35));
+            prof.meanInsideGray = selectQuantile(tailInsides, tIdx);
         } else {
             prof.meanInsideGray = sumTailInside / prof.validSectionCount;
         }
@@ -2240,10 +2294,25 @@ PointerDetectionResult PointerDetector::detect(const cv::Mat& gray, const cv::Po
     int numSteps = static_cast<int>(std::round(180.0 / angleStep));
 
     std::vector<PointerAxisCandidate> allCandidates(numSteps);
+    std::vector<SearchTiming> coarseTimings(numSteps);
+    auto reportSearchTiming = [&](const char* name, const std::vector<SearchTiming>& timings) {
+        SearchTiming total;
+        for (const auto& t : timings) {
+            total.region += t.region; total.sections += t.sections;
+            total.scoring += t.scoring; total.tail += t.tail;
+        }
+        const auto prefix = QString::fromLatin1(name);
+        res.stageTimings[prefix+"_region_worker_ms"] = total.region;
+        res.stageTimings[prefix+"_sections_worker_ms"] = total.sections;
+        res.stageTimings[prefix+"_scoring_worker_ms"] = total.scoring;
+        res.stageTimings[prefix+"_tail_worker_ms"] = total.tail;
+        res.stageTimings[prefix+"_candidate_count"] = static_cast<int>(timings.size());
+    };
 
     // Parallel multi-threaded coarse search across angles
     cv::parallel_for_(cv::Range(0, numSteps), [&](const cv::Range& range) {
         for (int i = range.start; i < range.end; ++i) {
+            SearchTimingScope timingScope(coarseTimings[i]);
             double theta = i * angleStep;
             RadialDirectionProfile profA = evaluateRadialDirectionProfile(grayImg, features, effectivePivot, theta);
             RadialDirectionProfile profB = evaluateRadialDirectionProfile(grayImg, features, effectivePivot, theta + 180.0);
@@ -2332,6 +2401,7 @@ PointerDetectionResult PointerDetector::detect(const cv::Mat& gray, const cv::Po
     }
 
     mark("coarse_search_ms");
+    reportSearchTiming("coarse", coarseTimings);
     // Top-10 candidate retention and formatted debug table
     std::vector<PointerAxisCandidate> sortedCandidates = allCandidates;
     std::sort(sortedCandidates.begin(), sortedCandidates.end(), [](const PointerAxisCandidate& a, const PointerAxisCandidate& b) {
@@ -2378,10 +2448,12 @@ PointerDetectionResult PointerDetector::detect(const cv::Mat& gray, const cv::Po
 
     int numFineSteps = static_cast<int>(std::round((fineRange * 2.0) / fineStep));
     std::vector<PointerAxisCandidate> fineCandidates(numFineSteps + 1);
+    std::vector<SearchTiming> fineTimings(numFineSteps + 1);
 
     // Parallel multi-threaded fine search around best candidate
     cv::parallel_for_(cv::Range(0, numFineSteps + 1), [&](const cv::Range& range) {
         for (int i = range.start; i < range.end; ++i) {
+            SearchTimingScope timingScope(fineTimings[i]);
             double theta = (bestCoarseTheta - fineRange) + i * fineStep;
             if (theta < 0.0) theta += 180.0;
             if (theta >= 180.0) theta -= 180.0;
@@ -2467,6 +2539,7 @@ PointerDetectionResult PointerDetector::detect(const cv::Mat& gray, const cv::Po
     res.axisAngle = bestFineTheta;
 
     mark("fine_search_ms");
+    reportSearchTiming("fine", fineTimings);
     // Phase 2 Bidirectional Direction Analysis (+axis vs -axis)
     RadialDirectionProfile profA = evaluateRadialDirectionProfile(grayImg, features, effectivePivot, bestFineTheta);
     RadialDirectionProfile profB = evaluateRadialDirectionProfile(grayImg, features, effectivePivot, bestFineTheta + 180.0);

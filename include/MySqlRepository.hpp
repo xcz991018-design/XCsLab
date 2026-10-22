@@ -1,5 +1,6 @@
 #pragma once
 #include "InspectionService.hpp"
+#include "AccessControl.hpp"
 #include <QJsonObject>
 #include <QByteArray>
 #include "GaugeTemplateRecord.hpp"
@@ -28,6 +29,10 @@ struct StoredInspection {
     QJsonObject latestReview;
     QJsonObject resultSnapshot;
 };
+struct HistoryDeletion {
+    int tasks{0}, images{0};
+    qint64 imageBytes{0};
+};
 struct StoredImage {
     QByteArray bytes;
     QString sha256;
@@ -38,6 +43,13 @@ struct StoredImage {
 class MySqlRepository {
 public:
     explicit MySqlRepository(DatabaseSettings settings = DatabaseSettings::fromEnvironment());
+    void changeApplicationPassword(const QString& oldPassword, const QString& newPassword) const;
+    bool hasApplicationAccounts() const;
+    bool hasAdministratorAccount() const;
+    QString authenticateAccount(const QString& username, const QString& password) const;
+    void createApplicationAccount(const QString& username, const QString& password, const QString& role, bool bootstrap = false) const;
+    QList<ApplicationAccount> applicationAccounts() const;
+    void deleteApplicationAccount(const QString& username) const;
     void checkConnection() const;
     QString testConnection() const;
     QJsonObject loadRegistry() const;
@@ -53,6 +65,8 @@ public:
     QList<StoredInspection> history(const QString& cameraId, const QDateTime& from,
                                   const QDateTime& until, int page, int pageSize = 50) const;
     StoredImage original(const QString& taskId) const;
+    HistoryDeletion deleteHistory(const QStringList& taskIds) const;
+    QStringList historyTaskIds(const QString& cameraId, const QDateTime& from, const QDateTime& until) const;
     void addReview(const QString& taskId, const QString& reviewer, const QString& decision,
                    const QString& correctedValue, const QString& comment) const;
     static QJsonObject inspectionEnvelope(const InspectionTask&, const InspectionOutcome&);

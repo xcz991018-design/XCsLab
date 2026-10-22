@@ -5,11 +5,14 @@
 #include "MySqlBootstrapSchema.hpp"
 #include "MySqlTemplateSchema.hpp"
 #include "GaugeTemplateStore.hpp"
+#include "PointerAlgorithmSettings.hpp"
 #include "GaugeProfile.hpp"
 #include "DeviceCalibration.hpp"
 #include "EvidenceArchive.hpp"
 #include <mysql.h>
 #include <QCryptographicHash>
+#include <QMessageAuthenticationCode>
+#include <QRandomGenerator>
 #include <QJsonDocument>
 #include <QJsonArray>
 #include <QFile>
@@ -124,7 +127,8 @@ public:
         catch (...) { mysql_close(handle); handle = nullptr; mysql_thread_end(); throw; }
     }
     ~Connection() { if (handle) { mysql_close(handle); mysql_thread_end(); } }
-    Rows exec(const QByteArray& sql, const Row& values = {}, int binaryIndex = -1) {
+    Rows exec(const QByteArray& sql, const Row& values = {}, int binaryIndex = -1, qint64* affectedRows = nullptr) {
+        if (sql.trimmed().toUpper().startsWith("DELETE ")) AccessControl::requireAdministrator();
         std::unique_ptr<MYSQL_STMT, decltype(&mysql_stmt_close)> stmt(mysql_stmt_init(handle), mysql_stmt_close);
         if (!stmt) fail("MYSQL_STATEMENT_INIT_FAILED");
         auto check = [&](int code) {
@@ -146,6 +150,7 @@ public:
         bool updateLengths = true;
         check(mysql_stmt_attr_set(stmt.get(), STMT_ATTR_UPDATE_MAX_LENGTH, &updateLengths));
         check(mysql_stmt_execute(stmt.get()));
+        if (affectedRows) *affectedRows = static_cast<qint64>(mysql_stmt_affected_rows(stmt.get()));
         if (!mysql_stmt_field_count(stmt.get())) return {};
         check(mysql_stmt_store_result(stmt.get()));
         std::unique_ptr<MYSQL_RES, decltype(&mysql_free_result)> meta(mysql_stmt_result_metadata(stmt.get()), mysql_free_result);
@@ -317,7 +322,7 @@ void MySqlRepository::saveRegistry(const QJsonObject& registry) const {
     QStringList templates;
     for (const auto& value : registry["devices"].toArray()) {
         auto id = value.toObject()["default_profile_id"].toString();
-        if (id.isEmpty()) id = "PRESSURE_GAUGE_1.6MPA";
+        if (id.isEmpty()) continue;
         if (!templates.contains(id)) templates.append(id);
     }
     templates.sort();
@@ -330,8 +335,8 @@ void MySqlRepository::saveRegistry(const QJsonObject& registry) const {
         auto device = value.toObject(); ids.insert(device["camera_id"].toString()); saveCamera(c, device, true);
     }
     for (const auto& row : c.exec("SELECT camera_id FROM camera_archives WHERE deleted_at IS NULL"))
-        if (!ids.contains(str(row[0]))) c.exec("UPDATE camera_archives SET enabled=0,deleted_at=?,updated_at=? WHERE camera_id=?",
-            {time(QDateTime::currentDateTimeUtc()), time(QDateTime::currentDateTimeUtc()), row[0]});
+        if (!ids.contains(str(row[0]))) { AccessControl::requireAdministrator(); c.exec("UPDATE camera_archives SET enabled=0,deleted_at=?,updated_at=? WHERE camera_id=?",
+            {time(QDateTime::currentDateTimeUtc()), time(QDateTime::currentDateTimeUtc()), row[0]}); }
     c.exec("INSERT INTO runtime_settings(setting_key,setting_json) VALUES('system',?)"
         " ON DUPLICATE KEY UPDATE setting_json=VALUES(setting_json)", {json(sanitizedRegistry(registry)["system"].toObject())});
     tx.commit();
@@ -357,7 +362,7 @@ void validateTemplate(const QJsonObject& definition) {
 const QByteArray templateReferences = "SELECT camera_id FROM camera_archives WHERE deleted_at IS NULL AND "
     "CASE WHEN JSON_TYPE(JSON_EXTRACT(archive_json,'$.default_profile_id'))='STRING' AND "
     "JSON_UNQUOTE(JSON_EXTRACT(archive_json,'$.default_profile_id'))<>'' "
-    "THEN JSON_UNQUOTE(JSON_EXTRACT(archive_json,'$.default_profile_id')) ELSE 'PRESSURE_GAUGE_1.6MPA' END=?";
+    "THEN JSON_UNQUOTE(JSON_EXTRACT(archive_json,'$.default_profile_id')) ELSE '' END=?";
 }
 
 QList<GaugeTemplateRecord> MySqlRepository::loadTemplates() const {
@@ -372,10 +377,13 @@ QList<GaugeTemplateRecord> MySqlRepository::loadTemplates() const {
     QMap<QString, QStringList> usage;
     for (const auto& row : c.exec("SELECT camera_id,archive_json FROM camera_archives WHERE deleted_at IS NULL")) {
         auto id = QJsonDocument::fromJson(row[1].value_or(QByteArray())).object()["default_profile_id"].toString();
-        if (id.isEmpty()) id = "PRESSURE_GAUGE_1.6MPA";
+        if (id.isEmpty()) continue;
         usage[id].append(str(row[0]));
     }
-    for (auto& record : records) record.usedBy = usage.value(record.id);
+    for (auto& record : records) {
+        record.usedBy = usage.value(record.id);
+        record.definition = PointerAlgorithmSettings::resolve(record.definition);
+    }
     return records;
 }
 
@@ -384,14 +392,19 @@ GaugeTemplateRecord MySqlRepository::loadTemplate(const QString& id) const {
     const auto rows = c.exec("SELECT template_id,definition,revision FROM gauge_templates WHERE template_id=? AND deleted_at IS NULL", {id.toUtf8()});
     if (rows.empty()) fail(QStringLiteral(u"\u6570\u636e\u5e93\u6a21\u677f\u4e0d\u5b58\u5728\u6216\u5df2\u5220\u9664\uff1a%1").arg(id));
     auto record = templateRecord(rows.front());
+    record.definition = PointerAlgorithmSettings::resolve(record.definition);
     validateTemplate(record.definition);
     return record;
 }
 
 GaugeTemplateRecord MySqlRepository::saveTemplate(const QJsonObject& input, quint64 expectedRevision) const {
     auto definition=input; definition.remove("min_angle_deg"); definition.remove("max_angle_deg");
+    definition = PointerAlgorithmSettings::resolve(definition);
     validateTemplate(definition);
+    const auto runtimeDefinition = definition;
+    definition = PointerAlgorithmSettings::withoutAlgorithmFields(definition);
     const auto id = definition["gauge_id"].toString();
+    definition["_algorithm_parameters_template_id"] = id;
     Connection c(m_settings); Transaction tx(c);
     const auto rows = c.exec("SELECT revision,deleted_at FROM gauge_templates WHERE template_id=? FOR UPDATE", {id.toUtf8()});
     if (!expectedRevision && !rows.empty()) fail(QStringLiteral(u"\u6a21\u677f\u7f16\u53f7\u5df2\u5b58\u5728\uff08\u542b\u5df2\u5220\u9664\u6a21\u677f\uff09\uff0c\u8bf7\u4f7f\u7528\u4e0d\u540c\u7f16\u53f7"));
@@ -404,10 +417,11 @@ GaugeTemplateRecord MySqlRepository::saveTemplate(const QJsonObject& input, quin
     else c.exec("UPDATE gauge_templates SET definition=?,revision=?,updated_at=? WHERE template_id=?",
                 {json(definition), number(revision), now, id.toUtf8()});
     tx.commit();
-    return {id, definition, revision, {}};
+    return {id, runtimeDefinition, revision, {}};
 }
 
 void MySqlRepository::deleteTemplate(const QString& id, quint64 expectedRevision) const {
+    AccessControl::requireAdministrator();
     Connection c(m_settings); Transaction tx(c);
     const auto rows = c.exec("SELECT revision,deleted_at FROM gauge_templates WHERE template_id=? FOR UPDATE", {id.toUtf8()});
     if (!expectedRevision || rows.empty() || rows.front()[1] || str(rows.front()[0]).toULongLong() != expectedRevision)
@@ -556,6 +570,61 @@ QList<StoredInspection> MySqlRepository::history(const QString& camera, const QD
     for (const auto& row : c.exec(sql,params)) result.append(toInspection(row));
     return result;
 }
+QStringList MySqlRepository::historyTaskIds(const QString& camera, const QDateTime& from, const QDateTime& until) const {
+    if (!from.isValid() || !until.isValid() || from >= until) fail(QStringLiteral(u"请选择有效的时间范围。"));
+    Connection c(m_settings); Row values{time(from),time(until)};
+    auto sql=QByteArray("SELECT task_id FROM inspection_history WHERE processed_at>=? AND processed_at<?");
+    if (!camera.trimmed().isEmpty()) { sql+=" AND camera_id=?"; values.push_back(camera.trimmed().toUtf8()); }
+    sql+=" ORDER BY task_id";
+    QStringList ids;
+    for (const auto& row : c.exec(sql,values)) ids.append(str(row[0]));
+    return ids;
+}
+
+HistoryDeletion MySqlRepository::deleteHistory(const QStringList& taskIds) const {
+    AccessControl::requireAdministrator();
+    auto ids=taskIds; ids.removeDuplicates(); ids.sort();
+    if (ids.isEmpty()) fail(QStringLiteral(u"请选择需要删除的历史记录。"));
+    for (const auto& id : ids)
+        if (QUuid(id).isNull()) fail(QStringLiteral(u"历史任务编号无效，未执行删除。"));
+    Connection c(m_settings); Transaction tx(c);
+    // Freeze exactly the IDs approved by the user, across every result page.
+    // Temporary tables belong to this connection and disappear when it closes.
+    c.exec("CREATE TEMPORARY TABLE history_delete_tasks(task_id CHAR(36) CHARACTER SET ascii COLLATE ascii_bin PRIMARY KEY) ENGINE=InnoDB");
+    for (int offset=0; offset<ids.size(); offset+=500) {
+        QByteArray sql="INSERT INTO history_delete_tasks(task_id) VALUES "; Row values;
+        for (int i=offset; i<(std::min)(offset+500,ids.size()); ++i) {
+            if (!values.empty()) sql+=",";
+            sql+="(?)"; values.push_back(ids[i].toUtf8());
+        }
+        c.exec(sql,values);
+    }
+    const auto locked=c.exec("SELECT h.task_id FROM inspection_history h JOIN history_delete_tasks t ON t.task_id=h.task_id ORDER BY h.task_id FOR UPDATE");
+    if (locked.size()!=size_t(ids.size())) fail(QStringLiteral(u"部分记录已被删除，请重新查询后重试。"));
+    QSet<QString> selected;
+    for (const auto& id : ids) selected.insert(id);
+    const auto children=c.exec("SELECT h.task_id FROM inspection_history h JOIN history_delete_tasks t ON h.parent_task_id=t.task_id FOR UPDATE");
+    for (const auto& child : children)
+        if (!selected.contains(str(child[0])))
+            fail(QStringLiteral(u"筛选或选择的记录仍被范围外的历史重分析记录引用。请一并选择相关重分析记录，或先删除这些子记录。"));
+    c.exec("CREATE TEMPORARY TABLE history_delete_images(image_id BIGINT UNSIGNED PRIMARY KEY) ENGINE=InnoDB");
+    c.exec("INSERT IGNORE INTO history_delete_images(image_id) SELECT e.image_id FROM inspection_evidence e JOIN history_delete_tasks t ON t.task_id=e.task_id WHERE e.image_id IS NOT NULL");
+    c.exec("SELECT b.image_id FROM image_blobs b JOIN history_delete_images i ON i.image_id=b.image_id ORDER BY b.image_id FOR UPDATE");
+    c.exec("UPDATE inspection_history h JOIN history_delete_tasks t ON t.task_id=h.task_id SET h.parent_task_id=NULL");
+    c.exec("DELETE r FROM reading_reviews r JOIN history_delete_tasks t ON t.task_id=r.task_id");
+    c.exec("DELETE e FROM inspection_evidence e JOIN history_delete_tasks t ON t.task_id=e.task_id");
+    HistoryDeletion result; qint64 deleted=0;
+    c.exec("DELETE h FROM inspection_history h JOIN history_delete_tasks t ON t.task_id=h.task_id",{},-1,&deleted);
+    result.tasks=int(deleted);
+    const auto unused=c.exec("SELECT b.byte_size FROM image_blobs b JOIN history_delete_images i ON i.image_id=b.image_id WHERE NOT EXISTS(SELECT 1 FROM inspection_evidence e WHERE e.image_id=b.image_id)");
+    for (const auto& blob : unused) result.imageBytes+=str(blob[0]).toLongLong();
+    c.exec("DELETE b FROM image_blobs b JOIN history_delete_images i ON i.image_id=b.image_id WHERE NOT EXISTS(SELECT 1 FROM inspection_evidence e WHERE e.image_id=b.image_id)",{},-1,&deleted);
+    result.images=int(deleted);
+    if (result.tasks!=ids.size() || result.images!=int(unused.size())) fail(QStringLiteral(u"删除范围发生变化，操作已回滚，请重新查询。"));
+    tx.commit();
+    return result;
+}
+
 StoredImage MySqlRepository::original(const QString& taskId) const {
     Connection c(m_settings); Transaction tx(c);
     auto record = c.exec(historySelect + " WHERE h.task_id=?",{taskId.toUtf8()});
@@ -666,6 +735,7 @@ QString MySqlRepository::retryPending(const QString& directory,int limit) {
 
 
 QString MySqlRepository::maintainEvidence(const QString& directory) const {
+    if (!AccessControl::administrator()) return QString();
     if (directory.isEmpty()) return {};
     const auto now=QDateTime::currentDateTimeUtc();
     const auto policy=EvidenceArchive::Policy::fromEnvironment();
@@ -690,6 +760,8 @@ QString MySqlRepository::maintainEvidence(const QString& directory) const {
         "NOT EXISTS(SELECT 1 FROM reading_reviews r WHERE r.task_id=h.task_id AND r.decision IN('corrected','unreadable'))))";
     const Row cutoffs{abnormalCut,abnormalCut,normalCut};
     int expiredTasks=0,removedBlobs=0,expiredLocal=0,localFailures=0;
+    qint64 removedDatabaseBytes=0;
+    EvidenceArchive::CleanupStats localCleanup;
     {
         Transaction tx(c);
         const auto tasks=c.exec("SELECT h.task_id FROM inspection_history h WHERE "+eligible+
@@ -701,10 +773,14 @@ QString MySqlRepository::maintainEvidence(const QString& directory) const {
             ++expiredTasks;
         }
         // Shared BLOBs are removed only when no task references them, including reanalysis.
-        const auto blobs=c.exec("SELECT b.image_id FROM image_blobs b WHERE NOT EXISTS(SELECT 1 FROM inspection_evidence e WHERE e.image_id=b.image_id) LIMIT 1500 FOR UPDATE");
+        const auto blobs=c.exec("SELECT b.image_id,b.byte_size FROM image_blobs b WHERE NOT EXISTS(SELECT 1 FROM inspection_evidence e WHERE e.image_id=b.image_id) LIMIT 1500 FOR UPDATE");
         for(const auto& row:blobs) {
-            c.exec("DELETE FROM image_blobs WHERE image_id=? AND NOT EXISTS(SELECT 1 FROM inspection_evidence e WHERE e.image_id=image_blobs.image_id)",{row[0]});
-            ++removedBlobs;
+            qint64 deleted = 0;
+            c.exec("DELETE FROM image_blobs WHERE image_id=? AND NOT EXISTS(SELECT 1 FROM inspection_evidence e WHERE e.image_id=image_blobs.image_id)",{row[0]},-1,&deleted);
+            if (deleted>0) {
+                ++removedBlobs;
+                removedDatabaseBytes+=str(row[1]).toLongLong();
+            }
         }
         tx.commit();
     }
@@ -720,7 +796,7 @@ QString MySqlRepository::maintainEvidence(const QString& directory) const {
         " ORDER BY h.processed_at LIMIT 500",localArgs);
     for(const auto& row:localTasks) {
         const auto id=str(row[0]); if(protectedTasks.contains(id)) continue;
-        if(EvidenceArchive::expireLocalImages(directory,id,now)) {
+        if(EvidenceArchive::expireLocalImages(directory,id,now,&localCleanup)) {
             ++expiredLocal;
             c.exec("UPDATE inspection_history SET result_snapshot=JSON_SET(COALESCE(result_snapshot,JSON_OBJECT()),'$.local_images_expired_at',?) WHERE task_id=?",{time(now),id.toUtf8()});
         } else ++localFailures;
@@ -736,7 +812,95 @@ QString MySqlRepository::maintainEvidence(const QString& directory) const {
     const QStorageInfo disk(QFileInfo(directory).absoluteFilePath());
     return QString::fromUtf8(QJsonDocument(QJsonObject{{"normal_days",policy.normalDays},{"abnormal_days",policy.abnormalDays},
         {"expired_database_tasks",expiredTasks},{"removed_unreferenced_blobs",removedBlobs},{"expired_local_tasks",expiredLocal},
+        {"local_removed_images",double(localCleanup.imageCount)},{"local_reclaimed_bytes",double(localCleanup.imageBytes)},
+        {"database_reclaimed_bytes",double(removedDatabaseBytes)},
         {"local_cleanup_failures",localFailures},{"database_image_bytes",str(stored[0][0]).toDouble()},
         {"local_image_bytes",double(localBytes)},{"disk_available_bytes",double(disk.bytesAvailable())},
         {"low_disk_space",disk.isValid() && disk.bytesAvailable()<2LL*1024*1024*1024}}).toJson(QJsonDocument::Compact));
+}
+
+namespace {
+void accountSchema(Connection& c) {
+    c.exec("CREATE TABLE IF NOT EXISTS application_roles (role_code VARCHAR(32) PRIMARY KEY, display_name VARCHAR(64) NOT NULL) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4");
+    c.exec("INSERT IGNORE INTO application_roles VALUES('administrator','管理员'),('operator','操作员')");
+    c.exec("CREATE TABLE IF NOT EXISTS application_accounts (username VARCHAR(64) PRIMARY KEY, role_code VARCHAR(32) NOT NULL, salt VARCHAR(64) NOT NULL, password_hash VARCHAR(64) NOT NULL, FOREIGN KEY(role_code) REFERENCES application_roles(role_code)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4");
+}
+QByteArray passwordKey(const QString& password, const QByteArray& salt) {
+    const auto key=password.toUtf8();
+    auto u=QMessageAuthenticationCode::hash(salt+QByteArray::fromHex("00000001"),key,QCryptographicHash::Sha256);
+    auto result=u;
+    for (int i=1;i<120000;++i) {
+        u=QMessageAuthenticationCode::hash(u,key,QCryptographicHash::Sha256);
+        for (int j=0;j<result.size();++j) result[j]=char(result.at(j)^u.at(j));
+    }
+    return result.toHex();
+}
+}
+bool MySqlRepository::hasApplicationAccounts() const {
+    Connection c(m_settings); accountSchema(c);
+    return !c.exec("SELECT username FROM application_accounts LIMIT 1").empty();
+}
+bool MySqlRepository::hasAdministratorAccount() const {
+    Connection c(m_settings); accountSchema(c);
+    return !c.exec("SELECT username FROM application_accounts WHERE role_code='administrator' LIMIT 1").empty();
+}
+QString MySqlRepository::authenticateAccount(const QString& username,const QString& password) const {
+    Connection c(m_settings); accountSchema(c);
+    auto rows=c.exec("SELECT role_code,salt,password_hash FROM application_accounts WHERE username=?",{username.trimmed().toUtf8()});
+    if(rows.empty()) fail(QStringLiteral(u"账号或密码错误"));
+    const auto actual=passwordKey(password,QByteArray::fromHex(*rows[0][1]));
+    const auto expected=*rows[0][2];
+    unsigned diff=actual.size()^expected.size();
+    for(int i=0;i<qMin(actual.size(),expected.size());++i) diff|=unsigned(static_cast<unsigned char>(actual[i]^expected[i]));
+    if(diff) fail(QStringLiteral(u"账号或密码错误"));
+    return str(rows[0][0]);
+}
+void MySqlRepository::createApplicationAccount(const QString& username,const QString& password,const QString& role,bool bootstrap) const {
+    if(!bootstrap) AccessControl::requireAdministrator();
+    if(username.trimmed().isEmpty() || username.trimmed().size()>64 || password.size()<8 ||
+        (role!="administrator" && role!="operator")) fail(QStringLiteral(u"账号须为1至64个字符，密码至少8位，请选择有效角色"));
+    Connection c(m_settings); accountSchema(c); Transaction tx(c);
+    c.exec("SELECT role_code FROM application_roles WHERE role_code='administrator' FOR UPDATE");
+    if(bootstrap && (role!="administrator" || !c.exec("SELECT username FROM application_accounts LIMIT 1").empty()))
+        fail(QStringLiteral(u"初始化已完成，请使用管理员登录"));
+    QByteArray salt;
+    for(int i=0;i<8;++i) salt+=QByteArray::number(QRandomGenerator::system()->generate(),16).rightJustified(8,'0');
+    salt=QByteArray::fromHex(salt);
+    c.exec("INSERT INTO application_accounts(username,role_code,salt,password_hash) VALUES(?,?,?,?)",
+        {username.trimmed().toUtf8(),role.toUtf8(),salt.toHex(),passwordKey(password,salt)});
+    tx.commit();
+}
+QList<ApplicationAccount> MySqlRepository::applicationAccounts() const {
+    AccessControl::requireAdministrator(); Connection c(m_settings); accountSchema(c);
+    QList<ApplicationAccount> result;
+    for(const auto& row:c.exec("SELECT username,role_code FROM application_accounts ORDER BY username")) result.append({str(row[0]),str(row[1])});
+    return result;
+}
+void MySqlRepository::deleteApplicationAccount(const QString& username) const {
+    AccessControl::requireAdministrator(); Connection c(m_settings); Transaction tx(c);
+    c.exec("SELECT role_code FROM application_roles WHERE role_code='administrator' FOR UPDATE");
+    if (username==AccessControl::username()) fail(QStringLiteral(u"不能删除当前登录账号，请使用其他管理员账号操作"));
+    auto admins=c.exec("SELECT username FROM application_accounts WHERE role_code='administrator' FOR UPDATE");
+    if(admins.size()==1 && str(admins[0][0])==username) fail(QStringLiteral(u"不能删除最后一个管理员"));
+    c.exec("DELETE FROM application_accounts WHERE username=?",{username.toUtf8()}); tx.commit();
+}
+
+void MySqlRepository::changeApplicationPassword(const QString& oldPassword, const QString& newPassword) const {
+    const auto username=AccessControl::username();
+    if ((AccessControl::role()!=AccessControl::Administrator && AccessControl::role()!=AccessControl::Operator) || username.isEmpty())
+        fail(QStringLiteral(u"请先登录后修改密码"));
+    if(newPassword.size()<8) fail(QStringLiteral(u"新密码至少8位"));
+    Connection c(m_settings); Transaction tx(c);
+    const auto rows=c.exec("SELECT salt,password_hash FROM application_accounts WHERE username=? FOR UPDATE",{username.toUtf8()});
+    if(rows.empty()) fail(QStringLiteral(u"当前账号已不存在，请重新登录"));
+    const auto actual=passwordKey(oldPassword,QByteArray::fromHex(*rows[0][0]));
+    const auto expected=*rows[0][1];
+    unsigned diff=actual.size()^expected.size();
+    for(int i=0;i<qMin(actual.size(),expected.size());++i) diff|=unsigned(static_cast<unsigned char>(actual[i]^expected[i]));
+    if(diff) fail(QStringLiteral(u"原密码错误"));
+    QByteArray salt;
+    for(int i=0;i<8;++i) salt+=QByteArray::number(QRandomGenerator::system()->generate(),16).rightJustified(8,'0');
+    salt=QByteArray::fromHex(salt);
+    c.exec("UPDATE application_accounts SET salt=?,password_hash=? WHERE username=?",{salt.toHex(),passwordKey(newPassword,salt),username.toUtf8()});
+    tx.commit();
 }

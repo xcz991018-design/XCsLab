@@ -114,3 +114,15 @@ HEADERS += $$PWD/include/ScaleCalibration.hpp
 HEADERS += $$PWD/include/RecognitionQuality.hpp
 
 HEADERS += $$PWD/include/DeviceCredentialStore.hpp
+
+
+HEADERS += $$PWD/include/LiquidSurface.hpp
+
+HEADERS += $$PWD/include/AutoDialCalibration.hpp
+
+SOURCES += $$PWD/src/AccessControl.cpp
+HEADERS += $$PWD/include/AccessControl.hpp
+
+HEADERS += $$PWD/include/UiTheme.hpp
+
+HEADERS += $$PWD/include/DeviceConnection.hpp

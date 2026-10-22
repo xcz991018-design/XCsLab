@@ -1,6 +1,7 @@
 #pragma once
 #include <QNetworkAccessManager>
 #include <QNetworkReply>
+#include <QNetworkProxy>
 #include <QAuthenticator>
 #include <QEventLoop>
 #include <QTimer>
@@ -33,6 +34,7 @@ inline QByteArray requestRaw(const QUrl& endpoint, const QString& action, const 
     }
     const QByteArray xml = QString("<s:Envelope xmlns:s=\"http://www.w3.org/2003/05/soap-envelope\" xmlns:tds=\"http://www.onvif.org/ver10/device/wsdl\" xmlns:trt=\"http://www.onvif.org/ver10/media/wsdl\" xmlns:tt=\"http://www.onvif.org/ver10/schema\"><s:Header>%1</s:Header><s:Body>%2</s:Body></s:Envelope>").arg(security, body).toUtf8();
     QNetworkAccessManager manager;
+    manager.setProxy(QNetworkProxy::NoProxy);
     int authAttempts = 0;
     QObject::connect(&manager, &QNetworkAccessManager::authenticationRequired,
                      [&authAttempts, &user, &password](QNetworkReply*, QAuthenticator* auth) {
@@ -161,15 +163,41 @@ inline QByteArray request(const QUrl& endpoint,const QString& action,const QStri
     }
     return response;
 }
-// An empty result means verified success. NTP configuration is never replaced by Manual.
-inline QString synchronizeClock(const QUrl& endpoint,const QString& user,const QString& password) {
+struct ClockSyncResult {
+    bool correctionAttempted{false};
+    bool beforeKnown{false}, afterKnown{false};
+    qint64 beforeOffsetMs{0}, afterOffsetMs{0}; // Camera UTC minus computer UTC.
+    QString error;
+
+    QString logMessage(const QString& cameraId) const {
+        if (!correctionAttempted && error.isEmpty()) return {}; // Normal checks stay silent.
+        if (!correctionAttempted)
+            return QStringLiteral(u"设备 %1 时间检查失败：%2").arg(cameraId,error);
+        const auto offset=[](bool known,qint64 value) {
+            return known ? (value>=0 ? QStringLiteral("+") : QString())+QString::number(value)+QStringLiteral(" ms")
+                         : QStringLiteral(u"未获取");
+        };
+        const auto status=error.isEmpty() ? QStringLiteral(u"已执行校时并通过验证")
+                                          : QStringLiteral(u"已尝试校时但未通过验证");
+        auto message=QStringLiteral(u"设备 %1 %2，校正前偏差：%3，校正后偏差：%4（设备时间－电脑时间）")
+            .arg(cameraId,status,offset(beforeKnown,beforeOffsetMs),offset(afterKnown,afterOffsetMs));
+        if (!error.isEmpty()) message+=QStringLiteral(u"；原因：%1").arg(error);
+        return message;
+    }
+};
+// Automatic correction may select Manual when an NTP clock is inaccurate.
+inline ClockSyncResult synchronizeClockDetailed(const QUrl& endpoint,const QString& user,const QString& password, bool allowManual = true) {
+    ClockSyncResult result;
     QString error;
     auto clock=readClock(endpoint,user,password,error);
-    if (!clock.utc.isValid()) return error;
-    const auto delta=QDateTime::currentDateTimeUtc().msecsTo(clock.utc);
-    if (std::llabs(delta)<=5000) return {};
-    if (clock.type=="NTP") return "Camera NTP clock differs from this computer; check camera NTP server and network";
-    if (clock.type!="Manual") return "Camera returned an unsupported clock mode";
+    if (!clock.utc.isValid()) { result.error=error; return result; }
+    result.beforeKnown=true;
+    result.beforeOffsetMs=QDateTime::currentDateTimeUtc().msecsTo(clock.utc);
+    if (std::llabs(result.beforeOffsetMs)<=5000) return result;
+    if (clock.type=="NTP" && !allowManual) {
+        result.error="Camera NTP clock differs from this computer; check camera NTP server and network"; return result;
+    }
+    if (clock.type!="Manual" && clock.type!="NTP") { result.error="Camera returned an unsupported clock mode"; return result; }
     const auto now=QDateTime::currentDateTimeUtc();
     const auto date=now.date(); const auto time=now.time();
     const auto zone=clock.zone.isEmpty()?QString():QString("<tds:TimeZone><tt:TZ>%1</tt:TZ></tds:TimeZone>").arg(escape(clock.zone));
@@ -177,15 +205,24 @@ inline QString synchronizeClock(const QUrl& endpoint,const QString& user,const Q
         .arg(clock.daylight?"true":"false").arg(zone).arg(time.hour()).arg(time.minute()).arg(time.second()).arg(date.year()).arg(date.month()).arg(date.day());
     qint64 offset=0;
     { QMutexLocker lock(&clockMutex()); offset=offsets().value(clockKey(endpoint,user)).offset; }
+    result.correctionAttempted=true;
     const auto response=requestRaw(endpoint,"http://www.onvif.org/ver10/device/wsdl/SetSystemDateAndTime",body,user,password,error,offset);
     const auto writeError=error;
     // Even a failed/timeout response may have changed the clock; refresh authentication offset.
     clock=readClock(endpoint,user,password,error);
-    if (!clock.utc.isValid()) return error;
-    if (std::llabs(QDateTime::currentDateTimeUtc().msecsTo(clock.utc))>5000)
-        return writeError.isEmpty()?QString("Camera time verification failed after synchronization"):writeError;
-    if (response.isEmpty()) return "Time is now correct, but camera did not acknowledge synchronization";
-    return {};
+    if (!clock.utc.isValid()) { result.error=error; return result; }
+    result.afterKnown=true;
+    result.afterOffsetMs=QDateTime::currentDateTimeUtc().msecsTo(clock.utc);
+    if (std::llabs(result.afterOffsetMs)>5000)
+        result.error=writeError.isEmpty()?QString("Camera time verification failed after synchronization"):writeError;
+    else if (allowManual && clock.type!="Manual") result.error="Camera did not switch to Manual clock mode";
+    else if (response.isEmpty()) result.error="Time is now correct, but camera did not acknowledge synchronization";
+    return result;
 }
+// Compatibility for callers that only need an error status.
+inline QString synchronizeClock(const QUrl& endpoint,const QString& user,const QString& password,bool allowManual = true) {
+    return synchronizeClockDetailed(endpoint,user,password,allowManual).error;
+}
+
 
 }

@@ -9,6 +9,7 @@
 #include "CameraIdentity.hpp"
 #include <QUrl>
 #include "CameraDiscoveryTargets.hpp"
+#include "CameraHealthProbe.hpp"
 #include <QFile>
 #include <QJsonDocument>
 
@@ -21,35 +22,38 @@ AutoCameraDiscoveryService::AutoCameraDiscoveryService(QObject *parent)
     m_healthTimer = new QTimer(this);
     m_healthTimer->setInterval(1000);
     connect(m_healthTimer, &QTimer::timeout, this, &AutoCameraDiscoveryService::pollHealth);
-    m_scanTimer = new QTimer(this);
-    connect(m_scanTimer, &QTimer::timeout, this, &AutoCameraDiscoveryService::onScanTimerTimeout);
 }
 
 AutoCameraDiscoveryService::~AutoCameraDiscoveryService() {
-    stopAutoScan();
+    stopHealthMonitoring();
     m_scanFuture.waitForFinished();
 }
 
-void AutoCameraDiscoveryService::startAutoScan(int intervalMs) {
+void AutoCameraDiscoveryService::startHealthMonitoring() {
+    if (m_healthTimer->isActive()) { pollHealth(); return; }
     m_stopping.store(false);
-    m_scanTimer->start(std::max(intervalMs, 300000));
     m_healthTimer->start();
-    emit logGenerated(tr("[AUTO-DISCOVERY] 启用低频新设备发现（%1 分钟）及分批健康检查（并发上限 16，每秒最多 32 台）。")
-        .arg(m_scanTimer->interval()/60000));
-    startDiscovery(false);
+    emit logGenerated(tr("[CAMERA-HEALTH] 后台连接检测已启动：在线设备每 %1 秒检查，离线设备每 %2 秒重试；必须收到有效 HTTP/RTSP 响应，检测独立于实时预览和视频缓冲帧。")
+        .arg(CameraHealthSchedule::onlineIntervalMs / 1000).arg(CameraHealthSchedule::offlineIntervalMs / 1000));
+    emit logGenerated(tr("[DISCOVERY] 新设备发现仅在点击刷新设备时执行；已登记设备继续维护连接状态。"));
     pollHealth();
 }
 
-void AutoCameraDiscoveryService::stopAutoScan() {
-    m_stopping.store(true);
-    m_scanTimer->stop(); m_healthTimer->stop();
-    const auto sockets = m_healthSockets;
-    m_healthSockets.clear();
-    for (auto socket : sockets) if (socket) { socket->disconnect(this); socket->abort(); socket->deleteLater(); }
-    for (auto& state : m_health.states) { ++state.revision; state.inFlight = false; }
+bool AutoCameraDiscoveryService::knownOnlineState(const QString& cameraId, bool& online) const {
+    const auto state=m_health.states.constFind(cameraId);
+    if (state==m_health.states.cend() || !state->known) return false;
+    online=state->online;
+    return true;
 }
 
-void AutoCameraDiscoveryService::onScanTimerTimeout() { startDiscovery(false); }
+void AutoCameraDiscoveryService::stopHealthMonitoring() {
+    m_stopping.store(true);
+    m_healthTimer->stop();
+    const auto sockets = m_healthSockets;
+    m_healthSockets.clear();
+    for (auto socket : sockets) if (socket) { socket->disconnect(); socket->abort(); socket->deleteLater(); }
+    for (auto& state : m_health.states) { ++state.revision; state.inFlight = false; }
+}
 
 void AutoCameraDiscoveryService::triggerScanNow() {
     if (m_stopping.load()) return;
@@ -58,18 +62,18 @@ void AutoCameraDiscoveryService::triggerScanNow() {
         if (state.captureBusyUntil <= now && (state.lastLiveAt < 0 || now - state.lastLiveAt >= 30000)) state.due = 0;
     }
     pollHealth();
-    startDiscovery(true);
+    startDiscovery();
 }
 
-void AutoCameraDiscoveryService::startDiscovery(bool manual) {
+void AutoCameraDiscoveryService::startDiscovery() {
     {
         QMutexLocker locker(&m_mutex);
         if (m_stopping.load() || m_isScanning) return;
         m_isScanning = true;
     }
-    if (manual) emit logGenerated(tr("[AUTO-DISCOVERY] 手动刷新：发现新设备并分批检查已登记设备。"));
-    m_scanFuture = QtConcurrent::run(&m_discoveryPool, [this, manual]() {
-        try { executeDiscoveryProcess(manual); }
+    emit logGenerated(tr("[AUTO-DISCOVERY] 手动刷新：发现新设备并分批检查已登记设备。"));
+    m_scanFuture = QtConcurrent::run(&m_discoveryPool, [this]() {
+        try { executeDiscoveryProcess(); }
         catch (const std::exception& error) {
             emit logGenerated(tr("[AUTO-DISCOVERY] 发现任务失败: %1").arg(QString::fromUtf8(error.what())));
             emit discoveryCompleted(0);
@@ -78,22 +82,21 @@ void AutoCameraDiscoveryService::startDiscovery(bool manual) {
     });
 }
 
-void AutoCameraDiscoveryService::publishHealth(const QString& cameraId, bool online, bool changed) {
+void AutoCameraDiscoveryService::publishHealth(const QString& cameraId, bool online, bool changed, const QString& details) {
     if (!changed || m_stopping.load()) return;
     emit cameraOnlineStateChanged(cameraId, online);
-    emit logGenerated(tr("[CAMERA-HEALTH] 设备 %1 状态变为%2。").arg(cameraId, online ? tr("在线") : tr("离线")));
+    const auto endpoint=m_health.states.value(cameraId).endpoint;
+    emit logGenerated(tr("[CAMERA-HEALTH] 设备 %1 状态变为%2，检测结果：%3。")
+        .arg(cameraId, online ? tr("在线") : tr("离线"), details.isEmpty()?endpoint:details));
 }
 
 void AutoCameraDiscoveryService::recordCaptureState(const QString& cameraId, bool online) {
     if (m_stopping.load() || !DeviceConfigManager::instance().hasDevice(cameraId)) return;
     const auto camera = DeviceConfigManager::instance().getDevice(cameraId);
     if (camera.protocolType == CameraProtocolType::LOCAL_FILE) return;
-    const QUrl uri(camera.rtspUrl);
-    const auto host = uri.host().isEmpty() ? camera.ipOrSn : uri.host();
-    const auto port = uri.port(camera.rtspPort > 0 ? camera.rtspPort : 554);
-    m_health.configure(cameraId, host+":"+QString::number(port));
+    m_health.configure(cameraId, cameraHealthEndpointKey(camera));
     const bool changed = m_health.update(cameraId, online, m_clock.elapsed(), true);
-    if (auto socket = m_healthSockets.take(cameraId)) { socket->disconnect(this); socket->abort(); socket->deleteLater(); }
+    if (auto socket = m_healthSockets.take(cameraId)) { socket->disconnect(); socket->abort(); socket->deleteLater(); }
     publishHealth(cameraId, online, changed);
     if (!changed && camera.isOnline != online) emit cameraOnlineStateChanged(cameraId, online);
 }
@@ -102,19 +105,33 @@ void AutoCameraDiscoveryService::deferHealthForCapture(const QString& cameraId) 
     if (m_stopping.load() || !DeviceConfigManager::instance().hasDevice(cameraId)) return;
     const auto camera = DeviceConfigManager::instance().getDevice(cameraId);
     if (camera.protocolType == CameraProtocolType::LOCAL_FILE) return;
-    const QUrl uri(camera.rtspUrl);
-    const auto host = uri.host().isEmpty() ? camera.ipOrSn : uri.host();
-    auto& state = m_health.configure(cameraId, host+":"+QString::number(uri.port(camera.rtspPort > 0 ? camera.rtspPort : 554)));
-    ++state.revision; state.inFlight = false; state.due = m_clock.elapsed() + 30000;
-    state.captureBusyUntil = state.due;
-    if (auto socket = m_healthSockets.take(cameraId)) { socket->disconnect(this); socket->abort(); socket->deleteLater(); }
+    m_health.configure(cameraId, cameraHealthEndpointKey(camera));
+    if (!m_health.deferForCapture(cameraId, m_clock.elapsed())) return;
+    if (auto socket = m_healthSockets.take(cameraId)) { socket->disconnect(); socket->abort(); socket->deleteLater(); }
 }
 
 void AutoCameraDiscoveryService::recordInspectionState(const QString& cameraId, const QString& errorCode, bool captured) {
-    if (captured) { recordCaptureState(cameraId, true); return; }
+    // Buffered frames must never cancel an independent probe or overwrite offline state.
+    if (captured || m_stopping.load()) return;
     static const QSet<QString> captureFailures = {"OPEN_FAILED", "NOT_OPEN", "READ_FAILED", "NO_FRAME", "STALE_FRAME",
         "CAPTURE_TIMEOUT", "CAPTURE_WORKER_FAILED", "CAPTURE_EXCEPTION"};
-    if (captureFailures.contains(errorCode)) recordCaptureState(cameraId, false);
+    if (!captureFailures.contains(errorCode) || !DeviceConfigManager::instance().hasDevice(cameraId)) return;
+    const auto camera=DeviceConfigManager::instance().getDevice(cameraId);
+    if (camera.protocolType!=CameraProtocolType::ONVIF_RTSP_STREAM || cameraHealthEndpoints(camera).isEmpty()) return;
+    const auto key=cameraHealthEndpointKey(camera);
+    if (m_health.states.value(cameraId).endpoint!=key) m_captureFailureChecks.remove(cameraId);
+    auto& state=m_health.configure(cameraId,key);
+    // Already-offline devices retain the configured retry interval. Reuse an in-flight probe.
+    if ((state.known && !state.online) || state.inFlight || m_healthSockets.contains(cameraId)) return;
+    const auto now=m_clock.elapsed();
+    if (now-m_captureFailureChecks.value(cameraId,-5000)<5000) return;
+    m_captureFailureChecks[cameraId]=now;
+    state.captureBusyUntil=0;
+    state.due=0; // Bypass the normal interval and acquisition grace period.
+    m_urgentHealthChecks.insert(cameraId);
+    emit logGenerated(tr("[CAMERA-HEALTH] 设备 %1 采集失败（%2），立即复核连接：%3。")
+        .arg(cameraId,errorCode,key));
+    pollHealth();
 }
 
 void AutoCameraDiscoveryService::pollHealth() {
@@ -127,10 +144,21 @@ void AutoCameraDiscoveryService::pollHealth() {
     QSet<QString> ids;
     for (const auto& camera : cameras) if (camera.protocolType != CameraProtocolType::LOCAL_FILE) ids.insert(camera.cameraId);
     m_health.prune(ids);
+    for (auto it=m_healthDiagnostics.begin();it!=m_healthDiagnostics.end();) {
+        if (!ids.contains(it.key())) {
+            m_healthDiagnosticTimes.remove(it.key()); m_captureFailureChecks.remove(it.key());
+            m_urgentHealthChecks.remove(it.key()); it=m_healthDiagnostics.erase(it);
+        }
+        else ++it;
+    }
     const auto oldSockets = m_healthSockets;
     for (auto it = oldSockets.begin(); it != oldSockets.end(); ++it) if (!ids.contains(it.key())) {
         m_healthSockets.remove(it.key());
-        if (it.value()) { it.value()->disconnect(this); it.value()->abort(); it.value()->deleteLater(); }
+        if (it.value()) { it.value()->disconnect(); it.value()->abort(); it.value()->deleteLater(); }
+    }
+    // Prioritize a capture-triggered check while preserving concurrency/rate limits.
+    for (int index=0;index<cameras.size();++index) {
+        if (m_urgentHealthChecks.contains(cameras[index].cameraId)) { m_healthCursor=index; break; }
     }
     int started = 0;
     for (int visited = 0; visited < cameras.size() && started < 32 && m_healthStarted < 32 && m_healthSockets.size() < 16; ++visited) {
@@ -138,35 +166,41 @@ void AutoCameraDiscoveryService::pollHealth() {
         const auto camera = cameras[m_healthCursor++ % cameras.size()];
         if (m_healthCursor >= cameras.size()) m_healthCursor = 0;
         if (camera.protocolType != CameraProtocolType::ONVIF_RTSP_STREAM) continue;
-        const QUrl uri(camera.rtspUrl);
-        const auto host = uri.host().isEmpty() ? camera.ipOrSn : uri.host();
-        const int port = uri.port(camera.rtspPort > 0 ? camera.rtspPort : 554);
-        auto& state = m_health.configure(camera.cameraId, host+":"+QString::number(port));
+        const auto endpoints = cameraHealthEndpoints(camera);
+        if (endpoints.isEmpty()) continue;
+        auto& state = m_health.configure(camera.cameraId, cameraHealthEndpointKey(camera));
         if (state.inFlight || state.due > m_clock.elapsed() || m_healthSockets.contains(camera.cameraId)) continue;
+        m_urgentHealthChecks.remove(camera.cameraId);
         const auto revision = m_health.begin(camera.cameraId);
-        auto* socket = new QTcpSocket(this);
+        const auto probeSocket = std::make_shared<QPointer<QTcpSocket>>();
+        const auto details = std::make_shared<QStringList>();
+        auto* socket = startCameraHealthProbe(endpoints, this,
+            [this, id = camera.cameraId, wasOnline = camera.isOnline, revision, probeSocket, details](bool online) {
+                if (!*probeSocket || m_healthSockets.value(id) != *probeSocket) return;
+                auto* completedSocket = m_healthSockets.take(id).data();
+                if (!completedSocket) return;
+                completedSocket->disconnect(); completedSocket->abort(); completedSocket->deleteLater();
+                bool changed = false;
+                if (m_health.complete(id, revision, online, m_clock.elapsed(), changed)) {
+                    const auto diagnosis=details->join(QStringLiteral(u"；"));
+                    const auto now=m_clock.elapsed();
+                    const bool diagnosisChanged=m_healthDiagnostics.value(id)!=diagnosis;
+                    const bool repeatDue=now-m_healthDiagnosticTimes.value(id,-30000)>=30000;
+                    publishHealth(id, online, changed, diagnosis);
+                    if (!changed && !diagnosis.isEmpty() && (diagnosisChanged || (!online && repeatDue)))
+                        emit logGenerated(tr("[CAMERA-HEALTH] 设备 %1 检测%2：%3。")
+                            .arg(id,online?tr("在线"):tr("离线"),diagnosis));
+                    if (changed || diagnosisChanged || (!online && repeatDue)) m_healthDiagnosticTimes[id]=now;
+                    m_healthDiagnostics[id]=diagnosis;
+                    if (!changed && wasOnline != online && !m_stopping.load()) emit cameraOnlineStateChanged(id, online);
+                }
+            }, 2000, [details](const CameraHealthAttempt& attempt) { details->append(attempt.description()); });
+        *probeSocket = socket;
         m_healthSockets.insert(camera.cameraId, socket); ++started; ++m_healthStarted;
-        auto* timeout = new QTimer(socket); timeout->setSingleShot(true);
-        const auto done = [this, id = camera.cameraId, wasOnline = camera.isOnline, revision, socket, timeout](bool online) {
-            if (m_healthSockets.value(id) != socket) return;
-            m_healthSockets.remove(id); timeout->stop();
-            socket->disconnect(this); socket->abort(); socket->deleteLater();
-            bool changed = false;
-            if (m_health.complete(id, revision, online, m_clock.elapsed(), changed)) {
-                publishHealth(id, online, changed);
-                if (!changed && wasOnline != online && !m_stopping.load()) emit cameraOnlineStateChanged(id, online);
-            }
-        };
-        connect(socket, &QTcpSocket::connected, this, [done]() { done(true); });
-        connect(socket, QOverload<QAbstractSocket::SocketError>::of(&QTcpSocket::error), this,
-            [done](QAbstractSocket::SocketError) { done(false); });
-        connect(timeout, &QTimer::timeout, this, [done]() { done(false); });
-        timeout->start(1000);
-        socket->connectToHost(host, static_cast<quint16>(port));
     }
 }
 
-void AutoCameraDiscoveryService::executeDiscoveryProcess(bool manual) {
+void AutoCameraDiscoveryService::executeDiscoveryProcess() {
     const auto knownCameras = DeviceConfigManager::instance().getAllDevices();
     QSet<QString> registeredHosts;
     for (const auto& camera : knownCameras) {
@@ -199,7 +233,7 @@ void AutoCameraDiscoveryService::executeDiscoveryProcess(bool manual) {
         item.username = "";
         item.password = "";
         item.isOnline = true;
-        item.defaultProfileId = "PRESSURE_GAUGE_1.6MPA";
+        item.defaultProfileId.clear();
         item.lastSeenTime = QDateTime::currentDateTime().toString("yyyy-MM-dd HH:mm:ss");
 
         if (m_stopping.load()) return;
@@ -311,7 +345,6 @@ void AutoCameraDiscoveryService::executeDiscoveryProcess(bool manual) {
     if (m_stopping.load()) return;
 
     emit discoveryCompleted(newFound);
-    if (!manual) return;
     if (newFound == 0) {
         emit logGenerated(tr("[AUTO-DISCOVERY] Scan completed. No real cameras responded on the local network (Total: 0)."));
     } else {

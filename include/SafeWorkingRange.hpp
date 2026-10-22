@@ -6,18 +6,15 @@
 
 struct SafeWorkingRange {
     bool enabled{true};
-    double normalMin{0}, normalMax{0}, allowanceMinus{0}, allowancePlus{0};
-    double lower() const { return normalMin - allowanceMinus; }
-    double upper() const { return normalMax + allowancePlus; }
+    double normalMin{0}, normalMax{0};
+    double lower() const { return normalMin; }
+    double upper() const { return normalMax; }
     bool valid() const {
         return std::isfinite(normalMin) && std::isfinite(normalMax) &&
-            std::isfinite(allowanceMinus) && std::isfinite(allowancePlus) &&
-            normalMin <= normalMax && allowanceMinus >= 0 && allowancePlus >= 0 &&
-            std::isfinite(lower()) && std::isfinite(upper());
+            normalMin <= normalMax;
     }
     QJsonObject toJson() const {
-        return {{"defaults_version",2},{"enabled",enabled},{"normal_min",normalMin},{"normal_max",normalMax},
-            {"allowance_minus",allowanceMinus},{"allowance_plus",allowancePlus}};
+        return {{"defaults_version",2},{"enabled",enabled},{"normal_min",normalMin},{"normal_max",normalMax}};
     }
     static SafeWorkingRange fromJson(const QJsonObject& object) {
         SafeWorkingRange r;
@@ -26,8 +23,6 @@ struct SafeWorkingRange {
         const double missing = r.enabled ? std::numeric_limits<double>::quiet_NaN() : 0.0;
         r.normalMin = object["normal_min"].toDouble(missing);
         r.normalMax = object["normal_max"].toDouble(missing);
-        r.allowanceMinus = object["allowance_minus"].toDouble(missing);
-        r.allowancePlus = object["allowance_plus"].toDouble(missing);
         return r;
     }
     QJsonObject assess(double value, bool recognized) const {

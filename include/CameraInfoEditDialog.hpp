@@ -22,7 +22,7 @@ class CameraInfoEditDialog : public QDialog {
 
 public:
     CameraInfoEditDialog(const QString& cameraId, QWidget *parent = nullptr, bool isNewDevice = false,
-                         GaugeTemplateBackend backend = {});
+                         GaugeTemplateBackend backend = {}, bool archiveOnly = false);
     ~CameraInfoEditDialog() override = default;
 
     QString getUpdatedCameraId() const;
@@ -44,6 +44,7 @@ private:
     QLabel* m_templateStatus{nullptr};
     QString m_originalCameraId;
     bool m_isNewDevice{false};
+    bool m_archiveOnly{false};
 
     // Device Network & Registry Parameters
     QLineEdit *m_hardwareIdEdit{nullptr};
@@ -59,18 +60,13 @@ private:
 
     // Gauge Profile & Location Parameters
     QComboBox *m_gaugeProfileCombo{nullptr};
-    QLineEdit *m_substationEdit{nullptr};
-    QLineEdit *m_areaEdit{nullptr};
+    QLineEdit *m_installationPositionEdit{nullptr};
     QLineEdit *m_locationEdit{nullptr};
     QLineEdit *m_deviceTagEdit{nullptr};
-    QLineEdit *m_gaugeTypeEdit{nullptr};
     QLineEdit *m_manufacturerEdit{nullptr};
-    QLineEdit *m_modelNameEdit{nullptr};
-    QLineEdit *m_accuracyClassEdit{nullptr};
 
     QCheckBox *m_safeRangeEnabled{nullptr};
     QDoubleSpinBox *m_normalMin{nullptr}, *m_normalMax{nullptr};
-    QDoubleSpinBox *m_allowanceMinus{nullptr}, *m_allowancePlus{nullptr};
     QLabel *m_safeRangePreview{nullptr};
     QPushButton *m_saveBtn{nullptr};
     QPushButton *m_cancelBtn{nullptr};

@@ -26,7 +26,7 @@ struct InspectionTask {
     DiscoveredCameraItem device;
     QString localImagePath;
     QString outputDirectory;
-    GaugeRunMode runMode{GaugeRunMode::Production};
+    GaugeRunMode runMode{GaugeRunMode::Evidence};
     InspectionInputKind inputKind{InspectionInputKind::CameraSnapshot};
     QString parentTaskId;
     QDateTime originalCapturedAt;
@@ -83,6 +83,7 @@ public:
     ~InspectionService() override;
     bool start(const QList<InspectionTask>& tasks);
     void stop();
+    void updateDeviceConnection(const DiscoveredCameraItem& device);
     void exportImage(const cv::Mat& frame, const QString& path);
     bool isRunning() const { return m_running; }
     static CameraSourcePtr createCameraSource(const InspectionTask& task);
@@ -97,13 +98,16 @@ signals:
     void evidenceMaintenanceFinished(const QString& report);
 private:
     void dispatch();
-    void complete(InspectionOutcome outcome);
+    void complete(InspectionOutcome outcome, int index);
     QThreadPool m_capturePool;
     QThreadPool m_recognitionPool;
     QThreadPool m_storagePool;
     SourceFactory m_factory;
     bool m_isolateCapture{false};
     QList<InspectionTask> m_tasks;
+    QList<int> m_retryIndices;
+    QSet<int> m_restartIndices;
+    QHash<int, std::shared_ptr<std::atomic<bool>>> m_taskCancels;
     std::shared_ptr<std::atomic<bool>> m_cancel;
     int m_limit;
     int m_next{0};

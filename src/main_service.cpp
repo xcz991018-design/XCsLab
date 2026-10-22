@@ -10,6 +10,11 @@
 #include <QTextStream>
 #include <QFileInfo>
 #include <QJsonArray>
+#include "DeviceCodec.hpp"
+#include "OnvifSoap.hpp"
+#include "PointerAlgorithmSettings.hpp"
+#include <QFile>
+#include <QJsonDocument>
 
 int main(int argc, char** argv) {
     const int workerExit = runCaptureWorker(argc, argv);
@@ -19,6 +24,10 @@ int main(int argc, char** argv) {
     parser.setApplicationDescription("Headless gauge inspection runtime");
     parser.addHelpOption();
     parser.addOptions({
+        QCommandLineOption("export-algorithm-parameters", "Initialize independent pointer algorithm JSON from current database templates"),
+        QCommandLineOption("sync-camera-clock", "Correct a registered camera to computer UTC when offset exceeds 5 seconds, then verify", "camera-id"),
+        QCommandLineOption("diagnose-snapshot", "Offline replay using an exported snapshot.json and --image", "path"),
+        QCommandLineOption("diagnose-task", "Read-only replay of a historical DB task; exports original, frozen config and diagnostics", "task-id"),
         QCommandLineOption("devices", "Explicit credential/registry JSON override (default: user data directory)", "path"),
         QCommandLineOption("credential-path", "Print the shared user credential path without opening a camera"),
         QCommandLineOption("migrate-config", "Migrate legacy JSON directory to user data and verify backups; no DB writes", "directory"),
@@ -30,10 +39,104 @@ int main(int argc, char** argv) {
         QCommandLineOption("image", "Explicit image for LOCAL_FILE devices", "path"),
         QCommandLineOption("concurrency", "Maximum in-flight tasks", "count", "4"),
         QCommandLineOption("capture-timeout", "Whole network acquisition deadline in milliseconds", "ms", "8000"),
-        QCommandLineOption("mode", "Run mode: production, evidence, debug", "mode", "production"),
+        QCommandLineOption("mode", "Diagnostic replay rendering: production, evidence, debug (inspection uses unified image retention)", "mode", "evidence"),
         QCommandLineOption("interval", "Repeat interval in seconds (0: one pass)", "seconds", "0")
     });
     parser.process(app);
+    if (parser.isSet("export-algorithm-parameters")) {
+        try {
+            const auto templates=MySqlRepository().loadTemplates();
+            QTextStream(stdout) << "Templates: " << templates.size() << "; algorithm JSON: " << PointerAlgorithmSettings::path() << "\n";
+            return 0;
+        } catch(const std::exception& e) { QTextStream(stderr) << e.what() << "\n"; return 2; }
+    }
+    if (parser.isSet("sync-camera-clock")) {
+        try {
+            const auto archive = MySqlRepository().loadDevice(parser.value("sync-camera-clock"));
+            QJsonObject local; QString error;
+            if (!DeviceCredentialStore::readRegistry(DeviceCredentialStore::defaultPath(),local,error))
+                throw std::runtime_error(error.toStdString());
+            const auto device = deviceFromJson(DeviceCredentialStore::withCredentials(deviceToJson(archive),local["devices"].toArray()));
+            if (device.protocolType != CameraProtocolType::ONVIF_RTSP_STREAM)
+                throw std::runtime_error("Camera is not ONVIF");
+            QUrl endpoint; endpoint.setScheme("http"); endpoint.setHost(device.ipOrSn);
+            endpoint.setPort(device.port); endpoint.setPath("/onvif/device_service");
+            const auto before = OnvifSoap::readClock(endpoint,device.username,device.password,error);
+            if (!before.utc.isValid()) throw std::runtime_error(error.toStdString());
+            const auto beforeDelta = QDateTime::currentDateTimeUtc().msecsTo(before.utc);
+            error = OnvifSoap::synchronizeClock(endpoint,device.username,device.password,true);
+            if (!error.isEmpty()) throw std::runtime_error(error.toStdString());
+            const auto after = OnvifSoap::readClock(endpoint,device.username,device.password,error);
+            if (!after.utc.isValid()) throw std::runtime_error(error.toStdString());
+            const auto afterDelta = QDateTime::currentDateTimeUtc().msecsTo(after.utc);
+            QTextStream(stdout) << "Camera: " << device.cameraId << "; previous mode: " << before.type
+                << "; previous offset(ms): " << beforeDelta << "; mode: " << after.type
+                << "; verified offset(ms): " << afterDelta << "; UTC: " << after.utc.toString(Qt::ISODate) << "\n";
+            return std::llabs(afterDelta) <= 5000 ? 0 : 2;
+        } catch (const std::exception& e) { QTextStream(stderr) << e.what() << "\n"; return 2; }
+    }
+    if (parser.isSet("diagnose-task") || parser.isSet("diagnose-snapshot")) {
+        try {
+            StoredImage stored;
+            if (parser.isSet("diagnose-snapshot")) {
+                QFile config(parser.value("diagnose-snapshot")), image(parser.value("image"));
+                if (!config.open(QIODevice::ReadOnly) || !image.open(QIODevice::ReadOnly))
+                    throw std::runtime_error("Cannot read offline snapshot/image");
+                QJsonParseError error;
+                const auto root = QJsonDocument::fromJson(config.readAll(),&error).object();
+                if (error.error != QJsonParseError::NoError || !root.contains("device") || !root.contains("profile"))
+                    throw std::runtime_error("Invalid offline snapshot");
+                stored.inspection.device = deviceFromJson(root["device"].toObject());
+                stored.inspection.profile = root["profile"].toObject();
+                stored.inspection.resultSnapshot = root["stored_result"].toObject();
+                stored.bytes = image.readAll();
+            } else stored = MySqlRepository().original(parser.value("diagnose-task"));
+            const auto& d = stored.inspection.device;
+            GaugeProfile profile;
+            if (!profile.loadFromJson(stored.inspection.profile, d.defaultProfileId.toStdString()))
+                throw std::runtime_error("Invalid historical template");
+            profile.gauge_id = d.cameraId.toStdString();
+            profile.perspective_correction_enabled = d.perspectiveEnabled;
+            profile.perspective_pts = {cv::Point2f(d.pt0_x,d.pt0_y),cv::Point2f(d.pt1_x,d.pt1_y),cv::Point2f(d.pt2_x,d.pt2_y),cv::Point2f(d.pt3_x,d.pt3_y)};
+            profile.center = cv::Point2f(d.centerX,d.centerY);
+            profile.scalePoints = d.scalePoints;
+            profile.pointerBaseRadius = d.pointerBaseRadius;
+            profile.calibrated_width = d.calibratedWidth; profile.calibrated_height = d.calibratedHeight;
+            profile.auto_detect_roi = false; profile.save_debug_images = false;
+            const auto frame = cv::imdecode(std::vector<uchar>(stored.bytes.begin(),stored.bytes.end()), cv::IMREAD_COLOR);
+            QDir dir(parser.value("output"));
+            if (!dir.mkpath(".")) throw std::runtime_error("Cannot create output directory");
+            const auto write = [&](const QString& name, const QByteArray& bytes) {
+                QFile f(dir.filePath(name));
+                if (!f.open(QIODevice::WriteOnly) || f.write(bytes) != bytes.size()) throw std::runtime_error("Cannot export diagnostic file");
+            };
+            write("original.jpg", stored.bytes);
+            write("snapshot.json", QJsonDocument(QJsonObject{{"device",deviceToJson(d)}, {"profile",stored.inspection.profile},
+                {"stored_result",stored.inspection.resultSnapshot}}).toJson());
+            const auto modeName = parser.value("mode");
+            if (modeName != "production" && modeName != "evidence" && modeName != "debug")
+                throw std::runtime_error("Invalid diagnostic run mode");
+            const auto mode = modeName == "production" ? GaugeRunMode::Production :
+                modeName == "evidence" ? GaugeRunMode::Evidence : GaugeRunMode::Debug;
+            const auto result = GaugeReaderEngine().process(frame,profile,mode);
+            if (!result.step2_rectified.empty()) cv::imwrite(dir.filePath("rectified.png").toStdString(),result.step2_rectified);
+            if (!result.overlayImage.empty()) cv::imwrite(dir.filePath("overlay.png").toStdString(),result.overlayImage);
+            if (!result.diagnosticHudImage.empty()) cv::imwrite(dir.filePath("hud.png").toStdString(),result.diagnosticHudImage);
+            const auto& r=result.pointerDetectorResult;
+            const auto body=[](const RadialDirectionProfile& p) { return QJsonObject{{"reach",p.reach},{"width",p.medianWidth},
+                {"sections",p.validSectionCount},{"coverage_length",p.validLength},{"score",p.bodyScore}}; };
+            const auto tail=[](const TailDirectionProfile& p) { return QJsonObject{{"valid",p.valid},{"reach",p.reach},
+                {"width",p.medianWidth},{"slope",p.widthSlope},{"widening",p.wideningScore},{"score",p.tailScore}}; };
+            QJsonObject report{{"task_id",stored.inspection.taskId},{"mode",modeName},{"success",result.success},{"value",result.value},
+                {"angle",result.pointer_angle_deg},{"head",QString(QChar(r.headEnd))}, {"likelihood_a",r.tipLikelihoodA},
+                {"likelihood_b",r.tipLikelihoodB},{"body_a",body(r.directionA)},{"body_b",body(r.directionB)},
+                {"tail_a",tail(r.tailA)},{"tail_b",tail(r.tailB)},{"error",QString::fromStdString(result.errorMessage)}};
+            write("report.json",QJsonDocument(report).toJson());
+            write("diagnostics.txt",QByteArray::fromStdString(result.detailedDebugInfo));
+            QTextStream(stdout) << QJsonDocument(report).toJson();
+            return 0;
+        } catch (const std::exception& error) { QTextStream(stderr) << error.what() << "\n"; return 2; }
+    }
     if (parser.isSet("credential-path")) {
         QTextStream(stdout) << DeviceCredentialStore::defaultPath() << "\n"; return 0;
     }
@@ -129,7 +232,7 @@ int main(int argc, char** argv) {
             int missing = 0;
             for (const auto& value : registry["devices"].toArray()) {
                 const auto object = value.toObject();
-                const auto id = object["default_profile_id"].toString("PRESSURE_GAUGE_1.6MPA");
+                const auto id = object["default_profile_id"].toString();
                 if (!ids.contains(id)) {
                     ++missing;
                     QTextStream(stderr) << "Missing template: " << id << "\n";
@@ -148,12 +251,7 @@ int main(int argc, char** argv) {
             return 0;
         } catch (const std::exception& error) { QTextStream(stderr) << error.what() << "\n"; return 2; }
     }
-    const QString modeName = parser.value("mode");
-    GaugeRunMode mode;
-    if (modeName == "production") mode = GaugeRunMode::Production;
-    else if (modeName == "evidence") mode = GaugeRunMode::Evidence;
-    else if (modeName == "debug") mode = GaugeRunMode::Debug;
-    else return 2;
+    const auto mode = GaugeRunMode::Evidence; // Unified inspection rendering and image retention.
     bool concurrencyOk, intervalOk, captureTimeoutOk;
     const int captureTimeout = parser.value("capture-timeout").toInt(&captureTimeoutOk);
     const int concurrency = parser.value("concurrency").toInt(&concurrencyOk);

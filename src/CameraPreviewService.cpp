@@ -89,6 +89,9 @@ void CameraPreviewService::requestFrame() {
             if (!acquired.ok()) {
                 acquired.frame.release();
                 if (acquired.failure == CaptureFailure::None) acquired.failure = CaptureFailure::NoFrame;
+                m_source->close();
+                m_source.reset();
+                m_workerGeneration = 0; // Reopen after connection loss instead of reusing a dead source forever.
             }
             return acquired;
         } catch (const std::exception& e) {

@@ -51,9 +51,11 @@ inline QString imageSuffix(const std::vector<uchar>& bytes) {
     if (bytes.size() >= 8 && bytes[0]==0x89 && bytes[1]=='P' && bytes[2]=='N' && bytes[3]=='G') return ".png";
     return {};
 }
+struct CleanupStats { qint64 imageCount{0}, imageBytes{0}; };
+
 // Only fixed evidence filenames inside a non-symlink UUID directory may be removed.
 // Metadata, timing files, pending outbox records and unknown files are retained.
-inline bool expireLocalImages(const QString& root, const QString& id, const QDateTime& now) {
+inline bool expireLocalImages(const QString& root, const QString& id, const QDateTime& now, CleanupStats* stats = nullptr) {
     if (QUuid(id).isNull()) return false;
     const QFileInfo directory(QDir(root).filePath(id));
     if (!directory.exists()) return true;
@@ -67,7 +69,11 @@ inline bool expireLocalImages(const QString& root, const QString& id, const QDat
                               "recognition.jpg","gray.png","diagnostic_hud.png"}) {
         QFileInfo file(folder.filePath(name));
         if (file.isSymLink()) return false;
-        if (file.exists() && !QFile::remove(file.absoluteFilePath())) return false;
+        if (file.exists()) {
+            const auto bytes = file.size();
+            if (!QFile::remove(file.absoluteFilePath())) return false;
+            if (stats) { ++stats->imageCount; stats->imageBytes += bytes; }
+        }
     }
     record["images_expired_at"]=now.toUTC().toString(Qt::ISODateWithMs);
     record["review_image_available"]=false;
