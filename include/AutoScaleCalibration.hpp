@@ -31,7 +31,7 @@ inline std::vector<Number> numbers(const QJsonArray& tokens,double minimum,doubl
     }
     return out;
 }
-inline std::vector<Tick> ticks(const cv::Mat& image,cv::Point2f center,double radius,double radialTolerance=.022) {
+inline std::vector<Tick> ticks(const cv::Mat& image,cv::Point2f center,double radius,double radialTolerance=.022,double minimumLength=.045,double mergeAngle=1.2) {
     cv::Mat gray;
     if(image.channels()==1)gray=image;else cv::cvtColor(image,gray,cv::COLOR_BGR2GRAY);
     gray=gray.clone();
@@ -47,10 +47,10 @@ inline std::vector<Tick> ticks(const cv::Mat& image,cv::Point2f center,double ra
         const cv::Point2f a{float(l[0]),float(l[1])},b{float(l[2]),float(l[3])};
         const auto mid=(a+b)*.5f,delta=b-a,radial=mid-center;
         const double length=cv::norm(delta),r=cv::norm(radial);
-        if(r<radius*.5 || length<radius*.045 || length>radius*.24 || std::abs(delta.x*radial.y-delta.y*radial.x)/length>radius*radialTolerance)continue;
+        if(r<radius*.5 || length<radius*minimumLength || length>radius*.24 || std::abs(delta.x*radial.y-delta.y*radial.x)/length>radius*radialTolerance)continue;
         const double angle=wrap(std::atan2(radial.y,radial.x)*180/CV_PI);
         auto it=std::find_if(out.begin(),out.end(),[&](const Tick& t){
-            return distance(t.angle,angle)<1.2 && std::abs(t.radius-r)<(t.length+length)*.5+radius*.015;
+            return distance(t.angle,angle)<mergeAngle && std::abs(t.radius-r)<(t.length+length)*.5+radius*.015;
         });
         if(it==out.end())out.push_back({mid,angle,r,length});
         else {

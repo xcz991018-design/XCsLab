@@ -19,6 +19,7 @@
 
 #include "GaugeProfile.hpp"
 #include "LiquidSurface.hpp"
+#include "MinorTickPreview.hpp"
 
 class InteractiveImageLabel : public QLabel {
     Q_OBJECT
@@ -32,8 +33,11 @@ public:
     double getPointerBaseRadius() const { return m_pointerBaseRadius; }
     QJsonArray getScalePoints() const { return m_scalePoints; }
     QJsonArray ocrNumbers() const { return m_ocrNumbers; }
+    void setMinorPreview(const MinorTickPreview::Result& result) {m_minorPreview=result;update();}
+    MinorTickPreview::Result minorPreview() const {return m_minorPreview;}
+    void clearMinorPreview() {m_minorPreview={};update();}
     void setOcrNumbers(const QJsonArray& numbers) {m_ocrNumbers=numbers;update();}
-    void setScalePoints(const QJsonArray& points) { m_scalePoints=points; clearScaleSelection(); update(); }
+    void setScalePoints(const QJsonArray& points) { m_scalePoints=points; clearMinorPreview(); clearScaleSelection(); update(); }
     void setScaleRange(double minimum,double maximum) {m_rangeMinimum=minimum;m_rangeMaximum=maximum;m_hasScaleRange=maximum>minimum;update();}
     void clearScaleSelection() { m_selectedScale=-1; emit scaleSelectionChanged(); update(); }
     bool hasSelectedIntermediateScale() const { return m_selectedScale>=0 && m_selectedScale<m_scalePoints.size() && m_scalePoints[m_selectedScale].toObject()["ratio"].toDouble()>0 && m_scalePoints[m_selectedScale].toObject()["ratio"].toDouble()<1; }
@@ -42,9 +46,9 @@ public:
     void selectCenter() { m_pickLiquidSurface=false; m_liquidClicks.clear(); m_pickCenter=true; m_pendingRatio=-1; setCursor(Qt::CrossCursor); emit pickModeChanged(); }
     bool pickingCenter() const { return m_pickCenter; }
     double pendingScaleRatio() const { return m_pendingRatio; }
-    void setLiquidSurface(const LiquidSurface& surface) {m_liquidSurface=surface; update();}
+    void setLiquidSurface(const LiquidSurface& surface) {m_liquidSurface=surface; clearMinorPreview(); update();}
     LiquidSurface liquidSurface() const {return m_liquidSurface;}
-    void showLiquidMask(bool enabled) {m_showLiquidMask=enabled; update();}
+    void showLiquidMask(bool enabled) {m_showLiquidMask=enabled; clearMinorPreview(); update();}
     void selectLiquidSurface() {m_pickLiquidSurface=true;m_pickCenter=false;m_pendingRatio=-1;m_liquidClicks.clear();setCursor(Qt::CrossCursor);emit pickModeChanged();}
     void setRectifiedMode(bool enabled) { m_rectifiedMode=enabled; m_selectedIdx=-1; }
 
@@ -70,6 +74,7 @@ private:
     bool m_pickLiquidSurface{false}, m_showLiquidMask{true};
     std::vector<cv::Point2f> m_liquidClicks;
     LiquidSurface m_liquidSurface;
+    MinorTickPreview::Result m_minorPreview;
     QJsonArray m_scalePoints;
     double m_rangeMinimum{0},m_rangeMaximum{1};
     bool m_hasScaleRange{false};
@@ -105,6 +110,8 @@ private slots:
     void onConfirmPerspective();
     void onDetectLiquidSurface();
     void onAutoScaleCalibration();
+    void onMinorTickPreview();
+
 
 private:
     void setupUi();
@@ -142,6 +149,9 @@ private:
     QLabel *m_saveStatus{nullptr};
     QWidget* m_scaleControls{nullptr};
     QLabel* m_scaleStatus{nullptr};
+    QPushButton* m_minorPreviewBtn{nullptr};
+    QDoubleSpinBox* m_minorDivision{nullptr};
+    QCheckBox* m_saveMinorTicks{nullptr};
     QLabel* m_geometryStatus{nullptr};
     QCheckBox* m_geometryAcknowledged{nullptr};
     QByteArray m_geometryReviewSignature;

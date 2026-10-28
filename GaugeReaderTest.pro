@@ -39,6 +39,7 @@ win32 {
 
 # Header Files
 HEADERS += \
+    $$PWD/include/MinorTickPreview.hpp \
     $$PWD/include/CameraHealthSchedule.hpp \
     $$PWD/include/DeviceCalibration.hpp \
     $$PWD/include/InspectionCalibration.hpp \

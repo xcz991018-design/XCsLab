@@ -31,6 +31,8 @@ std::vector<cv::Point2f> editableCardinalPlaceholders(const cv::Mat& frame) {
 }
 
 InteractiveImageLabel::InteractiveImageLabel(QWidget *parent) : QLabel(parent) {
+    connect(this,&InteractiveImageLabel::pointsChanged,this,&InteractiveImageLabel::clearMinorPreview);
+    connect(this,&InteractiveImageLabel::liquidSurfaceChanged,this,&InteractiveImageLabel::clearMinorPreview);
     setMouseTracking(true);
     setFocusPolicy(Qt::ClickFocus);
     setMinimumSize(540, 480);
@@ -38,6 +40,7 @@ InteractiveImageLabel::InteractiveImageLabel(QWidget *parent) : QLabel(parent) {
 }
 
 void InteractiveImageLabel::setImageAndPoints(const cv::Mat& mat, const std::vector<cv::Point2f>& pts, const cv::Point2f& centerPt) {
+    clearMinorPreview();
     m_origImage = mat.clone();
     m_ocrNumbers={};
     m_pts = pts;
@@ -170,6 +173,12 @@ void InteractiveImageLabel::paintEvent(QPaintEvent *event) {
     }
     painter.setPen(QPen(QColor(0,220,255),2));painter.setBrush(Qt::NoBrush);
     for(auto point:m_liquidClicks)painter.drawEllipse(mapToCanvas(point),5,5);
+    for(const auto& mark:m_minorPreview.marks) {
+        painter.setPen(QPen(mark.gap?QColor("#ff9e38"):(mark.assigned?QColor("#69d5ff"):QColor("#dc79ff")),2,
+                            mark.gap?Qt::DashLine:Qt::SolidLine));
+        painter.drawLine(mapToCanvas(mark.a),mapToCanvas(mark.b));
+        painter.drawText(mapToCanvas(mark.b)+QPointF(3,3),(mark.ratio>=0?(mark.assigned?QString():tr("估计 "))+MinorTickPreview::displayValue(m_rangeMinimum+mark.ratio*(m_rangeMaximum-m_rangeMinimum))+" / ":(mark.gap?QString():tr("待定 / ")))+QString::number(qRound(mark.confidence*100))+"%");
+    }
     for (int index=0;index<m_scalePoints.size();++index) {
         const auto value=m_scalePoints[index];
         const auto p=value.toObject(); const QPointF cp=mapToCanvas({float(p["x"].toDouble()),float(p["y"].toDouble())});
@@ -177,7 +186,7 @@ void InteractiveImageLabel::paintEvent(QPaintEvent *event) {
         const QColor color=selected?QColor("#ffb74d"):QColor(100,255,100);
         painter.setPen(QPen(color,selected?3:1.5)); painter.setBrush(color);
         const double ratio=p["ratio"].toDouble();
-        const bool labelled=m_scalePoints.size()<=20 || std::abs(ratio*10-std::round(ratio*10))<1e-7;
+        const bool labelled=p["source"].toString()=="minor_tick" || m_scalePoints.size()<=20 || std::abs(ratio*10-std::round(ratio*10))<1e-7;
         if(labelled||selected) painter.drawLine(mapToCanvas(ScaleCalibration::origin(p,m_centerPt)),cp);
         painter.drawEllipse(cp,selected?5:3,selected?5:3);
         if(labelled||selected) painter.drawText(cp+QPointF(7,-7),(m_hasScaleRange?
@@ -480,17 +489,31 @@ void CardinalSelectorDialog::setupUi() {
     m_autoScaleBtn->setObjectName("autoCalibrateScaleButton");
     m_autoScaleBtn->setToolTip(tr("识别左下、右下数字设置量程，并在数字外侧寻找真实大刻度线，自动标定起止角度；结果可手动修正。"));
     autoScaleLayout->addWidget(m_autoScaleBtn);
+    m_minorPreviewBtn=new QPushButton(tr("小刻度识别与预览"),this);
+    m_minorPreviewBtn->setToolTip(tr("使用已有大刻度锚点分析小刻度；紫色为候选，橙色虚线为推断缺口，可在保存时采用已确认小刻度，估计值与缺口不保存。"));
+    autoScaleLayout->addWidget(m_minorPreviewBtn);
+    auto* minorOptions=new QHBoxLayout;
+    minorOptions->addWidget(new QLabel(tr("小刻度分度（0=自动）"),this));
+    m_minorDivision=new QDoubleSpinBox(this);m_minorDivision->setDecimals(6);m_minorDivision->setRange(0,1e9);m_minorDivision->setSingleStep(.01);
+    m_minorDivision->setToolTip(tr("自动推断有歧义时，填写表盘实际最小分度，再点击小刻度识别与预览。"));
+    m_minorDivision->setMaximumWidth(130);minorOptions->addWidget(m_minorDivision);
+    connect(m_minorDivision,QOverload<double>::of(&QDoubleSpinBox::valueChanged),this,[this](double){m_previewLabel->clearMinorPreview();});
+    m_saveMinorTicks=new QCheckBox(tr("保存时采用已确认小刻度"),this);m_saveMinorTicks->setChecked(true);
+    minorOptions->addWidget(m_saveMinorTicks);
+    minorOptions->addStretch();
+    connect(m_minorPreviewBtn,&QPushButton::clicked,this,&CardinalSelectorDialog::onMinorTickPreview);
     auto* scaleHint=new QLabel(tr("自动匹配各数字对应的长刻度；结果可手动修正"),this);
     scaleHint->setWordWrap(true);
     autoScaleLayout->addWidget(scaleHint);autoScaleLayout->addStretch();
     mainLayout->addLayout(autoScaleLayout);
+    mainLayout->addLayout(minorOptions);
     auto* rangeLayout=new QHBoxLayout;
     rangeLayout->addWidget(new QLabel(tr("OCR 量程（左下 → 右下）"),this));
     m_rangeMinimum=new QDoubleSpinBox(this);m_rangeMaximum=new QDoubleSpinBox(this);
     m_rangeMinimum->setObjectName("ocrRangeMinimum");m_rangeMaximum->setObjectName("ocrRangeMaximum");
     for(auto* spin:{m_rangeMinimum,m_rangeMaximum}) {spin->setDecimals(6);spin->setRange(-1e9,1e9);rangeLayout->addWidget(spin);}
     m_rangeMinimum->setValue(m_profile.min_val);m_rangeMaximum->setValue(m_profile.max_val);
-    const auto updateRangeLabels=[this]{m_previewLabel->setScaleRange(m_rangeMinimum->value(),m_rangeMaximum->value());};
+    const auto updateRangeLabels=[this]{m_previewLabel->clearMinorPreview();m_previewLabel->setScaleRange(m_rangeMinimum->value(),m_rangeMaximum->value());};
     for(auto* spin:{m_rangeMinimum,m_rangeMaximum})connect(spin,QOverload<double>::of(&QDoubleSpinBox::valueChanged),this,[updateRangeLabels](double){updateRangeLabels();});
     updateRangeLabels();
     rangeLayout->addWidget(new QLabel(QString::fromStdString(m_profile.unit)+tr("；识别后可修正，保存标定时生效"),this));
@@ -776,6 +799,7 @@ void CardinalSelectorDialog::onConfirmPerspective() {
 }
 
 void CardinalSelectorDialog::updatePreview() {
+    m_minorPreviewBtn->setEnabled(!m_saving&&!m_autoDetectRunning&&m_perspectiveConfirmed&&m_centerConfirmed);
     m_autoScaleBtn->setEnabled(!m_saving&&!m_autoDetectRunning&&m_perspectiveConfirmed);
     m_confirmPerspectiveBtn->setVisible(!m_automaticReviewMode&&!m_perspectiveConfirmed);
     m_scaleStatus->setVisible(!m_automaticReviewMode);
@@ -868,6 +892,8 @@ void CardinalSelectorDialog::setAutoDetectionBusy(bool busy) {
     m_autoScaleBtn->setEnabled(!busy&&m_perspectiveConfirmed);
     m_rangeMinimum->setEnabled(!busy);m_rangeMaximum->setEnabled(!busy);
     m_confirmPerspectiveBtn->setEnabled(!busy);
+    m_minorDivision->setEnabled(!busy);m_saveMinorTicks->setEnabled(!busy);
+    m_minorPreviewBtn->setEnabled(!busy&&m_perspectiveConfirmed&&m_centerConfirmed);
     m_manualEditBtn->setEnabled(!busy);
     m_scaleControls->setEnabled(!busy&&m_perspectiveConfirmed);
     m_liquidControls->setEnabled(!busy&&m_perspectiveConfirmed);
@@ -880,6 +906,57 @@ void CardinalSelectorDialog::setAutoDetectionBusy(bool busy) {
 
 void CardinalSelectorDialog::onAutoDetect() {
     startAutoDetection(false);
+}
+
+void CardinalSelectorDialog::onMinorTickPreview() {
+    if(m_saving||m_autoDetectRunning||!m_perspectiveConfirmed||!m_centerConfirmed)return;
+    cv::Mat rectified;
+    try {
+        GaugeReaderEngine engine;cv::Mat inverse;
+        rectified=engine.rectifyPerspective(m_frame,m_currentPts,inverse,m_profile.rectified_size,m_profile.rectified_margin).clone();
+    } catch(const cv::Exception& error){m_saveStatus->setText(QString::fromUtf8(error.what()));return;}
+    QJsonArray anchors;
+    for(const auto& p:m_previewLabel->getScalePoints())if(p.toObject()["source"].toString()!="minor_tick")anchors.append(p);
+    const auto center=m_previewLabel->getCenterPoint();
+    const auto surface=m_liquidMaskEnabled->isChecked()?m_previewLabel->liquidSurface():LiquidSurface{};
+    const double minimum=m_rangeMinimum->value(),maximum=m_rangeMaximum->value();
+    m_previewLabel->clearMinorPreview();setAutoDetectionBusy(true);
+    m_autoProgressLabel->setText(tr("正在分析小刻度赋值并对比指针读数…"));
+    auto* watcher=new QFutureWatcher<MinorTickPreview::Result>(this);
+    connect(watcher,&QFutureWatcher<MinorTickPreview::Result>::finished,this,[this,watcher]{
+        const auto result=watcher->result();watcher->deleteLater();setAutoDetectionBusy(false);
+        updatePreview();m_previewLabel->setMinorPreview(result);m_saveStatus->setText(result.message);
+    });
+    // Build a private profile with the same frozen frame and current annotations.
+    auto previewProfile=m_profile;
+    const auto annotations=sourceAnnotations();
+    previewProfile.center=CameraUndistortion::point(annotations.first,m_frame.size(),true);
+    previewProfile.scalePoints=CameraUndistortion::scales(ScaleCalibration::transformed(anchors,m_inverseHomography),m_frame.size(),true);
+    previewProfile.perspective_pts=CameraUndistortion::points(m_currentPts,m_frame.size(),true);
+    previewProfile.calibrated_width=m_rawFrame.cols;previewProfile.calibrated_height=m_rawFrame.rows;
+    previewProfile.auto_detect_roi=false;previewProfile.perspective_correction_enabled=true;
+    previewProfile.min_val=minimum;previewProfile.max_val=maximum;
+    previewProfile.pointerBaseRadius=m_previewLabel->getPointerBaseRadius();
+    const auto raw=m_rawFrame.clone();
+    const double confirmedDivision=m_minorDivision->value();
+    watcher->setFuture(QtConcurrent::run([rectified,anchors,center,surface,minimum,maximum,raw,previewProfile,confirmedDivision,
+                                         radius=m_profile.rectified_size*.5-m_profile.rectified_margin,clockwise=m_profile.clockwise]() mutable {
+        try {
+            GaugeReaderEngine engine;const auto reading=engine.process(raw,previewProfile,GaugeRunMode::Production);
+            auto result=MinorTickPreview::detect(rectified,anchors,center,radius,minimum,maximum,clockwise,surface,
+                reading.success?reading.pointer_angle_deg:std::numeric_limits<double>::quiet_NaN(),confirmedDivision);
+            if(!reading.success)result.message+=QStringLiteral(u" 指针检测未通过，未输出读数对比：%1").arg(QString::fromStdString(reading.errorMessage.empty()?reading.pointerDetectorResult.failureReason:reading.errorMessage));
+            else {
+                const auto origin=ScaleCalibration::origin(anchors.first().toObject(),center);
+                if(cv::norm(origin-reading.center)>std::max(1.,radius*.005))
+                    result.message+=QStringLiteral(u" 指针中心与刻度中心相差 %1 px，尚未建立可靠映射，暂停数值对比。").arg(cv::norm(origin-reading.center),0,'f',1);
+                else result.message+=" " + MinorTickPreview::compare(result,anchors,center,clockwise,minimum,maximum,reading.pointer_angle_deg).message
+                    +QStringLiteral(u" 单位：%1。").arg(QString::fromStdString(previewProfile.unit));
+            }
+            return result;
+        }
+        catch(const cv::Exception& error){MinorTickPreview::Result result;result.message=QString::fromUtf8(error.what());return result;}
+    }));
 }
 
 void CardinalSelectorDialog::onAutoScaleCalibration() {
@@ -895,6 +972,7 @@ void CardinalSelectorDialog::onAutoScaleCalibration() {
     connect(this,&QDialog::finished,this,[cancelled]{cancelled->store(true);});
     connect(this,&QObject::destroyed,[cancelled]{cancelled->store(true);});
     m_previewLabel->selectScaleRatio(-1);
+    m_previewLabel->clearMinorPreview();
     m_previewLabel->setOcrNumbers({});
     setAutoDetectionBusy(true);
     m_autoProgressLabel->setText(tr("正在识别数字并匹配各数值的长刻度线…可点击取消关闭。"));
@@ -1085,6 +1163,14 @@ std::pair<cv::Point2f,QJsonArray> CardinalSelectorDialog::sourceAnnotations() co
 
 void CardinalSelectorDialog::onSaveAndApply() {
     if (m_saving || m_autoDetectRunning) return;
+    if(m_saveMinorTicks->isChecked()) {
+        const auto proposal=m_previewLabel->minorPreview();
+        if(!proposal.marks.empty()&&!proposal.divisionConfirmed) {
+            m_saveStatus->setText(tr("小刻度分度尚未确认：请填写实际分度并重新预览，或取消“保存时采用已确认小刻度”以仅保存现有标定。"));return;
+        }
+        if(proposal.divisionConfirmed&&std::any_of(proposal.marks.begin(),proposal.marks.end(),[](const MinorTickPreview::Mark& m){return m.assigned;}))
+            m_previewLabel->setScalePoints(proposal.previewPoints);
+    }
     if(m_endpointReviewRequired) {
         m_saveStatus->setText(tr("自动刻度尚未通过检查。请确认透视、轴心及液面后重新识别，或手动修正刻度，再保存标定。"));return;
     }
