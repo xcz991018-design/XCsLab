@@ -86,6 +86,7 @@ set(GUI_SOURCES
     "${CMAKE_CURRENT_SOURCE_DIR}/include/CardinalSelectorDialog.hpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/include/LiquidSurface.hpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/include/AutoDialCalibration.hpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/include/GraduationRectification.hpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/include/CameraInfoEditDialog.hpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/include/PointerDetector.hpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/include/GB28181StreamManager.hpp"
@@ -110,6 +111,12 @@ add_executable(gauge_reader_test ${CLI_SOURCES})
 target_link_libraries(gauge_reader_test PRIVATE ${OpenCV_LIBS} ${QT_LIBS} ws2_32)
 
 add_executable(gauge_reader_gui WIN32 ${GUI_SOURCES})
+add_custom_command(TARGET gauge_reader_gui POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E make_directory "$<TARGET_FILE_DIR:gauge_reader_gui>/ocr"
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+        "${CMAKE_CURRENT_SOURCE_DIR}/tools/ocr/paddle_scale_ocr.py"
+        "${CMAKE_CURRENT_SOURCE_DIR}/tools/ocr/requirements.txt"
+        "$<TARGET_FILE_DIR:gauge_reader_gui>/ocr")
 target_sources(gauge_reader_gui PRIVATE src/IsolatedCapture.cpp)
 target_link_libraries(gauge_reader_gui PRIVATE ${OpenCV_LIBS} ${QT_LIBS} gauge_mysql_client ws2_32 crypt32)
 

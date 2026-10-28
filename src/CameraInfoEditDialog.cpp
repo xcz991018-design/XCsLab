@@ -1,6 +1,5 @@
 #include "CameraInfoEditDialog.hpp"
 #include "DeviceConfigManager.hpp"
-#include "GaugeTemplateDialog.hpp"
 #include <QFile>
 #include <QJsonDocument>
 #include <QJsonObject>
@@ -19,7 +18,6 @@
 #include <QtConcurrent/QtConcurrent>
 
 namespace {
-struct TemplateChoices { QStringList ids; QString error; };
 // Round presentation only; keep the stored spin-box value's existing precision.
 class SafeRangeSpinBox : public QDoubleSpinBox {
 public:
@@ -95,7 +93,6 @@ DiscoveredCameraItem CameraInfoEditDialog::getUpdatedDeviceItem() const {
 
     }
     if (m_archiveOnly) {
-        item.defaultProfileId = m_gaugeProfileCombo->currentData().toString();
         // Asset & Physical Installation Metadata
         item.installationPosition = m_installationPositionEdit->text().trimmed();
         item.installationLocation = m_locationEdit ? m_locationEdit->text().trimmed() : "";
@@ -107,40 +104,6 @@ DiscoveredCameraItem CameraInfoEditDialog::getUpdatedDeviceItem() const {
     return item;
 }
 
-void CameraInfoEditDialog::refreshProfiles(const QString& selected) {
-    const auto id = selected.isNull() ? m_gaugeProfileCombo->currentData().toString() : selected;
-    const auto generation = ++m_templateGeneration;
-    m_templatesLoading = true;
-    m_gaugeProfileCombo->setEnabled(false);
-    if (m_saveBtn) m_saveBtn->setEnabled(false);
-    if (m_templateStatus) m_templateStatus->setText(tr("正在读取数据库模板…"));
-    auto* watcher = new QFutureWatcher<TemplateChoices>(this);
-    connect(watcher, &QFutureWatcher<TemplateChoices>::finished, this, [this, watcher, id, generation]() {
-        const auto result = watcher->result(); watcher->deleteLater();
-        if (generation != m_templateGeneration) return;
-        m_templatesLoading = false;
-        m_availableProfileIds = result.ids;
-        m_gaugeProfileCombo->clear();
-        m_gaugeProfileCombo->addItem(tr("请选择表计模板（必选）"), QString());
-        for (const auto& available : result.ids) m_gaugeProfileCombo->addItem(available, available);
-        if (!id.isEmpty()) {
-            int index = m_gaugeProfileCombo->findData(id);
-            if (index < 0) { m_gaugeProfileCombo->addItem(tr("%1（模板不存在）").arg(id), id); index = m_gaugeProfileCombo->count() - 1; }
-            m_gaugeProfileCombo->setCurrentIndex(index);
-        }
-        m_gaugeProfileCombo->setEnabled(result.error.isEmpty());
-        if (m_saveBtn) m_saveBtn->setEnabled(!m_archiveOnly || (result.error.isEmpty() && !result.ids.isEmpty()));
-        m_gaugeProfileCombo->setToolTip(result.error);
-        if (m_templateStatus) m_templateStatus->setText(result.error.isEmpty()
-            ? result.ids.isEmpty() ? tr("数据库暂无模板，请点击“管理模板”新增。") : tr("模板来自 数据库")
-            : tr("模板加载失败：%1").arg(result.error));
-    });
-    watcher->setFuture(QtConcurrent::run([backend = m_templateBackend]() {
-        GaugeTemplateStore store(backend); TemplateChoices result;
-        if (store.load(result.error)) result.ids = store.ids();
-        return result;
-    }));
-}
 void CameraInfoEditDialog::setupUi() {
     setWindowTitle(m_isNewDevice ? tr("➕ 添加新摄像头设备 (Add Camera Device)") : tr("✏️ 编辑摄像头与设备连接档案 (Device & Camera Editor)"));
     resize(640, 560);
@@ -156,7 +119,7 @@ void CameraInfoEditDialog::setupUi() {
     mainLayout->setContentsMargins(14, 14, 14, 14);
     mainLayout->setSpacing(12);
 
-    QLabel *headerLabel = new QLabel(m_isNewDevice ? tr("登记新摄像头网络参数；添加后请单独填写表计档案并标定。") : (m_archiveOnly ? tr("填写设备安装档案，并主动选择表计模板：") : tr("修改摄像头网络连接参数：")), this);
+    QLabel *headerLabel = new QLabel(m_isNewDevice ? tr("登记新摄像头网络参数；添加后请单独填写表计档案并标定。") : (m_archiveOnly ? tr("填写设备安装档案，量程在表计标定时识别：") : tr("修改摄像头网络连接参数：")), this);
     headerLabel->setStyleSheet("font-size: 14px; font-weight: bold; color: #00e5ff; padding-bottom: 2px;");
     mainLayout->addWidget(headerLabel);
 
@@ -231,11 +194,6 @@ void CameraInfoEditDialog::setupUi() {
     gaugeForm->setSpacing(10);
     gaugeForm->setLabelAlignment(Qt::AlignRight | Qt::AlignVCenter);
 
-    m_gaugeProfileCombo = new QComboBox(gaugeTab);
-    m_gaugeProfileCombo->setObjectName("deviceGaugeTemplate");
-    if (m_archiveOnly) refreshProfiles();
-    m_gaugeProfileCombo->setStyleSheet("QComboBox { color: #ffd700; font-weight: bold; }");
-
     m_installationPositionEdit = new QLineEdit(gaugeTab);
     m_installationPositionEdit->setPlaceholderText(tr("例如：柜体右上方（可选）"));
 
@@ -251,24 +209,7 @@ void CameraInfoEditDialog::setupUi() {
 
 
 
-    auto* profileRow = new QWidget(gaugeTab);
-    auto* profileLayout = new QHBoxLayout(profileRow);
-    profileLayout->setContentsMargins(0, 0, 0, 0);
-    profileLayout->addWidget(m_gaugeProfileCombo, 1);
-    auto* manageProfiles = new QPushButton(tr("管理模板…"), profileRow);
-    manageProfiles->setObjectName("manageDeviceGaugeTemplates");
-    profileLayout->addWidget(manageProfiles);
-    connect(manageProfiles, &QPushButton::clicked, this, [this]() {
-        GaugeTemplateDialog dialog(this, m_templateBackend);
-        connect(&dialog, &GaugeTemplateDialog::templatesChanged, this, [this]() { refreshProfiles(); });
-        dialog.exec();
-        refreshProfiles();
-    });
-    gaugeForm->addRow(tr("表计模板:"), profileRow);
-    m_templateStatus = new QLabel(tr("正在读取数据库模板…"), gaugeTab);
-    m_templateStatus->setWordWrap(true);
-    m_templateStatus->setTextFormat(Qt::PlainText);
-    gaugeForm->addRow(m_templateStatus);
+    gaugeForm->addRow(new QLabel(tr("表计量程由标定界面 OCR 自动识别，可手动修正。"), gaugeTab));
     gaugeForm->addRow(tr("<font color='#ff5252'>*</font> 安装点位 (installation_location):"), m_locationEdit);
     gaugeForm->addRow(tr("<font color='#ff5252'>*</font> 设备标签 (device_tag):"), m_deviceTagEdit);
     gaugeForm->addRow(tr("安装位置（可选）:"), m_installationPositionEdit);
@@ -328,7 +269,8 @@ void CameraInfoEditDialog::setupUi() {
     // Action Buttons
     QHBoxLayout *btnLayout = new QHBoxLayout();
     m_saveBtn = new QPushButton(tr("💾 保存设备配置并立即生效"), this);
-    m_saveBtn->setEnabled(!m_archiveOnly || (!m_templatesLoading && !m_availableProfileIds.isEmpty()));
+    m_saveBtn->setObjectName("saveDeviceArchiveButton");
+    m_saveBtn->setEnabled(true);
     m_cancelBtn = new QPushButton(tr("取消"), this);
 
     m_saveBtn->setStyleSheet("QPushButton { background-color: #00897b; color: white; font-weight: bold; padding: 8px 20px; border-radius: 4px; font-size: 13px; }"
@@ -387,10 +329,6 @@ void CameraInfoEditDialog::loadCameraInfo() {
             m_protocolCombo->setCurrentIndex(3);
         }
 
-        if (m_archiveOnly && !dev.defaultProfileId.isEmpty()) {
-            refreshProfiles(dev.defaultProfileId);
-        }
-
         m_installationPositionEdit->setText(dev.installationPosition);
         m_locationEdit->setText(dev.installationLocation);
         m_deviceTagEdit->setText(dev.deviceTag);
@@ -420,12 +358,6 @@ void CameraInfoEditDialog::onSave() {
 }
 
 bool CameraInfoEditDialog::saveCameraInfo() {
-    const auto selectedProfile = m_gaugeProfileCombo->currentData().toString();
-    if (m_archiveOnly && (m_templatesLoading || selectedProfile.isEmpty() || !m_availableProfileIds.contains(selectedProfile))) {
-        m_tabWidget->setCurrentIndex(0);
-        QMessageBox::warning(this, tr("验证失败"), tr("请选择有效的表计模板；可以点击“管理模板”新增模板。"));
-        return false;
-    }
     QString newCamId = getUpdatedCameraId();
     if (!m_archiveOnly) {
     if (newCamId.isEmpty()) {

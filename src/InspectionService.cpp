@@ -231,15 +231,20 @@ InspectionOutcome recognize(CapturedTask data, const std::shared_ptr<std::atomic
         const auto templateStarted = TimingClock::now();
         QJsonObject frozen = data.task.historicalProfile;
         if (frozen.isEmpty()) {
-            // Capturing without recognition is still possible with no database,
-            // but an algorithm run never falls back to local files or defaults.
+            // New devices use built-in algorithm parameters and their saved OCR
+            // range. Legacy devices retain their explicit database template.
             if (data.task.captureOnly && !DatabaseSettings::fromEnvironment().enabled) return out;
             try {
                 const auto id = data.task.device.defaultProfileId;
-                const auto record = MySqlRepository().loadTemplate(id);
-                frozen = QJsonObject{{"profiles", QJsonArray{record.definition}},
-                                     {"_database_template_id", record.id},
-                                     {"_database_template_revision", static_cast<double>(record.revision)}};
+                if(id.isEmpty()) {
+                    frozen=GaugeProfile::createDefault().toJson();
+                    frozen["_configuration_source"]="device_ocr";
+                } else {
+                    const auto record = MySqlRepository().loadTemplate(id);
+                    frozen = QJsonObject{{"profiles", QJsonArray{record.definition}},
+                                         {"_database_template_id", record.id},
+                                         {"_database_template_revision", static_cast<double>(record.revision)}};
+                }
             } catch (const std::exception& e) {
                 out.errorCode = "TEMPLATE_DATABASE_FAILED";
                 out.errorMessage = QString::fromUtf8(e.what());
@@ -248,6 +253,7 @@ InspectionOutcome recognize(CapturedTask data, const std::shared_ptr<std::atomic
         }
         out.timings["template_load_ms"] = elapsedMs(templateStarted);
         const auto profileStarted = TimingClock::now();
+        if(!usesHistoricalDatabaseConfiguration(data.task))frozen=OcrDialRange::withRange(frozen,data.task.device.meterRange);
         out.profileSnapshot = frozen;
         if (data.task.captureOnly) return out;
         GaugeProfile profile;

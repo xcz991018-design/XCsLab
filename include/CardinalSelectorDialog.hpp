@@ -31,7 +31,10 @@ public:
     void setPointerBaseRadius(double r) { m_pointerBaseRadius = r; update(); }
     double getPointerBaseRadius() const { return m_pointerBaseRadius; }
     QJsonArray getScalePoints() const { return m_scalePoints; }
+    QJsonArray ocrNumbers() const { return m_ocrNumbers; }
+    void setOcrNumbers(const QJsonArray& numbers) {m_ocrNumbers=numbers;update();}
     void setScalePoints(const QJsonArray& points) { m_scalePoints=points; clearScaleSelection(); update(); }
+    void setScaleRange(double minimum,double maximum) {m_rangeMinimum=minimum;m_rangeMaximum=maximum;m_hasScaleRange=maximum>minimum;update();}
     void clearScaleSelection() { m_selectedScale=-1; emit scaleSelectionChanged(); update(); }
     bool hasSelectedIntermediateScale() const { return m_selectedScale>=0 && m_selectedScale<m_scalePoints.size() && m_scalePoints[m_selectedScale].toObject()["ratio"].toDouble()>0 && m_scalePoints[m_selectedScale].toObject()["ratio"].toDouble()<1; }
     void deleteSelectedIntermediateScale();
@@ -68,6 +71,9 @@ private:
     std::vector<cv::Point2f> m_liquidClicks;
     LiquidSurface m_liquidSurface;
     QJsonArray m_scalePoints;
+    double m_rangeMinimum{0},m_rangeMaximum{1};
+    bool m_hasScaleRange{false};
+    QJsonArray m_ocrNumbers;
     double m_pendingRatio{-1};
     cv::Mat m_origImage;
     std::vector<cv::Point2f> m_pts; // 4 points [12H, 3H, 6H, 9H]
@@ -98,6 +104,7 @@ private slots:
     void onSaveAndApply();
     void onConfirmPerspective();
     void onDetectLiquidSurface();
+    void onAutoScaleCalibration();
 
 private:
     void setupUi();
@@ -107,6 +114,7 @@ private:
     void startAutoDetection(bool cornersOnly);
     std::pair<cv::Point2f,QJsonArray> sourceAnnotations() const;
 
+    cv::Mat m_rawFrame;
     cv::Mat m_frame;
     GaugeProfile& m_profile;
     QString m_cameraId;
@@ -116,10 +124,16 @@ private:
     InteractiveImageLabel *m_previewLabel{nullptr};
     QPushButton* m_confirmPerspectiveBtn{nullptr};
     QPushButton* m_centerBtn{nullptr};
+    QPushButton* m_autoScaleBtn{nullptr};
+    QDoubleSpinBox *m_rangeMinimum{nullptr},*m_rangeMaximum{nullptr};
+    bool m_rangeConfirmed{false};
+    bool m_autoEndpointCalibration{false};
+    bool m_endpointReviewRequired{false};
     cv::Mat m_inverseHomography;
     bool m_perspectiveConfirmed{false};
     bool m_centerConfirmed{false};
     cv::Point2f m_sourceCenter{-1,-1};
+    cv::Point2f m_graduationSourceCenter{-1,-1};
     QJsonArray m_sourceScalePoints;
     QDoubleSpinBox *m_baseRadiusSpinBox{nullptr};
     QPushButton *m_autoBtn{nullptr};

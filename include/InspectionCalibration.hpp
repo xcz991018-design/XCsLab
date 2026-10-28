@@ -2,6 +2,7 @@
 #include "InspectionService.hpp"
 #include "DeviceCodec.hpp"
 #include "DeviceCalibration.hpp"
+#include "OcrDialRange.hpp"
 
 inline bool canRecognizeDevice(const DiscoveredCameraItem& device) {
     return device.hasCalibration && hasSavedDeviceCalibration(deviceToJson(device)["calibration"].toObject());
@@ -9,7 +10,7 @@ inline bool canRecognizeDevice(const DiscoveredCameraItem& device) {
 
 inline QStringList recognitionMissingRequirements(const DiscoveredCameraItem& d) {
     QStringList missing;
-    if (d.defaultProfileId.trimmed().isEmpty()) missing << QStringLiteral(u"请选择表计模板");
+    if (!OcrDialRange::valid(d.meterRange)&&d.defaultProfileId.trimmed().isEmpty()) missing << QStringLiteral(u"请识别并保存表计量程");
     if (d.installationLocation.trimmed().isEmpty() || d.deviceTag.trimmed().isEmpty())
         missing << QStringLiteral(u"请填写完整的设备安装档案");
     if (!canRecognizeDevice(d)) missing << QStringLiteral(u"请完成表计标定并保存");

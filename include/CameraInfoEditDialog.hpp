@@ -35,13 +35,8 @@ private:
     void setupUi();
     void loadCameraInfo();
     bool saveCameraInfo();
-    void refreshProfiles(const QString& selected = QString());
 
     GaugeTemplateBackend m_templateBackend;
-    QStringList m_availableProfileIds;
-    quint64 m_templateGeneration{0};
-    bool m_templatesLoading{false};
-    QLabel* m_templateStatus{nullptr};
     QString m_originalCameraId;
     bool m_isNewDevice{false};
     bool m_archiveOnly{false};
@@ -59,7 +54,6 @@ private:
     QLineEdit *m_passwordEdit{nullptr};
 
     // Gauge Profile & Location Parameters
-    QComboBox *m_gaugeProfileCombo{nullptr};
     QLineEdit *m_installationPositionEdit{nullptr};
     QLineEdit *m_locationEdit{nullptr};
     QLineEdit *m_deviceTagEdit{nullptr};

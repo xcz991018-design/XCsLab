@@ -9,6 +9,12 @@
 // Points are stored in calibration-frame pixels. Ratios remain independent of
 // the selected template's unit and range; 0 and 1 are the required endpoints.
 namespace ScaleCalibration {
+// Automatic plane rectification can distinguish the printed radial origin from
+// the apparent center of a raised needle cap. Old/manual points use the hub.
+inline cv::Point2f origin(const QJsonObject& p,cv::Point2f hub) {
+    return p.contains("origin_x")&&p.contains("origin_y")?
+        cv::Point2f(float(p["origin_x"].toDouble()),float(p["origin_y"].toDouble())):hub;
+}
 inline double span(double from, double to, bool clockwise) {
     return std::fmod((clockwise ? to-from : from-to) + 720.0, 360.0);
 }
@@ -16,6 +22,7 @@ inline QJsonArray scaled(const QJsonArray& points, double sx, double sy) {
     QJsonArray result;
     for (const auto& value : points) {
         auto p = value.toObject(); p["x"] = p["x"].toDouble()*sx; p["y"] = p["y"].toDouble()*sy;
+        if(p.contains("origin_x")){p["origin_x"]=p["origin_x"].toDouble()*sx;p["origin_y"]=p["origin_y"].toDouble()*sy;}
         result.append(p);
     }
     return result;
@@ -29,7 +36,9 @@ inline QJsonArray transformed(const QJsonArray& points, const cv::Mat& H) {
     cv::perspectiveTransform(positions,positions,H);
     QJsonArray result;
     for (int i=0;i<points.size();++i) {
-        auto p=points[i].toObject(); p["x"]=positions[i].x; p["y"]=positions[i].y; result.append(p);
+        auto p=points[i].toObject(); p["x"]=positions[i].x; p["y"]=positions[i].y;
+        if(p.contains("origin_x")) {std::vector<cv::Point2f> o{origin(p,{})};cv::perspectiveTransform(o,o,H);p["origin_x"]=o[0].x;p["origin_y"]=o[0].y;}
+        result.append(p);
     }
     return result;
 }
@@ -44,6 +53,11 @@ inline bool valid(const QJsonArray& points, int width, int height, cv::Point2f c
         if (!std::isfinite(x) || !std::isfinite(y) || !std::isfinite(r) || x<0 || x>=width || y<0 || y>=height ||
             r<0 || r>1 || r<=previous || std::hypot(x-center.x,y-center.y)<2) return false;
         previous=r;
+        if(p.contains("origin_x")||p.contains("origin_y")) {
+            if(!p["origin_x"].isDouble()||!p["origin_y"].isDouble())return false;
+            const auto o=origin(p,center);
+            if(!std::isfinite(o.x)||!std::isfinite(o.y)||o.x<0||o.x>=width||o.y<0||o.y>=height||std::hypot(x-o.x,y-o.y)<2)return false;
+        }
     }
     return points.first().toObject()["ratio"].toDouble()==0 && points.last().toObject()["ratio"].toDouble()==1;
 }
@@ -60,9 +74,11 @@ inline bool build(const QJsonArray& points, cv::Point2f center, const cv::Mat& H
     }
     if (transformed.size()<2) return false;
     if (!H.empty()) cv::perspectiveTransform(transformed,transformed,H);
-    for (auto p : transformed) {
-        if (!std::isfinite(p.x) || !std::isfinite(p.y) || cv::norm(p-center)<2) return false;
-        double a=std::atan2(p.y-center.y,p.x-center.x)*180/CV_PI;
+    for (size_t i=0;i<transformed.size();++i) {
+        const auto p=transformed[i];auto o=origin(points[int(i)].toObject(),center);
+        if(points[int(i)].toObject().contains("origin_x")&&!H.empty()) {std::vector<cv::Point2f> origins{o};cv::perspectiveTransform(origins,origins,H);o=origins[0];}
+        if (!std::isfinite(p.x) || !std::isfinite(p.y) || !std::isfinite(o.x)||!std::isfinite(o.y)||cv::norm(p-o)<2) return false;
+        double a=std::atan2(p.y-o.y,p.x-o.x)*180/CV_PI;
         result.angles.push_back(std::fmod(a+360,360));
     }
     double previous=-1;

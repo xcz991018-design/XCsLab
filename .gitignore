@@ -76,3 +76,4 @@ Testing/
 /test_outputs/
 /capture-test-*/
 /template-test-*/
+__pycache__/

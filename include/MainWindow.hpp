@@ -215,6 +215,8 @@ private:
 
     // Original capture and final recognition image displays
     QLabel *m_originalImage{nullptr};
+    QLabel *m_undistortedImage{nullptr};
+    QLabel *m_rectifiedImage{nullptr};
     QLabel *m_recognitionImage{nullptr};
 
     // Bottom System Log Console

@@ -23,12 +23,14 @@ struct DeviceArchiveSummary {
                 device.isOnline ? QObject::tr("在线") : QObject::tr("离线"), text(device.lastSeenTime));
         result.location = QObject::tr("安装点位：%1\n设备标签：%2\n安装位置：%3")
             .arg(text(device.installationLocation), text(device.deviceTag), text(device.installationPosition));
-        result.specification = QObject::tr("表计模板：%1\n生产厂家：%2")
-            .arg(text(device.defaultProfileId), text(device.manufacturer));
+        result.specification = QObject::tr("生产厂家：%1").arg(text(device.manufacturer));
+        if(device.meterRange["min_val"].isDouble()&&device.meterRange["max_val"].isDouble())
+            result.specification+=QObject::tr("\n表计量程：%1 ～ %2 %3（OCR 标定）")
+                .arg(device.meterRange["min_val"].toDouble()).arg(device.meterRange["max_val"].toDouble()).arg(device.meterRange["unit"].toString("MPa"));
         const auto& range = device.safeWorkingRange;
         if (!range.valid()) result.safety = QObject::tr("安全范围检查：%1\n安全工作范围：待配置或配置无效")
             .arg(range.enabled ? QObject::tr("已启用") : QObject::tr("未启用"));
-        else result.safety = QObject::tr("安全范围检查：%1\n正常工作范围：[%2，%3]（单位与表计模板一致）")
+        else result.safety = QObject::tr("安全范围检查：%1\n正常工作范围：[%2，%3]（单位与表计量程一致）")
             .arg(range.enabled ? QObject::tr("已启用") : QObject::tr("未启用"))
             .arg(range.normalMin, 0, 'f', 3).arg(range.normalMax, 0, 'f', 3);
         result.calibration = hasSavedDeviceCalibration(deviceToJson(device).value("calibration").toObject()) ?

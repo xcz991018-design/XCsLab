@@ -34,6 +34,7 @@ struct GaugeResult {
 
     // 4 Main Pipeline Stage Images (原图 - 矫正 - 灰度图 - 识别)
     cv::Mat step1_original;       // Step 1: Raw input original frame
+    cv::Mat undistortedImage;     // Lens correction before four-point rectification
     cv::Mat step2_rectified;      // Step 2: Rectified front-view dial image
     cv::Mat step3_gray;   // Step 3: Actual grayscale detector input (BGR for display)
     cv::Mat step4_recognition;    // Step 4: Final recognition overlay result image
@@ -67,18 +68,19 @@ public:
     ~GaugeReaderEngine() = default;
 
     /**
-     * @brief Process an input gauge frame (4 steps: Original -> FOV Correction -> Grayscale -> Recognition).
+     * @brief Process a raw frame: lens undistortion -> FOV correction -> grayscale -> recognition.
+     * Saved profile annotations use raw pixels; conversion uses a private copy.
      */
     GaugeResult process(const cv::Mat& frame, GaugeProfile& profile,
                         GaugeRunMode mode = GaugeRunMode::Debug);
 
     /**
-     * @brief Rectify perspective distortion using 4 cardinal tangent points (12H Top, 3H Right, 6H Bottom, 9H Left).
+     * @brief Apply a homography represented by 4 editable mapping handles (Top, Right, Bottom, Left).
      */
     cv::Mat rectifyPerspective(const cv::Mat& src, const std::vector<cv::Point2f>& quadPts, cv::Mat& invH, int outSize = 800, int margin = 40);
 
     /**
-     * @brief Automatically detect dial rim 4 cardinal points (Top, Right, Bottom, Left) matching fov_corrector.py algorithm.
+     * @brief Estimate dial-plane geometry from the rim and reliable printed graduations; return equivalent mapping handles.
      */
     static std::vector<cv::Point2f> autoDetectCardinalPoints(const cv::Mat& image);
 

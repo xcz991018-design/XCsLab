@@ -57,6 +57,7 @@ DiscoveredCameraItem deviceFromJson(const QJsonObject& obj) {
     QJsonObject calObj = obj.contains("calibration") ? obj["calibration"].toObject() : obj;
     item.hasCalibration = hasSavedDeviceCalibration(calObj);
     item.scalePoints = calObj["scale_points"].toArray();
+    item.meterRange = calObj["meter_range"].toObject();
     item.perspectiveEnabled = calObj.value("perspective_correction_enabled").toBool(false);
     item.calibratedWidth = calObj.value("calibrated_width").toInt(0);
     item.calibratedHeight = calObj.value("calibrated_height").toInt(0);
@@ -120,6 +121,7 @@ QJsonObject deviceToJson(const DiscoveredCameraItem& item, bool includeSecrets) 
     calObj["center_y"] = item.centerY;
     calObj["pointer_base_radius"] = item.pointerBaseRadius;
     calObj["calibration_confirmed"] = item.hasCalibration;
+    if(!item.meterRange.isEmpty())calObj["meter_range"] = item.meterRange;
     if (!item.scalePoints.isEmpty()) calObj["scale_points"] = item.scalePoints;
     if (item.hasCalibration) obj["calibration"] = calObj;
 

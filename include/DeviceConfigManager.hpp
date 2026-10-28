@@ -46,7 +46,7 @@ public:
                                  double cx, double cy,
                                  double baseRadius,
                                  bool autoSave = true,
-                                 const QJsonArray& scalePoints = {});
+                                 const QJsonArray& scalePoints = {}, const QJsonObject& meterRange = {});
 
     QString getConfigPath() const { return m_currentFilePath; }
     static QString resolveConfigPath(const QString& preferredPath = "");

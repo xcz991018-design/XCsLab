@@ -430,7 +430,7 @@ void DeviceConfigManager::updateDeviceCalibration(const QString& cameraId,
                                                    double cx, double cy,
                                                    double baseRadius,
                                                    bool autoSave,
-                                                   const QJsonArray& scalePoints) {
+                                                   const QJsonArray& scalePoints, const QJsonObject& meterRange) {
     bool found = false;
     {
         QMutexLocker locker(&m_mutex);
@@ -447,6 +447,7 @@ void DeviceConfigManager::updateDeviceCalibration(const QString& cameraId,
             item.centerX = cx; item.centerY = cy;
             item.pointerBaseRadius = baseRadius;
             item.scalePoints = scalePoints;
+            if(!meterRange.isEmpty())item.meterRange = meterRange;
             found = true;
         }
     }

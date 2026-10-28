@@ -233,7 +233,7 @@ int main(int argc, char** argv) {
             for (const auto& value : registry["devices"].toArray()) {
                 const auto object = value.toObject();
                 const auto id = object["default_profile_id"].toString();
-                if (!ids.contains(id)) {
+                if (!id.isEmpty()&&!ids.contains(id)) {
                     ++missing;
                     QTextStream(stderr) << "Missing template: " << id << "\n";
                 }

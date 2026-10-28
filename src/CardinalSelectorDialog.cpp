@@ -4,6 +4,7 @@
 #include <QtConcurrent/QtConcurrent>
 #include "CardinalSelectorDialog.hpp"
 #include "GaugeReaderEngine.hpp"
+#include "CameraUndistortion.hpp"
 #include "DeviceConfigManager.hpp"
 #include <QPainter>
 #include <QMessageBox>
@@ -17,6 +18,8 @@
 #include <cmath>
 #include "ScaleCalibration.hpp"
 #include "AutoDialCalibration.hpp"
+#include "PaddleScaleOcr.hpp"
+#include "OcrDialRange.hpp"
 #include <algorithm>
 
 namespace {
@@ -36,6 +39,7 @@ InteractiveImageLabel::InteractiveImageLabel(QWidget *parent) : QLabel(parent) {
 
 void InteractiveImageLabel::setImageAndPoints(const cv::Mat& mat, const std::vector<cv::Point2f>& pts, const cv::Point2f& centerPt) {
     m_origImage = mat.clone();
+    m_ocrNumbers={};
     m_pts = pts;
     if (!m_rectifiedMode && m_pts.size() != 4 && !mat.empty()) {
         m_pts = editableCardinalPlaceholders(mat);
@@ -174,9 +178,11 @@ void InteractiveImageLabel::paintEvent(QPaintEvent *event) {
         painter.setPen(QPen(color,selected?3:1.5)); painter.setBrush(color);
         const double ratio=p["ratio"].toDouble();
         const bool labelled=m_scalePoints.size()<=20 || std::abs(ratio*10-std::round(ratio*10))<1e-7;
-        if(labelled||selected) painter.drawLine(mapToCanvas(m_centerPt),cp);
+        if(labelled||selected) painter.drawLine(mapToCanvas(ScaleCalibration::origin(p,m_centerPt)),cp);
         painter.drawEllipse(cp,selected?5:3,selected?5:3);
-        if(labelled||selected) painter.drawText(cp+QPointF(7,-7),tr("%1% 刻度%2").arg(ratio*100,0,'f',1).arg(selected?tr("（已选中，可删除）"):QString()));
+        if(labelled||selected) painter.drawText(cp+QPointF(7,-7),(m_hasScaleRange?
+            tr("%1 刻度%2").arg(m_rangeMinimum+ratio*(m_rangeMaximum-m_rangeMinimum),0,'g',6):
+            tr("%1% 刻度%2").arg(ratio*100,0,'f',1)).arg(selected?tr("（已选中，可删除）"):QString()));
     }
     // Draw 5th point (Dial Center Pin 🎯)
     if (m_centerPt.x > 0 && m_centerPt.y > 0) {
@@ -222,6 +228,26 @@ void InteractiveImageLabel::paintEvent(QPaintEvent *event) {
             painter.drawText(centerCp + QPointF(baseR_canvas + 3, 3), rStr);
         }
     }
+    // OCR is an inspection overlay, independent of calibration geometry and hit testing.
+    painter.save();painter.setClipRect(QRect(m_offsetX,m_offsetY,dispW,dispH));
+    QFont ocrFont=painter.font();ocrFont.setPixelSize(14);ocrFont.setBold(true);painter.setFont(ocrFont);
+    for(const auto& entry:m_ocrNumbers) {
+        const auto number=entry.toObject();QPolygonF polygon;
+        for(const auto& vertex:number["polygon"].toArray()) {
+            const auto point=vertex.toArray();polygon<<mapToCanvas({float(point[0].toDouble()),float(point[1].toDouble())});
+        }
+        if(polygon.size()!=4)continue;
+        painter.setPen(QPen(QColor("#00e5ff"),2));painter.setBrush(Qt::NoBrush);painter.drawPolygon(polygon);
+        const auto text=tr("%1  %2%").arg(number["text"].toString()).arg(number["score"].toDouble()*100,0,'f',0);
+        const auto bounds=polygon.boundingRect();
+        const auto metrics=painter.fontMetrics();
+        const double width=metrics.horizontalAdvance(text)+10,height=metrics.height()+6;
+        const double x=std::max(double(m_offsetX),std::min(bounds.left(),m_offsetX+dispW-width));
+        const double y=std::max(double(m_offsetY),bounds.top()-height-1);
+        const QRectF caption(x,y,width,height);
+        painter.fillRect(caption,QColor(0,25,35,225));painter.drawText(QPointF(x+5,y+3+metrics.ascent()),text);
+    }
+    painter.restore();
 }
 
 void InteractiveImageLabel::mousePressEvent(QMouseEvent *event) {
@@ -277,10 +303,10 @@ void InteractiveImageLabel::mousePressEvent(QMouseEvent *event) {
         }
     }
     // Select the nearest intermediate ray, avoiding the crowded area at the hub.
-    const QPointF center=mapToCanvas(m_centerPt);
     double nearest=7;
     if(m_centerPt.x>=0&&m_centerPt.y>=0)for(int i=0;i<m_scalePoints.size();++i) {
         const auto point=m_scalePoints[i].toObject();
+        const QPointF center=mapToCanvas(ScaleCalibration::origin(point,m_centerPt));
         const double ratio=point["ratio"].toDouble();
         if(ratio<=0||ratio>=1)continue;
         const QPointF end=mapToCanvas({float(point["x"].toDouble()),float(point["y"].toDouble())});
@@ -329,15 +355,22 @@ void InteractiveImageLabel::mouseReleaseEvent(QMouseEvent *event) {
 // ---------------- CardinalSelectorDialog ----------------
 
 CardinalSelectorDialog::CardinalSelectorDialog(const cv::Mat& frame, GaugeProfile& profile, const QString& cameraId, QWidget *parent, bool historicalSession)
-    : QDialog(parent), m_frame(frame.clone()), m_profile(profile), m_cameraId(cameraId) {
+    : QDialog(parent), m_rawFrame(frame.clone()), m_frame(CameraUndistortion::image(frame)), m_profile(profile), m_cameraId(cameraId) {
     m_historicalSession = historicalSession;
     m_automaticReviewMode=!historicalSession;
-    m_sourceCenter=profile.center; m_sourceScalePoints=profile.scalePoints;
+    m_sourceCenter=CameraUndistortion::point(profile.center, m_frame.size());
+    m_sourceScalePoints=CameraUndistortion::scales(profile.scalePoints, m_frame.size());
+    const auto correctedPoints=CameraUndistortion::points(profile.perspective_pts, m_frame.size());
     setupUi();
+    m_rangeConfirmed=m_historicalSession||!m_profile.parent_model_path.empty();
+    if(!m_cameraId.isEmpty()) {
+        const auto device=DeviceConfigManager::instance().getDevice(m_cameraId);
+        m_rangeConfirmed=m_rangeConfirmed||OcrDialRange::valid(device.meterRange)||!device.defaultProfileId.isEmpty();
+    }
 
-    bool ptsValid = (m_profile.perspective_pts.size() == 4);
+    bool ptsValid = (correctedPoints.size() == 4);
     if (ptsValid) {
-        for (const auto& p : m_profile.perspective_pts) {
+        for (const auto& p : correctedPoints) {
             if (p.x <= 0 || p.x >= m_frame.cols || p.y <= 0 || p.y >= m_frame.rows) {
                 ptsValid = false;
                 break;
@@ -346,7 +379,7 @@ CardinalSelectorDialog::CardinalSelectorDialog(const cv::Mat& frame, GaugeProfil
     }
 
     if (ptsValid) {
-        m_currentPts = m_profile.perspective_pts;
+        m_currentPts = correctedPoints;
     } else {
         m_currentPts=editableCardinalPlaceholders(m_frame);
     }
@@ -359,7 +392,7 @@ CardinalSelectorDialog::CardinalSelectorDialog(const cv::Mat& frame, GaugeProfil
     }
     updatePreview();
     if (ptsValid && cv::isContourConvex(m_currentPts) &&
-        ScaleCalibration::valid(m_profile.scalePoints,m_frame.cols,m_frame.rows,m_profile.center))
+        ScaleCalibration::valid(m_sourceScalePoints,m_frame.cols,m_frame.rows,m_sourceCenter))
         onConfirmPerspective(); // Existing completed calibration is editable immediately.
     if(!m_historicalSession) {
         setManualEditing(false);
@@ -402,7 +435,7 @@ void CardinalSelectorDialog::setupUi() {
     // Left: Interactive Selector
     QVBoxLayout *leftLayout = new QVBoxLayout();
     auto* originalHeader=new QHBoxLayout();
-    originalHeader->addWidget(new QLabel(tr("<b>原图定位与初始校正（支持自动）</b>"), this));
+    originalHeader->addWidget(new QLabel(tr("<b>表盘多特征定位与透视矫正（支持手动修正）</b>"), this));
     originalHeader->addStretch();
     auto* exportOriginal=new QPushButton(tr("保存标定原图"),this);
     exportOriginal->setObjectName("exportCalibrationOriginalButton");
@@ -414,13 +447,14 @@ void CardinalSelectorDialog::setupUi() {
         if(path.isEmpty())return;
         std::vector<uchar> encoded;
         try {
-            if(!cv::imencode(".png",m_frame,encoded)) {m_saveStatus->setText(tr("标定原图编码失败。"));return;}
+            if(!cv::imencode(".png",m_rawFrame,encoded)) {m_saveStatus->setText(tr("标定原图编码失败。"));return;}
         } catch(const cv::Exception&) {m_saveStatus->setText(tr("标定原图编码失败。"));return;}
         QFile output(path);
         if(!output.open(QIODevice::WriteOnly)||output.write(reinterpret_cast<const char*>(encoded.data()),qint64(encoded.size()))!=qint64(encoded.size())) {
             m_saveStatus->setText(tr("标定原图保存失败：%1").arg(output.errorString()));return;
         }
-        m_saveStatus->setText(tr("已保存本次标定实际原图（%1×%2）：%3").arg(m_frame.cols).arg(m_frame.rows).arg(path));
+        const auto saved=tr("已保存本次标定实际原图（%1×%2）：%3").arg(m_frame.cols).arg(m_frame.rows).arg(path);
+        m_saveStatus->setText((m_automaticAttemptFailed?tr("本次自动定位未通过，当前四点为保留的旧标定，并非本次自动结果。\n"):QString())+saved);
     });
     m_interactiveLabel = new InteractiveImageLabel(this);
     leftLayout->addWidget(m_interactiveLabel, 1);
@@ -440,6 +474,28 @@ void CardinalSelectorDialog::setupUi() {
     contentLayout->addLayout(rightLayout, 1);
 
     mainLayout->addLayout(contentLayout, 1);
+
+    auto* autoScaleLayout=new QHBoxLayout;
+    m_autoScaleBtn=new QPushButton(tr("识别表盘数字（PaddleOCR）"),this);
+    m_autoScaleBtn->setObjectName("autoCalibrateScaleButton");
+    m_autoScaleBtn->setToolTip(tr("识别左下、右下数字设置量程，并在数字外侧寻找真实大刻度线，自动标定起止角度；结果可手动修正。"));
+    autoScaleLayout->addWidget(m_autoScaleBtn);
+    auto* scaleHint=new QLabel(tr("自动匹配各数字对应的长刻度；结果可手动修正"),this);
+    scaleHint->setWordWrap(true);
+    autoScaleLayout->addWidget(scaleHint);autoScaleLayout->addStretch();
+    mainLayout->addLayout(autoScaleLayout);
+    auto* rangeLayout=new QHBoxLayout;
+    rangeLayout->addWidget(new QLabel(tr("OCR 量程（左下 → 右下）"),this));
+    m_rangeMinimum=new QDoubleSpinBox(this);m_rangeMaximum=new QDoubleSpinBox(this);
+    m_rangeMinimum->setObjectName("ocrRangeMinimum");m_rangeMaximum->setObjectName("ocrRangeMaximum");
+    for(auto* spin:{m_rangeMinimum,m_rangeMaximum}) {spin->setDecimals(6);spin->setRange(-1e9,1e9);rangeLayout->addWidget(spin);}
+    m_rangeMinimum->setValue(m_profile.min_val);m_rangeMaximum->setValue(m_profile.max_val);
+    const auto updateRangeLabels=[this]{m_previewLabel->setScaleRange(m_rangeMinimum->value(),m_rangeMaximum->value());};
+    for(auto* spin:{m_rangeMinimum,m_rangeMaximum})connect(spin,QOverload<double>::of(&QDoubleSpinBox::valueChanged),this,[updateRangeLabels](double){updateRangeLabels();});
+    updateRangeLabels();
+    rangeLayout->addWidget(new QLabel(QString::fromStdString(m_profile.unit)+tr("；识别后可修正，保存标定时生效"),this));
+    mainLayout->addLayout(rangeLayout);
+    connect(m_autoScaleBtn,&QPushButton::clicked,this,&CardinalSelectorDialog::onAutoScaleCalibration);
 
     m_scaleStatus = new QLabel(this);
     m_scaleStatus->setWordWrap(true);
@@ -526,13 +582,16 @@ void CardinalSelectorDialog::setupUi() {
         m_liquidNote=tr("请在右侧图中点击液面左、右两端；完成后继续手动标定刻度。");updatePreview();
     });
     connect(m_liquidMaskEnabled,&QCheckBox::toggled,this,[this](bool enabled){
-
+        if(m_autoEndpointCalibration){m_autoEndpointCalibration=false;m_endpointReviewRequired=true;}
         m_previewLabel->showLiquidMask(enabled);
         m_liquidNote=enabled?tr("将显示液面及以上影响区域；无可靠液面时可手动指定。"):tr("已关闭液面屏蔽；请确认该表盘无需屏蔽液面。");updatePreview();
+        if(m_endpointReviewRequired)m_saveStatus->setText(tr("液面屏蔽范围已改变，请重新识别表盘数字，或手动修正刻度后保存。"));
     });
     connect(m_previewLabel,&InteractiveImageLabel::liquidSurfaceChanged,this,[this]{
+        if(m_autoEndpointCalibration){m_autoEndpointCalibration=false;m_endpointReviewRequired=true;}
         m_manualLiquidSurface=true;
         m_liquidNote=tr("已手动设置液面，上方含缓冲区为影响区域，请据此选择可靠刻度。");updatePreview();
+        if(m_endpointReviewRequired)m_saveStatus->setText(tr("液面位置已改变，请重新识别表盘数字，或手动修正刻度后保存。"));
     });
     mainLayout->addWidget(m_liquidControls);
     m_liquidControls->setEnabled(false);
@@ -587,7 +646,7 @@ void CardinalSelectorDialog::setupUi() {
     m_scaleControls->setEnabled(false);
     m_baseRadiusSpinBox->setEnabled(false);
     m_saveBtn->setEnabled(false);
-    m_saveStatus = new QLabel(tr("设备: %1；底图已冻结，请先确认原图四切点，再在矫正图完成后续标定。").arg(m_cameraId), this);
+    m_saveStatus = new QLabel(tr("设备: %1；快照已冻结并完成镜头去畸变，请先确认左图四切点，再在透视矫正图完成后续标定。").arg(m_cameraId), this);
     m_saveStatus->setObjectName("calibrationSaveStatus");
     if (m_historicalSession) m_saveStatus->setText(tr("请根据这张历史原图重新标定；仅用于本次分析，不更新相机档案。取消后不进行识别。"));
     m_saveStatus->setWordWrap(true);
@@ -600,7 +659,10 @@ void CardinalSelectorDialog::setupUi() {
         updatePreview();
     });
     connect(m_confirmPerspectiveBtn,&QPushButton::clicked,this,&CardinalSelectorDialog::onConfirmPerspective);
-    connect(m_previewLabel,&InteractiveImageLabel::pointsChanged,this,&CardinalSelectorDialog::updatePreview);
+    connect(m_previewLabel,&InteractiveImageLabel::pointsChanged,this,[this]{
+        // An explicit manual annotation is the user's correction of the result.
+        m_autoEndpointCalibration=false;m_endpointReviewRequired=false;updatePreview();
+    });
     connect(m_previewLabel,&InteractiveImageLabel::centerClicked,this,[this]{
         m_centerConfirmed=true;
 
@@ -631,6 +693,8 @@ void CardinalSelectorDialog::setManualEditing(bool enabled) {
 
 void CardinalSelectorDialog::onPointsUpdated() {
     if(m_saving || m_autoDetectRunning)return;
+    m_graduationSourceCenter={-1,-1};
+    if(m_autoEndpointCalibration) {m_endpointReviewRequired=true;m_autoEndpointCalibration=false;}
     // Preserve annotations in source pixels before replacing the homography.
     if(m_perspectiveConfirmed && !m_inverseHomography.empty()) {
         const auto annotations=sourceAnnotations();
@@ -652,6 +716,7 @@ void CardinalSelectorDialog::onPointsUpdated() {
         }
         updatePreview();
         m_saveStatus->setText(tr("切点已调整，右侧矫正预览已同步更新。请复核轴心、刻度及液面后保存。"));
+        if(m_endpointReviewRequired)m_saveStatus->setText(tr("四切点已改变，旧自动端点不再作为有效结果。请重新识别表盘数字，或手动修正刻度后保存。"));
     } else {
         m_scaleControls->setEnabled(false);m_liquidControls->setEnabled(false);
         m_previewLabel->setEnabled(false);m_baseRadiusSpinBox->setEnabled(false);
@@ -711,6 +776,7 @@ void CardinalSelectorDialog::onConfirmPerspective() {
 }
 
 void CardinalSelectorDialog::updatePreview() {
+    m_autoScaleBtn->setEnabled(!m_saving&&!m_autoDetectRunning&&m_perspectiveConfirmed);
     m_confirmPerspectiveBtn->setVisible(!m_automaticReviewMode&&!m_perspectiveConfirmed);
     m_scaleStatus->setVisible(!m_automaticReviewMode);
     m_geometryStatus->setVisible(!m_automaticReviewMode);
@@ -768,28 +834,30 @@ void CardinalSelectorDialog::updatePreview() {
         m_geometryAcknowledged->setChecked(false); m_geometryReviewSignature=signature;
     }
     m_geometryAcknowledged->setVisible(!m_automaticReviewMode && valid && !issues.isEmpty());
-    m_saveBtn->setEnabled(valid && !m_saving && (!m_automaticReviewMode || !m_automaticAttemptFailed) &&
+    m_saveBtn->setEnabled(valid && !m_endpointReviewRequired && !m_saving && !m_autoDetectRunning && (!m_automaticReviewMode || !m_automaticAttemptFailed) &&
         (m_automaticReviewMode || issues.isEmpty() || m_geometryAcknowledged->isChecked()));
     m_scaleStatus->setText(valid ? tr("已标定 %1 个刻度点；量程 %2～%3 %4，方向：%5。请检查矫正图射线后保存。")
-        .arg(scales.size()).arg(m_profile.min_val).arg(m_profile.max_val).arg(QString::fromStdString(m_profile.unit))
+        .arg(scales.size()).arg(m_rangeMinimum->value()).arg(m_rangeMaximum->value()).arg(QString::fromStdString(m_profile.unit))
         .arg(m_profile.clockwise?tr("顺时针"):tr("逆时针")) : m_centerConfirmed
-            ?tr("自动校正与页面检测完成，请手动标定刻度")
-            :tr("请在矫正图点击轴心，再标定最小、最大刻度；中间点须按数值增长方向排列。"));
+            ?tr("轴心已确认，可识别表盘数字，或手动标定刻度。")
+            :tr("可先识别表盘数字；手动标定最小、最大及中间刻度前，请在矫正图确认轴心。"));
 }
 
 void CardinalSelectorDialog::onDetectLiquidSurface() {
     if(m_saving || !m_perspectiveConfirmed)return;
     if(!m_centerConfirmed){m_scaleStatus->setText(tr("请先在右侧图中确认指针轴心。"));return;}
+    if(m_autoEndpointCalibration){m_autoEndpointCalibration=false;m_endpointReviewRequired=true;}
 
     GaugeReaderEngine engine;cv::Mat inverse;
     const auto rectified=engine.rectifyPerspective(m_frame,m_currentPts,inverse,m_profile.rectified_size,m_profile.rectified_margin);
     const auto surface=detectLiquidSurface(rectified,m_previewLabel->getCenterPoint(),m_profile.rectified_size*.5-m_profile.rectified_margin);
     m_previewLabel->setLiquidSurface(surface);m_previewLabel->showLiquidMask(m_liquidMaskEnabled->isChecked());
 
-    m_liquidNote=surface.found?tr("已检测液面：橙色为液面影响区域（含边界缓冲），刻度请手动标定。"):
+    m_liquidNote=surface.found?tr("已检测液面：橙色为液面影响区域（含边界缓冲），仅匹配下方数字与长刻度。"):
         surface.ambiguous?tr("存在多条可能的液面，请手动调整液面，或确认无液面后关闭显示。"):
         tr("未检测到可靠液面，请手动指定液面；无液体表盘可关闭液面显示。");
     updatePreview();
+    if(m_endpointReviewRequired)m_saveStatus->setText(tr("液面已重新检测，请重新识别表盘数字，或手动修正刻度后保存。"));
 }
 
 void CardinalSelectorDialog::setAutoDetectionBusy(bool busy) {
@@ -797,6 +865,8 @@ void CardinalSelectorDialog::setAutoDetectionBusy(bool busy) {
     m_autoProgress->setVisible(busy);
     m_autoProgressLabel->setVisible(busy);
     m_autoBtn->setEnabled(!busy);
+    m_autoScaleBtn->setEnabled(!busy&&m_perspectiveConfirmed);
+    m_rangeMinimum->setEnabled(!busy);m_rangeMaximum->setEnabled(!busy);
     m_confirmPerspectiveBtn->setEnabled(!busy);
     m_manualEditBtn->setEnabled(!busy);
     m_scaleControls->setEnabled(!busy&&m_perspectiveConfirmed);
@@ -810,6 +880,88 @@ void CardinalSelectorDialog::setAutoDetectionBusy(bool busy) {
 
 void CardinalSelectorDialog::onAutoDetect() {
     startAutoDetection(false);
+}
+
+void CardinalSelectorDialog::onAutoScaleCalibration() {
+    if(m_saving||m_autoDetectRunning||!m_perspectiveConfirmed)return;
+    cv::Mat rectified;
+    try {
+        GaugeReaderEngine engine;cv::Mat inverse;
+        rectified=engine.rectifyPerspective(m_frame,m_currentPts,inverse,m_profile.rectified_size,m_profile.rectified_margin).clone();
+    } catch(const cv::Exception& error) {m_saveStatus->setText(QString::fromUtf8(error.what()));return;}
+    if(rectified.empty())return;
+    auto cancelled=std::make_shared<std::atomic_bool>(false);
+    // Closing the dialog interrupts the worker process; no GUI objects enter the worker.
+    connect(this,&QDialog::finished,this,[cancelled]{cancelled->store(true);});
+    connect(this,&QObject::destroyed,[cancelled]{cancelled->store(true);});
+    m_previewLabel->selectScaleRatio(-1);
+    m_previewLabel->setOcrNumbers({});
+    setAutoDetectionBusy(true);
+    m_autoProgressLabel->setText(tr("正在识别数字并匹配各数值的长刻度线…可点击取消关闭。"));
+    m_saveStatus->setText(tr("正在识别数字，完成后在右图显示数字框和置信度。"));
+    auto center=m_previewLabel->getCenterPoint();
+    if(center.x<0||center.y<0)center=cv::Point2f(rectified.cols*.5f,rectified.rows*.5f);
+    auto scaleCenter=center;
+    if(m_graduationSourceCenter.x>=0&&!m_inverseHomography.empty()) {
+        std::vector<cv::Point2f> origins{m_graduationSourceCenter};
+        cv::perspectiveTransform(origins,origins,m_inverseHomography.inv());scaleCenter=origins[0];
+    } else {
+        const auto existing=m_previewLabel->getScalePoints();
+        if(!existing.isEmpty())scaleCenter=ScaleCalibration::origin(existing.first().toObject(),center);
+    }
+    const auto surface=m_liquidMaskEnabled->isChecked()?m_previewLabel->liquidSurface():LiquidSurface{};
+    struct Analysis {PaddleScaleOcr::Recognition ocr;OcrDialRange::Calibration calibration;};
+    auto* watcher=new QFutureWatcher<Analysis>(this);
+    connect(watcher,&QFutureWatcher<Analysis>::finished,this,[this,watcher,center,size=rectified.cols,liquidExcluded=surface.found] {
+        const auto analysis=watcher->result();const auto& result=analysis.ocr;watcher->deleteLater();
+        setAutoDetectionBusy(false);
+        if(!result.valid()) {
+            updatePreview();
+            m_saveStatus->setText(tr("数字识别失败：%1 已保留原标定。").arg(result.error));return;
+        }
+        const auto numbers=PaddleScaleOcr::numericTokens(result.tokens);
+        const auto& range=analysis.calibration.range;
+        if(range.valid) {
+            m_rangeMinimum->setValue(range.minimum);m_rangeMaximum->setValue(range.maximum);m_rangeConfirmed=true;
+        }
+        m_previewLabel->setOcrNumbers(numbers);
+        QJsonArray merged;
+        const bool calibrated=OcrDialRange::mergeCalibration(m_previewLabel->getScalePoints(),analysis.calibration,center,size,m_profile.clockwise,merged);
+        if(calibrated) {
+            m_previewLabel->setScalePoints(merged);m_autoEndpointCalibration=true;m_endpointReviewRequired=false;
+        } else if(range.valid&&m_centerConfirmed) {
+            m_endpointReviewRequired=true;m_autoEndpointCalibration=false;
+        }
+        updatePreview();
+        m_saveStatus->setText(numbers.isEmpty()?tr("未识别到符合候选值的可靠数字，请检查候选列表和右图清晰度；已有标定点保留。"):
+            tr("识别到 %1 处数字：右图青色框显示识别结果及置信度，已有刻度点保持不变。").arg(numbers.size()));
+        m_saveStatus->setText(m_saveStatus->text()+(range.valid?
+            tr(" 已设置量程 %1 ～ %2 %3，可修正后保存。").arg(range.minimum).arg(range.maximum).arg(QString::fromStdString(m_profile.unit)):
+            tr(" 左下或右下端点缺失或有歧义，量程未修改，请检查识别结果。")));
+        if(calibrated) {
+            m_saveStatus->setText(tr("量程 %1 ～ %2 %3；%4 处刻度角度已自动标定（含起止和 %5 处中间数值，绿色射线）。可确认保存，也可手动修正。")
+                .arg(range.minimum).arg(range.maximum).arg(QString::fromStdString(m_profile.unit)).arg(analysis.calibration.points.size()).arg(analysis.calibration.points.size()-2));
+            if(liquidExcluded)m_saveStatus->setText(m_saveStatus->text()+tr(" 液面上方、边界缓冲区及跨界刻度已排除。"));
+            if(analysis.calibration.skipped)m_saveStatus->setText(m_saveStatus->text()+tr(" 另有 %1 处数字未找到可靠长刻度，未添加标定点。").arg(analysis.calibration.skipped));
+        }
+        else if(range.valid)m_saveStatus->setText(m_saveStatus->text()+
+            (analysis.calibration.valid()?tr(" 已有中间刻度与新匹配排列冲突，原刻度点保留，请手动修正。"):
+                tr(" 刻度角度未修改：%1").arg(analysis.calibration.error)));
+        else if(!range.valid&&!analysis.calibration.error.isEmpty())m_saveStatus->setText(m_saveStatus->text()+analysis.calibration.error);
+    });
+    const auto radius=m_profile.rectified_size*.5-m_profile.rectified_margin;
+    watcher->setFuture(QtConcurrent::run([rectified,cancelled,scaleCenter,surface,radius,clockwise=m_profile.clockwise,confirmed=m_centerConfirmed] {
+        Analysis analysis;analysis.ocr=PaddleScaleOcr::recognize(rectified,cancelled);
+        if(!analysis.ocr.valid()||cancelled->load())return analysis;
+        if(confirmed) {
+            try {
+                analysis.calibration=OcrDialRange::calibrate(rectified,analysis.ocr.tokens,scaleCenter,radius,clockwise,surface);
+            }
+            catch(const cv::Exception& error) {analysis.calibration.error=QString::fromUtf8(error.what());}
+        }
+        else analysis.calibration.error=QStringLiteral(u"请先确认轴心并识别两个端点数字。");
+        return analysis;
+    }));
 }
 
 void CardinalSelectorDialog::startAutoDetection(bool cornersOnly) {
@@ -833,14 +985,16 @@ void CardinalSelectorDialog::startAutoDetection(bool cornersOnly) {
         if(!result.valid()) {
             m_automaticAttemptFailed=true;
             setManualEditing(!m_automaticReviewMode);
-            m_saveStatus->setText(tr("自动定位未通过：%1 当前标定预览保留，可点击“手动修改”调整。").arg(result.error));
+            m_saveStatus->setText(tr("自动定位未通过：%1 当前四点为保留的旧标定，并非本次自动结果；可点击“手动修改”调整。").arg(result.error));
             return;
         }
         // Apply only on the GUI thread; the worker owns a frozen frame and settings.
+        if(m_autoEndpointCalibration) {m_endpointReviewRequired=true;m_autoEndpointCalibration=false;}
         const bool centerWasConfirmed=m_centerConfirmed;
         if(m_perspectiveConfirmed)onConfirmPerspective();
         if(!cornersOnly)m_sourceCenter=result.hub;
         m_currentPts=result.points;
+        m_graduationSourceCenter=result.graduationCenter;
         m_interactiveLabel->setImageAndPoints(m_frame,m_currentPts);
         updatePreview();onConfirmPerspective();
         if(!m_perspectiveConfirmed) {
@@ -858,17 +1012,26 @@ void CardinalSelectorDialog::startAutoDetection(bool cornersOnly) {
             const auto& surface=detection.surface;
             m_previewLabel->setLiquidSurface(surface);
             m_previewLabel->showLiquidMask(true);
-            m_liquidNote=surface.found?tr("已检测液面：橙色为液面影响区域（含边界缓冲），刻度请手动标定。"):
+            m_liquidNote=surface.found?tr("已检测液面：橙色为液面影响区域（含边界缓冲），仅匹配下方数字与长刻度。"):
                 surface.ambiguous?tr("存在多条可能的液面，请手动调整液面，或确认无液面后关闭显示。"):
                 tr("未检测到可靠液面，请手动指定液面；无液体表盘可关闭液面显示。");
         }
-        m_saveStatus->setText(tr("自动校正及中心检测完成：轮廓覆盖 %1%。请检查液面并手动标定刻度后保存。")
+        m_saveStatus->setText(tr("自动校正及中心检测完成：轮廓覆盖 %1%。请识别表盘数字，自动标定起止刻度后保存。")
             .arg(result.rimCoverage*100,0,'f',0));
+        if(result.graduationSupport>=24&&!result.structuralRectification)m_saveStatus->setText(m_saveStatus->text()+
+            tr(" 已结合 %1 组外围刻度边缘精修四切点。").arg(result.graduationSupport));
         setManualEditing(!m_automaticReviewMode);
         if(cornersOnly)
             m_saveStatus->setText(tr("切点检测完成，请复核轴心和刻度；需要检测液面时点击“重新检测液面”。"));
         else if(m_automaticReviewMode&&!m_saveBtn->isEnabled())
-            m_saveStatus->setText(tr("自动校正与液面检测已完成；请点击“手动修改”标定最小、最大刻度后确认。"));
+            m_saveStatus->setText(tr("自动校正与液面检测已完成；请点击“识别表盘数字”自动标定最小、最大刻度后确认。"));
+        if(result.graduationLiquidExcluded)m_saveStatus->setText(m_saveStatus->text()+
+            (result.graduationSupport>=24?tr(" 刻度环辅助精修已排除液面周边及液面以上区域。"):
+                tr(" 液面影响区域已排除；下方可靠刻度不足，保留表圈边缘定位结果。")));
+        else if(result.graduationLiquidAmbiguous)m_saveStatus->setText(m_saveStatus->text()+
+            tr(" 液面位置有歧义，已跳过刻度环辅助精修。"));
+        if(result.structuralRectification)m_saveStatus->setText(m_saveStatus->text()+
+            tr(" 已采用 %1 条刻度的平面矫正，并通过左右对称与270°跨度检查；左侧四点为可手动调整的映射控制点。").arg(result.structuralSupport));
     });
     const auto frame=m_frame.clone();
     const int size=m_profile.rectified_size;
@@ -922,13 +1085,16 @@ std::pair<cv::Point2f,QJsonArray> CardinalSelectorDialog::sourceAnnotations() co
 
 void CardinalSelectorDialog::onSaveAndApply() {
     if (m_saving || m_autoDetectRunning) return;
+    if(m_endpointReviewRequired) {
+        m_saveStatus->setText(tr("自动刻度尚未通过检查。请确认透视、轴心及液面后重新识别，或手动修正刻度，再保存标定。"));return;
+    }
     if(m_automaticReviewMode&&m_automaticAttemptFailed) {
         m_saveStatus->setText(tr("本次自动定位未通过，请先点击“手动修改”完成标定。"));return;
     }
     if (!m_perspectiveConfirmed || !m_centerConfirmed || m_inverseHomography.empty()) {
         m_saveStatus->setText(tr("请先确认四切点，并在矫正图点击轴心后完成刻度标定。")); return;
     }
-    const auto points=m_interactiveLabel->getPoints();
+    const auto points=CameraUndistortion::points(m_interactiveLabel->getPoints(),m_frame.size(),true);
     const auto rectifiedCenter=m_previewLabel->getCenterPoint();
     const auto rectifiedScales=m_previewLabel->getScalePoints();
     const auto radius=m_previewLabel->getPointerBaseRadius();
@@ -947,8 +1113,8 @@ void CardinalSelectorDialog::onSaveAndApply() {
         m_saveStatus->setText(tr("请先复核几何检查提示，并勾选确认使用这些标定点。"));return;
     }
     const auto annotations=sourceAnnotations();
-    const auto center=annotations.first;
-    const auto scales=annotations.second;
+    const auto center=CameraUndistortion::point(annotations.first,m_frame.size(),true);
+    const auto scales=CameraUndistortion::scales(annotations.second,m_frame.size(),true);
     QJsonObject calibration{{"perspective_correction_enabled", true},
         {"calibrated_width", m_frame.cols}, {"calibrated_height", m_frame.rows},
         {"center_x", center.x}, {"center_y", center.y}, {"pointer_base_radius", radius}};
@@ -957,11 +1123,19 @@ void CardinalSelectorDialog::onSaveAndApply() {
         calibration[QString("pt_%1_y").arg(i)] = points[i].y;
     }
     calibration["scale_points"] = scales;
+    if(!m_rangeConfirmed||m_rangeMinimum->value()>=m_rangeMaximum->value()) {
+        m_saveStatus->setText(tr("请先识别左下和右下端点数字，检查最小值小于最大值后保存。"));return;
+    }
+    const QJsonObject meterRange{{"min_val",m_rangeMinimum->value()},{"max_val",m_rangeMaximum->value()},
+        {"unit",QString::fromStdString(m_profile.unit)},{"source","ocr_endpoints"}};
+    calibration["meter_range"]=meterRange;
     if (!validDeviceCalibration(calibration) || m_cameraId.isEmpty()) {
         m_saveStatus->setText(tr("无法保存：请将四个切点按 12、3、6、9 点钟顺序放在图像内，并设置有效中心点。"));
         return;
     }
     if (m_historicalSession) {
+        m_profile.min_val=meterRange["min_val"].toDouble();m_profile.max_val=meterRange["max_val"].toDouble();
+        m_profile.spec.range_min=m_profile.min_val;m_profile.spec.range_max=m_profile.max_val;
         m_profile.scalePoints = scales;
         m_profile.perspective_pts = points;
         m_profile.perspective_correction_enabled = true;
@@ -972,6 +1146,8 @@ void CardinalSelectorDialog::onSaveAndApply() {
         return;
     }
     m_saving = true;
+    m_rangeMinimum->setEnabled(false);m_rangeMaximum->setEnabled(false);
+    m_autoScaleBtn->setEnabled(false);
     m_manualEditBtn->setEnabled(false);
     m_liquidControls->setEnabled(false);
     m_scaleControls->setEnabled(false);
@@ -983,9 +1159,10 @@ void CardinalSelectorDialog::onSaveAndApply() {
     m_autoBtn->setEnabled(false);
     m_saveBtn->setEnabled(false); m_cancelBtn->setEnabled(false);
     auto* watcher = new QFutureWatcher<QString>(this);
-    connect(watcher, &QFutureWatcher<QString>::finished, this, [this, watcher, points, center, radius, scales]() {
+    connect(watcher, &QFutureWatcher<QString>::finished, this, [this, watcher, points, center, radius, scales, meterRange]() {
         const auto error = watcher->result(); watcher->deleteLater();
         m_saving = false;
+        m_rangeMinimum->setEnabled(true);m_rangeMaximum->setEnabled(true);
         m_manualEditBtn->setEnabled(true);
         if (!error.isEmpty()) {
             m_saveStatus->setText(tr("数据库保存失败：%1；标定尚未保存，可重试。").arg(error));
@@ -999,7 +1176,9 @@ void CardinalSelectorDialog::onSaveAndApply() {
         }
         DeviceConfigManager::instance().updateDeviceCalibration(m_cameraId, true, m_frame.cols, m_frame.rows,
             points[0].x, points[0].y, points[1].x, points[1].y,
-            points[2].x, points[2].y, points[3].x, points[3].y, center.x, center.y, radius, false, scales);
+            points[2].x, points[2].y, points[3].x, points[3].y, center.x, center.y, radius, false, scales, meterRange);
+        m_profile.min_val=meterRange["min_val"].toDouble();m_profile.max_val=meterRange["max_val"].toDouble();
+        m_profile.spec.range_min=m_profile.min_val;m_profile.spec.range_max=m_profile.max_val;
         m_profile.scalePoints=scales;
         m_profile.perspective_pts = points;
         m_profile.perspective_correction_enabled = true;

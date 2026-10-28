@@ -5,6 +5,10 @@
 #include <cmath>
 
 inline bool validDeviceCalibration(const QJsonObject& data) {
+    if(data.contains("meter_range")) {
+        const auto range=data["meter_range"].toObject();const auto lo=range["min_val"],hi=range["max_val"];
+        if(!lo.isDouble()||!hi.isDouble()||!std::isfinite(lo.toDouble())||!std::isfinite(hi.toDouble())||lo.toDouble()>=hi.toDouble())return false;
+    }
     const int width = data["calibrated_width"].toInt();
     const int height = data["calibrated_height"].toInt();
     if (width <= 0 || height <= 0 || !data["perspective_correction_enabled"].toBool()) return false;

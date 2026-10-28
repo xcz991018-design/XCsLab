@@ -1,4 +1,5 @@
 #include "GaugeReaderEngine.hpp"
+#include "CameraUndistortion.hpp"
 #include "ScaleCalibration.hpp"
 #include "AutoDialCalibration.hpp"
 #include "RecognitionQuality.hpp"
@@ -144,7 +145,9 @@ cv::Mat GaugeReaderEngine::rectifyPerspective(const cv::Mat& src, const std::vec
     return rectified;
 }
 
-GaugeResult GaugeReaderEngine::process(const cv::Mat& frame, GaugeProfile& profile, GaugeRunMode mode) {
+GaugeResult GaugeReaderEngine::process(const cv::Mat& rawFrame, GaugeProfile& storedProfile, GaugeRunMode mode) {
+    // Work on a copy so repeated recognition never undistorts saved points twice.
+    GaugeProfile profile = storedProfile;
     GaugeResult res;
     using Clock = std::chrono::steady_clock;
     const auto engineStarted = Clock::now();
@@ -160,7 +163,7 @@ GaugeResult GaugeReaderEngine::process(const cv::Mat& frame, GaugeProfile& profi
     const bool evidence = mode != GaugeRunMode::Production;
     res.unit = profile.unit;
 
-    if (frame.empty()) {
+    if (rawFrame.empty()) {
         res.errorStep = "步骤 1: 原始采集图像 (Original Stream Frame)";
         res.errorMessage = "输入图像帧为空 (frame is empty)";
         res.detailedDebugInfo = "❌ [Pipeline Error] 摄像头或输入图像源未采集到有效图像帧 (cv::Mat::empty)。";
@@ -168,8 +171,17 @@ GaugeResult GaugeReaderEngine::process(const cv::Mat& frame, GaugeProfile& profi
     }
 
     // Step 1: 原图 (Original Frame)
-    if (evidence) res.step1_original = frame.clone();
+    if (evidence) res.step1_original = rawFrame.clone();
     if (debug) res.originalImage = res.step1_original;
+
+    const cv::Mat frame = CameraUndistortion::image(rawFrame);
+    if (evidence) res.undistortedImage = frame.clone();
+    const cv::Size annotationSize(profile.calibrated_width > 0 ? profile.calibrated_width : frame.cols,
+        profile.calibrated_height > 0 ? profile.calibrated_height : frame.rows);
+    profile.perspective_pts = CameraUndistortion::points(profile.perspective_pts, annotationSize);
+    profile.center = CameraUndistortion::point(profile.center, annotationSize);
+    profile.scalePoints = CameraUndistortion::scales(profile.scalePoints, annotationSize);
+    mark("undistortion_ms");
 
     if (profile.scalePoints.isEmpty()) {
         res.errorStep="Scale calibration";

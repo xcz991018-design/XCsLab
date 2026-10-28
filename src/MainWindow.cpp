@@ -128,6 +128,9 @@ MainWindow::MainWindow(QWidget *parent) : QMainWindow(parent) {
             m_hasAnalysisInput = !m_analysisInput.localImagePath.isEmpty() || !m_analysisInput.databaseOriginalTaskId.isEmpty();
             m_currentImagePath = m_analysisInput.localImagePath;
             updateImageCard(m_originalImage, m_currentFrame, "Task original");
+            updateImageCard(m_undistortedImage, {}, tr("去畸变图"));
+            updateImageCard(m_rectifiedImage, {}, tr("四切点透视矫正图"));
+            updateImageCard(m_recognitionImage, {}, tr("最终识别结果"));
         } else {
             m_currentFrame.release();
             m_currentImagePath.clear();
@@ -284,11 +287,6 @@ void MainWindow::setupUi() {
         emit logoutRequested();
     });
     databaseBar->addWidget(connectionButton);
-    auto* templateButton = new QPushButton(tr("表计模板管理"), centralWidget);
-    templateButton->setVisible(AccessControl::administrator());
-    templateButton->setObjectName("gaugeTemplateManagementButton");
-    databaseBar->addWidget(templateButton);
-    connect(templateButton, &QPushButton::clicked, this, &MainWindow::onManageGaugeTemplates);
     databaseBar->addWidget(historyButton);
     databaseBar->addWidget(m_databaseStatusLabel, 1);
     databaseBar->addWidget(accountsButton);
@@ -503,7 +501,7 @@ QWidget* MainWindow::createCenterVisionArea(QWidget *parent) {
     m_livePage = createLiveStreamStageArea(m_visionTabWidget);
     m_livePage->hide();
 
-    // --- Tab 1: 采集原图与最终识别结果 ---
+    // --- Tab 1: 原图、去畸变、透视矫正与识别结果 ---
     QScrollArea *tab1Scroll = new QScrollArea(m_visionTabWidget);
     tab1Scroll->setWidgetResizable(true);
     tab1Scroll->setStyleSheet("QScrollArea { border: none; background-color: #121216; }");
@@ -527,11 +525,14 @@ QWidget* MainWindow::createCenterVisionArea(QWidget *parent) {
     };
 
     gridLayout->addWidget(createImageCard(tr("采集原图"), m_originalImage), 0, 0);
-
-    gridLayout->addWidget(createImageCard(tr("最终识别结果"), m_recognitionImage), 0, 1);
+    gridLayout->addWidget(createImageCard(tr("去畸变图"), m_undistortedImage), 0, 1);
+    m_undistortedImage->setObjectName("undistortedImage");
+    gridLayout->addWidget(createImageCard(tr("四切点透视矫正图"), m_rectifiedImage), 1, 0);
+    gridLayout->addWidget(createImageCard(tr("最终识别结果"), m_recognitionImage), 1, 1);
     gridLayout->setColumnStretch(0, 1);
     gridLayout->setColumnStretch(1, 1);
     gridLayout->setRowStretch(0, 1);
+    gridLayout->setRowStretch(1, 1);
 
     tab1Scroll->setWidget(gridContainer);
     m_recognitionPage = tab1Scroll;
@@ -1226,6 +1227,8 @@ void MainWindow::selectCameraForDetails(const QString& camId) {
     m_valLabel->setText(tr("读取数值: --"));
     m_statusLabel->setText(tr("已选择设备档案；实时预览请通过右键菜单连接。"));
     updateImageCard(m_originalImage, cv::Mat(), "Original");
+    updateImageCard(m_undistortedImage, {}, tr("去畸变图"));
+    updateImageCard(m_rectifiedImage, {}, tr("四切点透视矫正图"));
     updateImageCard(m_recognitionImage, cv::Mat(), "Recognition");
     m_currentFrame.release();
     m_currentImagePath.clear();
@@ -1340,20 +1343,15 @@ void MainWindow::applyCameraCalibrationAndProfile(const QString& camId) {
     updateSelectedDeviceArchive(camId);
     const auto generation = ++m_profileGeneration;
     const auto profileId = m_discoveredItemsMap[camId].defaultProfileId;
-    if (profileId.isEmpty()) {
-        m_profileReady = false;
-        m_cfgRange->setText(tr("量程范围：请先在表计档案中选择模板"));
-        return;
-    }
     m_profileReady = false;
-    m_cfgRange->setText(tr("量程范围：正在读取数据库模板…"));
+    m_cfgRange->setText(tr("量程范围：正在读取设备配置…"));
     using ProfileReply = QPair<QJsonObject, QString>;
     auto* watcher = new QFutureWatcher<ProfileReply>(this);
     connect(watcher, &QFutureWatcher<ProfileReply>::finished, this, [this, watcher, camId, generation]() {
         const auto reply = watcher->result(); watcher->deleteLater();
         if (generation != m_profileGeneration || makeSingleTask().device.cameraId != camId) return;
         if (!reply.second.isEmpty() || !m_profile.loadFromJson(reply.first)) {
-            m_cfgRange->setText(tr("量程范围：数据库模板加载失败"));
+            m_cfgRange->setText(tr("量程范围：设备配置加载失败"));
             onLogReceived(tr("[TEMPLATE] %1").arg(reply.second));
             return;
         }
@@ -1378,6 +1376,11 @@ void MainWindow::applyCameraCalibrationAndProfile(const QString& camId) {
         cv::Point2f(static_cast<float>(item.pt3_x), static_cast<float>(item.pt3_y))
         };
         m_profile.scalePoints = item.scalePoints;
+        if(OcrDialRange::valid(item.meterRange)) {
+            m_profile.min_val=item.meterRange["min_val"].toDouble();m_profile.max_val=item.meterRange["max_val"].toDouble();
+            m_profile.spec.range_min=m_profile.min_val;m_profile.spec.range_max=m_profile.max_val;
+            m_profile.unit=item.meterRange["unit"].toString("MPa").toStdString();
+        }
         m_profile.center = cv::Point2f(static_cast<float>(item.centerX), static_cast<float>(item.centerY));
         m_profile.pointerBaseRadius = item.pointerBaseRadius;
         m_profile.calibrated_width = item.calibratedWidth;
@@ -1386,10 +1389,12 @@ void MainWindow::applyCameraCalibrationAndProfile(const QString& camId) {
         m_profileReady = true;
         updateSelectedDeviceArchive(camId);
         tryOpenCameraCalibration();
-        m_cfgRange->setText(tr("量程范围：%1 ～ %2 %3").arg(m_profile.min_val).arg(m_profile.max_val).arg(QString::fromStdString(m_profile.unit)));
+        m_cfgRange->setText(OcrDialRange::valid(item.meterRange)||!item.defaultProfileId.isEmpty()?
+            tr("量程范围：%1 ～ %2 %3").arg(m_profile.min_val).arg(m_profile.max_val).arg(QString::fromStdString(m_profile.unit)):
+            tr("量程范围：待表计标定时 OCR 识别"));
     });
     watcher->setFuture(QtConcurrent::run([profileId]() -> ProfileReply {
-        try { return {MySqlRepository().loadTemplate(profileId).definition, QString()}; }
+        try { return {profileId.isEmpty()?GaugeProfile::createDefault().toJson():MySqlRepository().loadTemplate(profileId).definition, QString()}; }
         catch (const std::exception& error) { return {QJsonObject(), QString::fromUtf8(error.what())}; }
     }));
 }
@@ -1458,10 +1463,6 @@ void MainWindow::onManageGaugeTemplates() {
 void MainWindow::onCalibrateCardinalPoints() {
     const QString cameraId = makeSingleTask().device.cameraId;
     if (!m_discoveredItemsMap.contains(cameraId) || m_calibrationDialogOpen) return;
-    if (m_discoveredItemsMap.value(cameraId).defaultProfileId.trimmed().isEmpty()) {
-        QMessageBox::warning(this, tr("请先选择表计模板"), tr("请右键设备打开“设备安装档案”，主动选择表计模板并保存后再标定。"));
-        return;
-    }
     // Calibration owns an ONVIF snapshot request; never select a live stream.
     ++m_cameraConnectionGeneration;
     m_calibrationSnapshot=FrameCaptureResult();
@@ -1510,6 +1511,7 @@ void MainWindow::checkCameraCalibration(const QString& cameraId) {
         item.centerX = saved.centerX; item.centerY = saved.centerY;
         item.pointerBaseRadius = saved.pointerBaseRadius;
         item.scalePoints = saved.scalePoints;
+        item.meterRange = saved.meterRange;
         if (auto* row = findListItemByCameraId(cameraId)) updateDeviceListItemWidget(row, item);
         if (!saved.hasCalibration) {
             m_pendingCalibrationCamera = cameraId;
@@ -1578,6 +1580,10 @@ void MainWindow::tryOpenCameraCalibration() {
         }
         const auto device = m_discoveredItemsMap.value(cameraId);
         GaugeProfile profile = m_profile;
+        if(OcrDialRange::valid(device.meterRange)) {
+            profile.min_val=device.meterRange["min_val"].toDouble();profile.max_val=device.meterRange["max_val"].toDouble();
+            profile.unit=device.meterRange["unit"].toString("MPa").toStdString();
+        }
         profile.scalePoints = {};
         profile.perspective_correction_enabled = device.hasCalibration;
         if (device.hasCalibration) {
@@ -1797,8 +1803,10 @@ void MainWindow::onRecognitionFinished() {
     }
     onLogReceived(qualitySummary(m_latestResult.recognitionQuality));
     logRecognitionStageTimings(tr("指定图像/历史重分析"), m_latestResult.stageTimings);
-    // Show only the original capture and final recognition result.
+    // Display the processing sequence, including the actual lens-corrected input.
     updateImageCard(m_originalImage, m_latestResult.step1_original, tr("采集原图"));
+    updateImageCard(m_undistortedImage, m_latestResult.undistortedImage, tr("去畸变图"));
+    updateImageCard(m_rectifiedImage, m_latestResult.step2_rectified, tr("四切点透视矫正图"));
     updateImageCard(m_recognitionImage, m_latestResult.step4_recognition, tr("最终识别结果"));
 
     // Clear diagnostics from a preceding debug run when the current mode omits them.
@@ -1864,8 +1872,12 @@ void MainWindow::onRecognitionFinished() {
 }
 
 void MainWindow::updateImageCard(QLabel* label, const cv::Mat& mat, const QString& title) {
-    Q_UNUSED(title);
-    if (!label || mat.empty()) return;
+    if (!label) return;
+    if (mat.empty()) {
+        label->clear();
+        label->setText(tr("%1：暂无图像").arg(title));
+        return;
+    }
     QImage img = cvMatToQImage(mat);
     QPixmap pixmap = QPixmap::fromImage(img);
 
@@ -2112,7 +2124,7 @@ void MainWindow::onStartAllDevicesInspection() {
         } else ++it;
     }
     if (!uncalibrated.isEmpty()) {
-        const auto message = tr("以下设备识别条件未满足，已排除在本次全站批量巡检之外：\n%1\n请右键对应设备，完善“设备安装档案”、选择模板并完成“表计标定”。").arg(uncalibrated.join("\n"));
+        const auto message = tr("以下设备识别条件未满足，已排除在本次全站批量巡检之外：\n%1\n请右键对应设备，完善“设备安装档案”，识别量程并完成“表计标定”。").arg(uncalibrated.join("\n"));
         onLogReceived(tr("[CALIBRATION] %1").arg(message));
         m_inspectionSummaryLabel->setText(tr("配置不完整设备已跳过：%1 台；请完善表计档案与标定。").arg(uncalibrated.size()));
         if (sender() != m_autoPatrolTimer)

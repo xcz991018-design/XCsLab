@@ -6,8 +6,9 @@ find_package(Qt5 REQUIRED COMPONENTS Widgets Core Network Concurrent)
 find_package(OpenCV REQUIRED)
 set(MYSQL_ROOT "C:/Program Files/MySQL/MySQL Server 8.0")
 add_executable(calibration_loading_test main.cpp ../../src/CardinalSelectorDialog.cpp
-    ../../include/CardinalSelectorDialog.hpp)
+    ../../include/CardinalSelectorDialog.hpp ../../src/CameraInfoEditDialog.cpp ../../include/CameraInfoEditDialog.hpp)
 target_compile_options(calibration_loading_test PRIVATE /utf-8)
+target_compile_definitions(calibration_loading_test PRIVATE OCR_FIXTURE_SCRIPT="${CMAKE_CURRENT_SOURCE_DIR}/../auto_scale_test/ocr_fixture.py")
 target_include_directories(calibration_loading_test PRIVATE ../../include ${OpenCV_INCLUDE_DIRS} "${MYSQL_ROOT}/include")
 target_link_libraries(calibration_loading_test PRIVATE
     "${CMAKE_CURRENT_SOURCE_DIR}/../../build/Release/gauge_inspection_runtime.lib"

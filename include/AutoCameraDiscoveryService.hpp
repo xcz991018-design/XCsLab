@@ -7,6 +7,7 @@
 #include <QTimer>
 #include <QString>
 #include <QJsonArray>
+#include <QJsonObject>
 #include <QList>
 #include <memory>
 #include <QFuture>
@@ -54,6 +55,7 @@ struct DiscoveredCameraItem {
 
     // Field Installation & Perspective Geometry Calibration
     QJsonArray scalePoints; // Original-frame x/y and normalized scale ratio.
+    QJsonObject meterRange; // Device OCR range, independent of legacy templates.
     bool hasCalibration{false};
     bool perspectiveEnabled{false};
     int calibratedWidth{0};
