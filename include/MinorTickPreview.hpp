@@ -1,5 +1,6 @@
 #pragma once
 #include "AutoScaleCalibration.hpp"
+#include "OcrDialRange.hpp"
 #include "LiquidSurface.hpp"
 #include <limits>
 
@@ -63,7 +64,7 @@ inline Comparison compare(const Result& result,const QJsonArray& anchors,cv::Poi
     return out;
 }
 inline Result detect(const cv::Mat& image,const QJsonArray& anchors,cv::Point2f hub,double radius,
-                     double minimum,double maximum,bool clockwise,const LiquidSurface& requestedSurface,double pointerAngle=std::numeric_limits<double>::quiet_NaN(),double confirmedDivision=0) {
+                     double minimum,double maximum,bool clockwise,const LiquidSurface& requestedSurface,double pointerAngle=std::numeric_limits<double>::quiet_NaN(),double confirmedDivision=0,QJsonArray* diagnostics=nullptr) {
     Result out; ScaleCalibration::Mapping mapping;
     const bool manualDivision=std::isfinite(confirmedDivision)&&confirmedDivision>0;
     if(image.empty()||image.depth()!=CV_8U||radius<30||!std::isfinite(maximum-minimum)||maximum<=minimum||
@@ -87,7 +88,13 @@ inline Result detect(const cv::Mat& image,const QJsonArray& anchors,cv::Point2f 
     auto detectionGray=gray.clone();
     if(surface.found)for(int y=0;y<gray.rows;++y)for(int x=0;x<gray.cols;++x)
         if(surface.excludes(x,y))detectionGray.at<uchar>(y,x)=255;
-    const auto lines=AutoScaleCalibration::ticks(detectionGray,center,radius,.09,.018);
+    auto lines=AutoScaleCalibration::ticks(detectionGray,center,radius,.09,.018);
+    // Preserve complete thick-head/thin-stem measurements. LSD alone may
+    // split a middle major into a short, ordinary-looking minor stroke.
+    // The same component/ink checks used by major calibration recover its
+    // physical extent, before the existing local merge and lattice checks.
+    for(const auto& major:OcrDialRange::majorTicks(gray,{},center,radius,surface))
+        if(major.tick.length>=radius*.09)lines.push_back(major.tick);
     auto point=[&](double angle,double r){const double a=angle*CV_PI/180;return center+cv::Point2f(float(r*std::cos(a)),float(r*std::sin(a)));};
     struct Model {int interval,n;double division,score,phase,step;};std::vector<Model> models;
     struct Interval {double start,sweep,leftRatio,rightRatio,ring;std::vector<int> marks;double middleOffset{-1},middleRatio{-1};bool minimumSide{true};};
@@ -132,10 +139,41 @@ inline Result detect(const cv::Mat& image,const QJsonArray& anchors,cv::Point2f 
             // measured centers, retaining one physical stroke rather than two edges.
             auto duplicate=std::find_if(candidates.begin(),candidates.end(),[&](const Candidate& c){
                 return AutoScaleCalibration::distance(c.tick.angle,t.angle)<2.0&&
-                       cv::norm(c.tick.point-t.point)<radius*.025;
+                       std::abs(c.tick.radius-t.radius)<(c.tick.length+t.length)*.5+radius*.015;
             });
             if(duplicate==candidates.end())candidates.push_back({t,offset,confidence});
             else if(t.length>duplicate->tick.length)*duplicate={t,offset,confidence};
+        }
+        // LSD can lose a thin stem or split it at a thick head. Recover only
+        // narrow, measured ink runs in the radial strip, never predicted slots.
+        const double minimumRun=radius*.035;
+        for(int begin=1;begin<bins;) {
+            if(!visible[begin]||signal[begin]<minimumRun){++begin;continue;}
+            const int runBegin=begin;int end=begin,peak=begin;
+            while(end+1<bins&&visible[end+1]&&signal[end+1]>=minimumRun){++end;if(signal[end]>signal[peak])peak=end;}
+            const double offset=sweep*peak/bins;
+            begin=end+1;
+            if(sweep*(end-runBegin+1)/bins>3.5)continue;
+            if(offset<1.4||offset>sweep-1.4)continue;
+            const double angle=angleAt(offset);
+            if(std::isfinite(pointerAngle)&&AutoScaleCalibration::distance(angle,pointerAngle)<2.5)continue;
+            const auto existing=std::find_if(candidates.begin(),candidates.end(),[&](const Candidate& c){return AutoScaleCalibration::distance(c.tick.angle,angle)<2.;});
+            if(existing!=candidates.end()&&existing->confidence>=.6)continue;
+            double bestLo=0,bestHi=0,runLo=0;bool inRun=false;
+            for(double r=ring-radius*.065;r<=ring+radius*.14;r+=1) {
+                const auto p=point(angle,r);const int x=cvRound(p.x),y=cvRound(p.y);
+                const bool dark=x>=0&&y>=0&&x<gray.cols&&y<gray.rows&&!surface.excludes(p.x,p.y)&&ink.at<uchar>(y,x);
+                if(dark){if(!inRun){runLo=r;inRun=true;}if(r-runLo>bestHi-bestLo){bestLo=runLo;bestHi=r;}}
+                else inRun=false;
+            }
+            const double length=bestHi-bestLo;
+            if(length<minimumRun||length>radius*.19||bestHi<ring-radius*.025)continue;
+            const auto before=point(angle,bestLo-3),after=point(angle,bestHi+3);
+            if(surface.excludes(before.x,before.y-2)||surface.excludes(after.x,after.y-2))continue;
+            const double r=(bestLo+bestHi)*.5;
+            Candidate recovered{{point(angle,r),AutoScaleCalibration::wrap(angle),r,length},offset,std::clamp(length/(radius*.065),0.,1.)};
+            if(existing==candidates.end())candidates.push_back(recovered);
+            else if(recovered.confidence>existing->confidence)*existing=recovered;
         }
         const int id=int(intervals.size());
         Interval section{start,sweep,left["ratio"].toDouble(),right["ratio"].toDouble(),ring,{}};
@@ -166,6 +204,10 @@ inline Result detect(const cv::Mat& image,const QJsonArray& anchors,cv::Point2f 
             }
         }
         intervals.push_back(section);
+        if(diagnostics) {
+            QJsonArray observations;for(const auto& c:candidates)observations.append(QJsonObject{{"offset",c.offset},{"length",c.tick.length},{"confidence",c.confidence}});
+            diagnostics->append(QJsonObject{{"type","interval"},{"id",id},{"sweep",sweep},{"middle",section.middleOffset},{"observations",observations}});
+        }
         // Keep competing subdivision counts for cross-interval consensus.
         for(int n=3;n<=80;++n) {
             double step=sweep/n,phase=0;
@@ -206,6 +248,10 @@ inline Result detect(const cv::Mat& image,const QJsonArray& anchors,cv::Point2f 
         if(!c.support.empty())groups.push_back(c);
     }
     std::sort(groups.begin(),groups.end(),[](const Consensus& a,const Consensus& b){return a.score>b.score;});
+    if(diagnostics) {
+        for(const auto& m:models)diagnostics->append(QJsonObject{{"type","model"},{"id",m.interval},{"n",m.n},{"division",m.division},{"score",m.score},{"step",m.step},{"phase",m.phase}});
+        for(const auto& g:groups)diagnostics->append(QJsonObject{{"type","consensus"},{"division",g.division},{"score",g.score},{"support",int(g.support.size())}});
+    }
     if(!groups.empty()) {
         const auto& best=groups.front();out.division=best.division;out.intervals=int(best.support.size());
         out.confidence=best.score/best.support.size();

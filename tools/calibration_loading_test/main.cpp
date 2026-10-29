@@ -326,6 +326,14 @@ int main(int argc, char** argv) {
         closing->setAttribute(Qt::WA_DontShowOnScreen);
         closing->show();
         const bool initialFeedback=closing->findChild<QProgressBar*>("calibrationLoadingProgress")->isVisible();
+        for(auto* button:closing->findChildren<QPushButton*>())
+            require(button->isVisible()==(button->objectName()=="exportCalibrationOriginalButton"),"automatic result view must expose only original-image export");
+        for(auto* spin:closing->findChildren<QDoubleSpinBox*>())
+            require(!spin->isVisible(),"automatic result view must expose no manual numeric fields");
+        require(!closing->findChild<InteractiveImageLabel*>("rectifiedCalibrationImage")->isVisible(),
+            "intermediate or stale calibration must not appear as the final result");
+        require(!closing->findChild<QLabel*>("calibrationLoadingStatus")->text().isEmpty(),
+            "loading message must exist before the first event loop iteration");
         app.processEvents(); // Starts the automatic detection scheduled on opening.
         closing->reject();
         const bool cancelled=!closing->isVisible();
@@ -333,6 +341,31 @@ int main(int argc, char** argv) {
         release.release();blocker.waitForFinished();pool->waitForDone();app.processEvents();
         require(cancelled, "users must be able to cancel while detection is pending");
         require(initialFeedback, "opening a calibration must immediately show loading feedback");
+        const auto automaticImage=qEnvironmentVariable("GAUGE_TEST_AUTOMATIC_IMAGE");
+        if(!automaticImage.isEmpty()) {
+            qputenv("GAUGE_OCR_SCRIPT",QByteArray(OCR_FIXTURE_SCRIPT));
+            qputenv("GAUGE_OCR_FIXTURE_TOKENS",qgetenv("GAUGE_TEST_AUTOMATIC_TOKENS"));
+            qputenv("GAUGE_OCR_FIXTURE_FULL_HEIGHT","800");
+            GaugeProfile automaticProfile;const auto initial=automaticProfile.toJson();
+            CardinalSelectorDialog automatic(cv::imread(automaticImage.toStdString()),automaticProfile);
+            automatic.setAttribute(Qt::WA_DontShowOnScreen);automatic.show();
+            QEventLoop autoLoop;QTimer autoPoll,autoTimeout;autoTimeout.setSingleShot(true);
+            autoPoll.setInterval(10);
+            QObject::connect(&autoPoll,&QTimer::timeout,&autoLoop,[&]{
+                if(automatic.findChild<QLabel*>("calibrationSaveStatus")->text().startsWith(QStringLiteral(u"未保存本次标定")))autoLoop.quit();
+            });
+            QObject::connect(&autoTimeout,&QTimer::timeout,&autoLoop,&QEventLoop::quit);
+            autoPoll.start();autoTimeout.start(20000);autoLoop.exec();
+            const auto status=automatic.findChild<QLabel*>("calibrationSaveStatus")->text();
+            std::cout<<"Automatic status: "<<status.toStdString()<<'\n';
+            require(status.contains(QStringLiteral(u"无法保存")),"automatic stages must reach save validation without any button clicks");
+            const auto points=automatic.findChild<InteractiveImageLabel*>("rectifiedCalibrationImage")->getScalePoints();
+            require(points.size()>15,"automatic chain must include major and minor calibration points");
+            require(automaticProfile.toJson()==initial,"missing device identity must not persist or mutate the original profile");
+            for(auto* button:automatic.findChildren<QPushButton*>())require(button->isVisible()==(button->objectName()=="exportCalibrationOriginalButton"),"automatic completion/failure must retain only original-image export");
+            automatic.reject();
+            std::cout<<"PASS: opening alone drives localization, OCR, major/minor ticks and save validation\n";
+        }
         std::cout << "PASS: busy feedback, event loop responsiveness, failure recovery, cancellation and safe destruction\n";
         return 0;
     } catch(const std::exception& e) {std::cerr << e.what() << '\n';return 1;}

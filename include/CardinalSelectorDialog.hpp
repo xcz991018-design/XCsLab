@@ -119,6 +119,8 @@ private:
     void setManualEditing(bool enabled);
     void setAutoDetectionBusy(bool busy);
     void startAutoDetection(bool cornersOnly);
+    void finishAutomaticFailure(const QString& reason);
+    bool m_autoSaved{false};
     std::pair<cv::Point2f,QJsonArray> sourceAnnotations() const;
 
     cv::Mat m_rawFrame;

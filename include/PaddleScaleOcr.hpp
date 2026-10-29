@@ -1,5 +1,6 @@
 #pragma once
 #include "AutoScaleCalibration.hpp"
+#include "LiquidSurface.hpp"
 #include <QCoreApplication>
 #include <QDir>
 #include <QFile>
@@ -13,9 +14,46 @@
 
 namespace PaddleScaleOcr {
 struct Recognition { QJsonArray tokens; QString error; bool valid() const {return error.isEmpty();} };
-inline Recognition recognize(const cv::Mat& image,const std::shared_ptr<std::atomic_bool>& cancelled) {
+struct InputRegion {cv::Mat image;int top{0};};
+inline InputRegion inputRegion(const cv::Mat& image,const LiquidSurface& surface) {
+    if(!surface.found||image.empty())return {image,0};
+    cv::Mat masked=image.clone();int top=image.rows;
+    for(int x=0;x<image.cols;++x) {
+        const double boundary=surface.yAt(x)+surface.margin;
+        if(!std::isfinite(boundary))return {{},0};
+        const int first=int(std::clamp(std::floor(boundary)+1,0.,double(image.rows)));
+        top=std::min(top,first);
+        if(first>0)masked(cv::Rect(x,0,1,first)).setTo(cv::Scalar::all(255));
+    }
+    if(top>=image.rows)return {{},top};
+    return {masked(cv::Rect(0,top,image.cols,image.rows-top)).clone(),top};
+}
+inline QJsonArray restoreTokens(const QJsonArray& tokens,int top,const LiquidSurface& surface) {
+    QJsonArray restored;
+    for(const auto& entry:tokens) {
+        auto token=entry.toObject();QJsonArray polygon;bool excluded=false;
+        for(const auto& vertex:token["polygon"].toArray()) {
+            const auto p=vertex.toArray();if(p.size()!=2){excluded=true;break;}
+            polygon.append(QJsonArray{p[0].toDouble(),p[1].toDouble()+top});
+        }
+        if(polygon.size()!=4)continue;
+        for(int i=0;i<4;++i) {
+            const auto a=polygon[i].toArray(),b=polygon[(i+1)%4].toArray();
+            for(int k=0;k<=8;++k) {
+                const double t=k/8.;
+                excluded|=surface.excludes(a[0].toDouble()*(1-t)+b[0].toDouble()*t,a[1].toDouble()*(1-t)+b[1].toDouble()*t);
+            }
+        }
+        if(!excluded){token["polygon"]=polygon;restored.append(token);}
+    }
+    return restored;
+}
+inline Recognition recognize(const cv::Mat& image,const std::shared_ptr<std::atomic_bool>& cancelled,const LiquidSurface& surface={}) {
     Recognition result;
     try {
+        if(surface.ambiguous){result.error=QStringLiteral(u"液面位置有歧义，未执行 OCR。");return result;}
+        const auto region=inputRegion(image,surface);
+        if(region.image.empty()){result.error=QStringLiteral(u"液面屏蔽后没有有效 OCR 区域。");return result;}
         const auto appDir=QCoreApplication::applicationDirPath();
         QString ocrDir=appDir+"/ocr";
         if(!QFile::exists(ocrDir+"/offline.json") && !QFile::exists(ocrDir+"/paddle_scale_ocr.py") && QFile::exists(appDir+"/../ocr/paddle_scale_ocr.py"))ocrDir=QDir(appDir+"/../ocr").absolutePath();
@@ -35,7 +73,7 @@ inline Recognition recognize(const cv::Mat& image,const std::shared_ptr<std::ato
         QTemporaryDir temporary;
         if(!temporary.isValid()) {result.error=QStringLiteral(u"无法创建 OCR 临时目录。");return result;}
         const auto input=temporary.filePath("dial.png"),output=temporary.filePath("result.json");
-        std::vector<uchar> encoded; cv::imencode(".png",image,encoded);
+        std::vector<uchar> encoded; cv::imencode(".png",region.image,encoded);
         QFile file(input);
         if(!file.open(QIODevice::WriteOnly)||file.write(reinterpret_cast<const char*>(encoded.data()),qint64(encoded.size()))!=qint64(encoded.size())) {result.error=QStringLiteral(u"无法写入 OCR 图像。");return result;}file.close();
         QProcess process;
@@ -65,7 +103,7 @@ inline Recognition recognize(const cv::Mat& image,const std::shared_ptr<std::ato
             result.error=QStringLiteral(u"PaddleOCR 识别失败：%1。使用的 Python：%2。请检查 OCR 环境及模型配置。")
                 .arg(data["error"].toString(QString::fromUtf8(errors.right(1200))),python);return result;
         }
-        result.tokens=data["tokens"].toArray();return result;
+        result.tokens=surface.found?restoreTokens(data["tokens"].toArray(),region.top,surface):data["tokens"].toArray();return result;
     } catch(const std::exception& error) {result.error=QString::fromUtf8(error.what());return result;}
 }
 // Upright dial inspection accepts the built-in 0..2 vocabulary in steps of 0.1.

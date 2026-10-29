@@ -406,7 +406,9 @@ CardinalSelectorDialog::CardinalSelectorDialog(const cv::Mat& frame, GaugeProfil
     if(!m_historicalSession) {
         setManualEditing(false);
         m_saveBtn->setEnabled(false);m_manualEditBtn->setEnabled(false);
-        m_saveStatus->setText(tr("正在自动执行视场矫正、液面检测及表盘中心检测…"));
+        m_saveStatus->setText(tr("正在进行自动识别，请稍后…"));
+        m_autoProgressLabel->setText(tr("正在进行自动识别，请稍后…"));
+        m_previewLabel->hide();
         QTimer::singleShot(0,this,&CardinalSelectorDialog::onAutoDetect);
     }
 }
@@ -444,7 +446,7 @@ void CardinalSelectorDialog::setupUi() {
     // Left: Interactive Selector
     QVBoxLayout *leftLayout = new QVBoxLayout();
     auto* originalHeader=new QHBoxLayout();
-    originalHeader->addWidget(new QLabel(tr("<b>表盘多特征定位与透视矫正（支持手动修正）</b>"), this));
+    originalHeader->addWidget(new QLabel(m_historicalSession?tr("<b>表盘定位与透视矫正</b>"):tr("<b>自动标定原图</b>"), this));
     originalHeader->addStretch();
     auto* exportOriginal=new QPushButton(tr("保存标定原图"),this);
     exportOriginal->setObjectName("exportCalibrationOriginalButton");
@@ -694,6 +696,20 @@ void CardinalSelectorDialog::setupUi() {
     connect(m_autoBtn, &QPushButton::clicked, this, [this]{startAutoDetection(true);});
     connect(m_saveBtn, &QPushButton::clicked, this, &CardinalSelectorDialog::onSaveAndApply);
     connect(m_cancelBtn, &QPushButton::clicked, this, &QDialog::reject);
+    if(!m_historicalSession) {
+        const auto hideLayout=[](auto&& self,QLayout* layout)->void {
+            for(int i=0;i<layout->count();++i){auto* item=layout->itemAt(i);if(item->widget())item->widget()->hide();if(item->layout())self(self,item->layout());}
+        };
+        for(auto* layout:{autoScaleLayout,minorOptions,rangeLayout,btnLayout})hideLayout(hideLayout,layout);
+        m_scaleControls->hide();m_liquidControls->hide();
+        m_scaleStatus->hide();m_geometryStatus->hide();m_geometryAcknowledged->hide();
+    }
+}
+
+void CardinalSelectorDialog::finishAutomaticFailure(const QString& reason) {
+    setAutoDetectionBusy(false);m_automaticAttemptFailed=true;
+    m_autoProgressLabel->setText(tr("自动标定未完成：%1").arg(reason));m_autoProgressLabel->show();
+    m_saveStatus->setText(tr("未保存本次标定。%1").arg(reason));m_previewLabel->show();
 }
 
 void CardinalSelectorDialog::setManualEditing(bool enabled) {
@@ -932,6 +948,14 @@ void CardinalSelectorDialog::onMinorTickPreview() {
     connect(watcher,&QFutureWatcher<MinorTickPreview::Result>::finished,this,[this,watcher]{
         const auto result=watcher->result();watcher->deleteLater();setAutoDetectionBusy(false);
         updatePreview();m_previewLabel->setMinorPreview(result);m_saveStatus->setText(result.message);
+        if(!m_historicalSession) {
+            if(!result.divisionConfirmed||result.previewPoints.isEmpty()) {finishAutomaticFailure(tr("小刻度分度或赋值未通过一致性检查。"));return;}
+            m_saveMinorTicks->setChecked(true);
+            m_autoProgressLabel->setText(tr("自动识别完成，正在保存标定结果…"));m_autoProgressLabel->show();
+            m_autoProgress->show();
+            onSaveAndApply();
+            if(!m_saving)finishAutomaticFailure(m_saveStatus->text());
+        }
     });
     // Build a private profile with the same frozen frame and current annotations.
     auto previewProfile=m_profile;
@@ -981,7 +1005,7 @@ void CardinalSelectorDialog::onAutoScaleCalibration() {
     m_previewLabel->clearMinorPreview();
     m_previewLabel->setOcrNumbers({});
     setAutoDetectionBusy(true);
-    m_autoProgressLabel->setText(tr("正在识别数字并匹配各数值的长刻度线…可点击取消关闭。"));
+    m_autoProgressLabel->setText(tr("正在自动识别 OCR 量程并匹配大刻度，请稍后…"));
     m_saveStatus->setText(tr("正在识别数字，完成后在右图显示数字框和置信度。"));
     auto center=m_previewLabel->getCenterPoint();
     if(center.x<0||center.y<0)center=cv::Point2f(rectified.cols*.5f,rectified.rows*.5f);
@@ -993,7 +1017,11 @@ void CardinalSelectorDialog::onAutoScaleCalibration() {
         const auto existing=m_previewLabel->getScalePoints();
         if(!existing.isEmpty())scaleCenter=ScaleCalibration::origin(existing.first().toObject(),center);
     }
-    const auto surface=m_liquidMaskEnabled->isChecked()?m_previewLabel->liquidSurface():LiquidSurface{};
+    if(!m_previewLabel->liquidSurface().found) {
+        m_previewLabel->setLiquidSurface(detectLiquidSurface(rectified,scaleCenter,m_profile.rectified_size*.5-m_profile.rectified_margin));
+        m_previewLabel->showLiquidMask(true);
+    }
+    const auto surface=m_previewLabel->liquidSurface();
     struct Analysis {PaddleScaleOcr::Recognition ocr;OcrDialRange::Calibration calibration;};
     auto* watcher=new QFutureWatcher<Analysis>(this);
     connect(watcher,&QFutureWatcher<Analysis>::finished,this,[this,watcher,center,size=rectified.cols,liquidExcluded=surface.found] {
@@ -1001,7 +1029,8 @@ void CardinalSelectorDialog::onAutoScaleCalibration() {
         setAutoDetectionBusy(false);
         if(!result.valid()) {
             updatePreview();
-            m_saveStatus->setText(tr("数字识别失败：%1 已保留原标定。").arg(result.error));return;
+            m_saveStatus->setText(tr("数字识别失败：%1 已保留原标定。").arg(result.error));
+            if(!m_historicalSession)finishAutomaticFailure(result.error);return;
         }
         const auto numbers=PaddleScaleOcr::numericTokens(result.tokens);
         const auto& range=analysis.calibration.range;
@@ -1032,10 +1061,15 @@ void CardinalSelectorDialog::onAutoScaleCalibration() {
             (analysis.calibration.valid()?tr(" 已有中间刻度与新匹配排列冲突，原刻度点保留，请手动修正。"):
                 tr(" 刻度角度未修改：%1").arg(analysis.calibration.error)));
         else if(!range.valid&&!analysis.calibration.error.isEmpty())m_saveStatus->setText(m_saveStatus->text()+analysis.calibration.error);
+        if(!m_historicalSession) {
+            if(!calibrated||!range.valid) {finishAutomaticFailure(tr("量程或大刻度匹配未通过：%1").arg(analysis.calibration.error));return;}
+            m_autoProgressLabel->setText(tr("正在自动识别并标定小刻度，请稍后…"));m_autoProgressLabel->show();m_autoProgress->show();
+            QTimer::singleShot(0,this,&CardinalSelectorDialog::onMinorTickPreview);
+        }
     });
     const auto radius=m_profile.rectified_size*.5-m_profile.rectified_margin;
     watcher->setFuture(QtConcurrent::run([rectified,cancelled,scaleCenter,surface,radius,clockwise=m_profile.clockwise,confirmed=m_centerConfirmed] {
-        Analysis analysis;analysis.ocr=PaddleScaleOcr::recognize(rectified,cancelled);
+        Analysis analysis;analysis.ocr=PaddleScaleOcr::recognize(rectified,cancelled,surface);
         if(!analysis.ocr.valid()||cancelled->load())return analysis;
         if(confirmed) {
             try {
@@ -1069,13 +1103,15 @@ void CardinalSelectorDialog::startAutoDetection(bool cornersOnly) {
         if(!result.valid()) {
             m_automaticAttemptFailed=true;
             setManualEditing(!m_automaticReviewMode);
-            m_saveStatus->setText(tr("自动定位未通过：%1 当前四点为保留的旧标定，并非本次自动结果；可点击“手动修改”调整。").arg(result.error));
+            m_saveStatus->setText(tr("自动定位未通过：%1").arg(result.error));
+            if(!m_historicalSession)finishAutomaticFailure(result.error);
             return;
         }
         // Apply only on the GUI thread; the worker owns a frozen frame and settings.
         if(m_autoEndpointCalibration) {m_endpointReviewRequired=true;m_autoEndpointCalibration=false;}
         const bool centerWasConfirmed=m_centerConfirmed;
         if(m_perspectiveConfirmed)onConfirmPerspective();
+        if(!m_historicalSession)m_sourceScalePoints={};
         if(!cornersOnly)m_sourceCenter=result.hub;
         m_currentPts=result.points;
         m_graduationSourceCenter=result.graduationCenter;
@@ -1084,7 +1120,8 @@ void CardinalSelectorDialog::startAutoDetection(bool cornersOnly) {
         if(!m_perspectiveConfirmed) {
             m_automaticAttemptFailed=true;
             setManualEditing(!m_automaticReviewMode);
-            m_saveStatus->setText(tr("自动视场校正未通过，请手动调整四切点后重试。"));
+            m_saveStatus->setText(tr("自动视场校正未通过。"));
+            if(!m_historicalSession)finishAutomaticFailure(m_saveStatus->text());
             return;
         }
         const auto center=m_previewLabel->getCenterPoint();
@@ -1116,6 +1153,10 @@ void CardinalSelectorDialog::startAutoDetection(bool cornersOnly) {
             tr(" 液面位置有歧义，已跳过刻度环辅助精修。"));
         if(result.structuralRectification)m_saveStatus->setText(m_saveStatus->text()+
             tr(" 已采用 %1 条刻度的平面矫正，并通过左右对称与270°跨度检查；左侧四点为可手动调整的映射控制点。").arg(result.structuralSupport));
+        if(!m_historicalSession) {
+            m_autoProgressLabel->setText(tr("正在自动识别 OCR 量程与大刻度，请稍后…"));m_autoProgressLabel->show();m_autoProgress->show();
+            QTimer::singleShot(0,this,&CardinalSelectorDialog::onAutoScaleCalibration);
+        }
     });
     const auto frame=m_frame.clone();
     const int size=m_profile.rectified_size;
@@ -1142,7 +1183,7 @@ void CardinalSelectorDialog::startAutoDetection(bool cornersOnly) {
 }
 
 void CardinalSelectorDialog::reject() {
-    if (!m_saving) QDialog::reject();
+    if (!m_saving) {if(m_autoSaved)QDialog::accept();else QDialog::reject();}
 }
 
 std::pair<cv::Point2f,QJsonArray> CardinalSelectorDialog::sourceAnnotations() const {
@@ -1198,10 +1239,9 @@ void CardinalSelectorDialog::onSaveAndApply() {
     auto geometryIssues=ScaleCalibration::geometryIssues(rectifiedScales,rectifiedCenter,m_profile.clockwise,
         m_profile.rectified_size*.5-m_profile.rectified_margin);
     if(m_autoDialReviewPending)geometryIssues<<tr("自动表盘定位及轴心需要复核。");
-    // In the initial read-only preview, the explicit confirmation button is
-    // the review acknowledgement. Manual mode retains its detailed checkbox.
-    if(m_automaticReviewMode)m_geometryAcknowledged->setChecked(true);
-    if(!geometryIssues.isEmpty() && !m_geometryAcknowledged->isChecked()) {
+    // The automatic pipeline has already validated each stage; manual review
+    // controls apply only to the historical/manual workflow.
+    if(!m_automaticReviewMode&&!geometryIssues.isEmpty() && !m_geometryAcknowledged->isChecked()) {
         m_saveStatus->setText(tr("请先复核几何检查提示，并勾选确认使用这些标定点。"));return;
     }
     const auto annotations=sourceAnnotations();
@@ -1257,6 +1297,7 @@ void CardinalSelectorDialog::onSaveAndApply() {
         m_rangeMinimum->setEnabled(true);m_rangeMaximum->setEnabled(true);
         m_manualEditBtn->setEnabled(true);
         if (!error.isEmpty()) {
+            if(!m_historicalSession) {finishAutomaticFailure(tr("数据库保存失败：%1").arg(error));return;}
             m_saveStatus->setText(tr("数据库保存失败：%1；标定尚未保存，可重试。").arg(error));
             m_scaleControls->setEnabled(true);
             m_liquidControls->setEnabled(true);
@@ -1277,7 +1318,12 @@ void CardinalSelectorDialog::onSaveAndApply() {
         m_profile.center = center; m_profile.pointerBaseRadius = radius;
         m_profile.auto_detect_roi = false;
         m_profile.calibrated_width = m_frame.cols; m_profile.calibrated_height = m_frame.rows;
-        accept();
+        if(!m_historicalSession) {
+            m_autoSaved=true;m_autoProgress->hide();m_previewLabel->show();
+            m_autoProgressLabel->setText(tr("自动标定完成，结果已保存"));m_autoProgressLabel->show();
+            m_saveStatus->setText(tr("量程 %1 ～ %2 %3；透视、轴心、大刻度及小刻度已自动标定并保存。")
+                .arg(m_profile.min_val).arg(m_profile.max_val).arg(QString::fromStdString(m_profile.unit)));
+        } else accept();
     });
     const auto cameraId = m_cameraId;
     watcher->setFuture(QtConcurrent::run([cameraId, calibration]() -> QString {

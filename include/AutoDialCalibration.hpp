@@ -278,7 +278,10 @@ inline GraduationFit graduationFit(const std::vector<cv::Vec4f>& lines,const cv:
     result.aspect=std::min(ellipse.size.width,ellipse.size.height)/std::max(ellipse.size.width,ellipse.size.height);
     // The printed graduation circle supplies evidence from the dial plane,
     // independent of housing reflections and a protruding axis cap.
-    result.score=1.8*result.aspect-8*result.residual;
+    // A housing conic can make a partial printed arc look circular while
+    // displacing its center far from the measured axis. Penalize that false
+    // fit instead of rewarding circularity alone.
+    result.score=1.8*result.aspect-8*result.residual-2*cv::norm(ellipse.center);
     return result;
 }
 inline std::vector<cv::Point2f> graduationEnvelope(const std::vector<cv::Vec4f>& lines,const cv::Mat& reference) {

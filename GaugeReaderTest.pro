@@ -18,6 +18,28 @@ win32-msvc {
 TARGET    = GaugeReaderTest
 TEMPLATE  = app
 
+# Qt Creator uses MSVC 2017 here. Keep intermediate files separate when a
+# different MSVC installation builds in the same shadow directory: newer
+# STL/EH object files cannot be linked against the older runtime libraries.
+win32-msvc {
+    msvcCompilerTag = $$(VCToolsVersion)
+    isEmpty(msvcCompilerTag): msvcCompilerTag = $$QMAKE_MSC_FULL_VER
+    CONFIG(debug, debug|release): msvcBuildVariant = debug
+    else: msvcBuildVariant = release
+    msvcIntermediate = $$OUT_PWD/obj/msvc-$${msvcCompilerTag}/$$msvcBuildVariant
+    OBJECTS_DIR = $$msvcIntermediate
+    MOC_DIR = $$msvcIntermediate/moc
+    RCC_DIR = $$msvcIntermediate/rcc
+    UI_DIR = $$msvcIntermediate/ui
+    # Embed compiler debug records in each object, avoiding the shared
+    # mspdbsrv compiler-PDB service when multiple MSVC versions are installed.
+    QMAKE_CFLAGS_DEBUG -= -Zi /Zi
+    QMAKE_CXXFLAGS_DEBUG -= -Zi /Zi
+    QMAKE_CFLAGS_DEBUG += -Z7
+    QMAKE_CXXFLAGS_DEBUG += -Z7
+    QMAKE_LFLAGS_DEBUG += /PDB:$$shell_quote($$shell_path($$OUT_PWD/debug/$${TARGET}-msvc-$${msvcCompilerTag}.pdb))
+}
+
 # Project Include Directories
 INCLUDEPATH += $$PWD/include
 isEmpty(MYSQL_ROOT): MYSQL_ROOT = "C:/Program Files/MySQL/MySQL Server 8.0"

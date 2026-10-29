@@ -29,4 +29,10 @@ else:
     replay = os.environ.get("GAUGE_OCR_FIXTURE_TOKENS")
     if replay:
         tokens = json.loads(Path(replay).read_text(encoding="utf-8"))["tokens"]
+        full_height = os.environ.get("GAUGE_OCR_FIXTURE_FULL_HEIGHT")
+        if full_height:
+            import struct
+            height = struct.unpack(">I", Path(args.image).read_bytes()[20:24])[0]
+            for token in tokens:
+                token["polygon"] = [[x, y-(int(full_height)-height)] for x, y in token["polygon"]]
     Path(args.output).write_text(json.dumps(dict(tokens=tokens)), encoding="utf-8")

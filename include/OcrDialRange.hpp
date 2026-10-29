@@ -140,6 +140,23 @@ inline std::vector<MajorTick> majorTicks(const cv::Mat& image,const QJsonArray& 
         if(existing==result.end())result.push_back({t,innerWidth,outerWidth});
         else if(t.length>existing->tick.length*1.15)*existing={t,innerWidth,outerWidth};
     }
+    // The thick head and thin stem of the zero tick can be separate components.
+    // Merge overlapping radial pieces before ring validation and length ranking;
+    // otherwise its head falls inside the ring and a nearby minor tick wins.
+    for(size_t i=0;i<result.size();++i)for(size_t j=i+1;j<result.size();) {
+        auto& a=result[i];const auto b=result[j];
+        const double ai=a.tick.radius-a.tick.length*.5,ao=a.tick.radius+a.tick.length*.5;
+        const double bi=b.tick.radius-b.tick.length*.5,bo=b.tick.radius+b.tick.length*.5;
+        const double inner=std::min(ai,bi),outer=std::max(ao,bo);
+        if(AutoScaleCalibration::distance(a.tick.angle,b.tick.angle)<1.7&&
+           std::max(ai,bi)<=std::min(ao,bo)+radius*.015&&outer-inner<=radius*.24) {
+            const double angle=AutoScaleCalibration::wrap(a.tick.angle+std::remainder(b.tick.angle-a.tick.angle,360.)*b.tick.length/(a.tick.length+b.tick.length));
+            const double r=(inner+outer)*.5,rad=angle*CV_PI/180;
+            const double innerWidth=ai<=bi?a.innerWidth:b.innerWidth,outerWidth=ao>=bo?a.outerWidth:b.outerWidth;
+            a={{center+cv::Point2f(float(r*std::cos(rad)),float(r*std::sin(rad))),angle,r,outer-inner},innerWidth,outerWidth};
+            result.erase(result.begin()+j);
+        } else ++j;
+    }
     return result;
 }
 inline double printedRadius(const cv::RotatedRect& ellipse,cv::Point2f p) {
@@ -176,11 +193,15 @@ inline Endpoints matchEndpoints(const Result& range,const std::vector<AutoScaleC
             if(!onRing(lo)||!onRing(hi))continue;
         } else if(std::abs(lo.radius-hi.radius)>radius*.08)continue;
         closestSweepError=std::min(closestSweepError,std::abs(sweep-270));
-        if(std::abs(sweep-270)>6)continue;
+        // A wide tolerance admits the zero-stop symbol or adjacent tick as
+        // the minimum endpoint. Keep the measured span within the original
+        // narrow tolerance; geometry errors must not be hidden by acceptance.
+        constexpr double endpointSweepTolerance=6;
+        if(std::abs(sweep-270)>endpointSweepTolerance)continue;
         pairs.push_back({a.index,b.index,a.cost+b.cost+std::abs(sweep-270)*.7+std::abs(lo.radius-hi.radius)/radius*20});
     }
     if(pairs.empty())return {{},closestSweepError<360?
-        QStringLiteral(u"起止刻度跨度偏离270°约%1°，可能存在四切点或轴心偏差。请先手动修正四切点及轴心，再重新识别；原刻度标定保留。").arg(closestSweepError,0,'f',1):
+        QStringLiteral(u"起止刻度跨度偏离270°约%1°，超出允许的±6°范围；未采用本次起止刻度，原标定保留。").arg(closestSweepError,0,'f',1):
         QStringLiteral(u"数字外侧未找到可靠起止大刻度线，请检查四切点、轴心及图像清晰度；原刻度标定保留。")};
     std::sort(pairs.begin(),pairs.end(),[](const Pair& a,const Pair& b){return a.cost<b.cost;});
     const auto best=pairs.front();
@@ -281,7 +302,10 @@ inline Calibration calibrate(const cv::Mat& image,const QJsonArray& tokens,cv::P
             // default tight prior for short, straight or competing strokes.
             const bool directMajor=printed.size.width>0&&labelError<=4&&taper>=.25&&t.length>=radius*.11&&t.length>=nextLength*1.35;
             if(angularError>(directMajor?8.:5.)+uncertainty)continue;
-            candidates.push_back({ratio,angularError+distance(t.angle,labelAngle)*.25-t.length/radius*12-taper*.8,i});
+            // A nearby needle edge can be closer to the uniform-angle prior
+            // than the real printed tick. Give the observed numeric label
+            // enough weight to distinguish those competing measured strokes.
+            candidates.push_back({ratio,angularError+labelError*.5-t.length/radius*12-taper*.8,i});
         }
         if(candidates.empty()){++result.skipped;continue;}
         std::sort(candidates.begin(),candidates.end(),[](const Choice& a,const Choice& b){return a.cost<b.cost;});

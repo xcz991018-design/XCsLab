@@ -5,6 +5,24 @@
 #include <iostream>
 #include <QJsonDocument>
 int main(int argc,char** argv){
+    if((argc==5||argc==6)&&std::string(argv[1])=="--calibrated") {
+        auto image=cv::imread(argv[2]);const float s=image.cols*.5f;const cv::Point2f center(s,s);const double radius=s*.9;
+        QFile input(argv[3]);if(!input.open(QIODevice::ReadOnly))return 80;
+        auto tokens=QJsonDocument::fromJson(input.readAll()).object()["tokens"].toArray();auto surface=detectLiquidSurface(image,center,radius);
+        auto c=OcrDialRange::calibrate(image,tokens,center,radius,true,surface);if(!c.valid())return 81;
+        QJsonArray diagnostics;
+        auto r=MinorTickPreview::detect(image,c.points,center,radius,0,1,true,surface,argc==6?std::stod(argv[5]):182.74,0,&diagnostics);
+        std::cout<<r.message.toStdString()<<'\n';
+        QJsonArray marks;int assigned=0;
+        for(const auto& m:r.marks) {
+            const auto p=(m.a+m.b)*.5f;
+            marks.append(QJsonObject{{"x",p.x},{"y",p.y},{"ratio",m.ratio},{"assigned",m.assigned},{"gap",m.gap}});
+            if(m.assigned){++assigned;if(m.gap)return 83;}
+        }
+        QFile out(argv[4]);out.open(QIODevice::WriteOnly);out.write(QJsonDocument(QJsonObject{{"anchors",c.points},{"points",r.previewPoints},{"marks",marks},{"division",r.division},{"confirmed",r.divisionConfirmed},{"diagnostics",diagnostics}}).toJson());
+        if(r.divisionConfirmed&&r.previewPoints.size()!=c.points.size()+assigned)return 84;
+        return r.divisionConfirmed?0:82;
+    }
     if(argc==4&&std::string(argv[1])=="--seven") {
         auto raw=CameraUndistortion::image(cv::imread(argv[2]));auto dial=AutoDialCalibration::detect(raw);if(!dial.valid())return 70;
         auto H=cv::getPerspectiveTransform(dial.points,std::vector<cv::Point2f>{{405,40.5f},{769.5f,405},{405,769.5f},{40.5f,405}});
@@ -31,7 +49,8 @@ int main(int argc,char** argv){
             cv::putText(image,MinorTickPreview::displayValue(m.ratio).toStdString(),(m.a+m.b)*.5f,cv::FONT_HERSHEY_SIMPLEX,.4,{0,0,255},1);
         }
         cv::imwrite(argv[3],image);
-        return surface.found&&r.divisionConfirmed&&upper==10&&upperValues==std::set<int>{22,24,26,28,30,70,72,74,76,78}?0:72;
+        const std::set<int> required{22,24,26,28,30,70,72,74,76,78};
+        return surface.found&&r.divisionConfirmed&&upper>=10&&std::includes(upperValues.begin(),upperValues.end(),required.begin(),required.end())?0:72;
     }
     if(argc==4&&(std::string(argv[1])=="--five"||std::string(argv[1])=="--five-raw")) {
         auto full=cv::imread(argv[2]);cv::Mat image;

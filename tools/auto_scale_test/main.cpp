@@ -12,6 +12,39 @@ static cv::Point2f point(double angle,double r=260) {
 int main(int argc,char** argv) {
     QCoreApplication app(argc,argv);
     try {
+        if(argc==4&&(QString::fromLocal8Bit(argv[1])=="--ocr-liquid"||QString::fromLocal8Bit(argv[1])=="--ocr-liquid800")) {
+            auto image=CameraUndistortion::image(cv::imread(argv[2]));const auto dial=AutoDialCalibration::detect(image);require(dial.valid(),"liquid OCR dial");
+            const int size=QString::fromLocal8Bit(argv[1])=="--ocr-liquid800"?800:810;
+            const float half=size*.5f,margin=size*.05f;const cv::Point2f center(half,half);const double radius=half-margin;
+            auto H=cv::getPerspectiveTransform(dial.points,std::vector<cv::Point2f>{{half,margin},{size-margin,half},{half,size-margin},{margin,half}});
+            cv::Mat rectified;cv::warpPerspective(image,rectified,H,{size,size},cv::INTER_CUBIC);
+            const auto surface=detectLiquidSurface(rectified,center,radius);require(surface.found,"liquid surface");
+            const auto region=PaddleScaleOcr::inputRegion(rectified,surface);cv::imwrite(std::string(argv[3])+"-input.png",region.image);
+            auto cancelled=std::make_shared<std::atomic_bool>(false);QElapsedTimer timer;timer.start();
+            const auto result=PaddleScaleOcr::recognize(rectified,cancelled,surface);require(result.valid(),qPrintable(result.error));
+            auto tokens=PaddleScaleOcr::numericTokens(result.tokens);std::vector<double> values;
+            for(auto t:tokens){auto o=t.toObject();values.push_back(o["text"].toString().toDouble());}
+            for(double expected:{0.,.2,.8,1.})require(std::any_of(values.begin(),values.end(),[&](double v){return std::abs(v-expected)<1e-6;}),"masked OCR must retain endpoints and lower major labels");
+            const auto calibration=OcrDialRange::calibrate(rectified,result.tokens,center,radius,true,surface);
+            QFile out(QString::fromLocal8Bit(argv[3])+".json");require(out.open(QIODevice::WriteOnly),"masked OCR output");
+            out.write(QJsonDocument(QJsonObject{{"tokens",tokens},{"elapsed_ms",double(timer.elapsed())},{"crop_top",region.top},{"points",calibration.points}}).toJson());
+            out.close();cv::imwrite(std::string(argv[3])+"-full.png",rectified);
+            require(calibration.valid(),qPrintable(calibration.error));
+            std::cout<<"PASS cropped OCR: "<<region.image.cols<<"x"<<region.image.rows<<" top="<<region.top<<" tokens="<<tokens.size()<<" elapsed_ms="<<timer.elapsed()<<'\n';return 0;
+        }
+        {
+            cv::Mat image(100,120,CV_8UC3,cv::Scalar(80,80,80));LiquidSurface surface;
+            surface.found=true;surface.centerX=60;surface.radius=60;surface.y0=30;surface.slope=6;surface.curve=4;surface.margin=2;
+            const auto region=PaddleScaleOcr::inputRegion(image,surface);require(region.top>0&&region.image.rows<100,"crop must reduce OCR input height");
+            for(int y=0;y<region.image.rows;++y)for(int x=0;x<region.image.cols;++x)
+                if(surface.excludes(x,y+region.top))require(region.image.at<cv::Vec3b>(y,x)==cv::Vec3b(255,255,255),"sloped and curved masked pixels must be blank");
+            QJsonArray raw{QJsonObject{{"text","1"},{"polygon",QJsonArray{QJsonArray{60,40},QJsonArray{65,40},QJsonArray{65,60},QJsonArray{60,60}}}},
+                QJsonObject{{"text","0.4"},{"polygon",QJsonArray{QJsonArray{110,0},QJsonArray{115,0},QJsonArray{115,15},QJsonArray{110,15}}}}};
+            const auto restored=PaddleScaleOcr::restoreTokens(raw,region.top,surface);
+            require(restored.size()==1&&restored[0].toObject()["polygon"].toArray()[0].toArray()[1].toDouble()==40+region.top,"coordinate restoration and boundary crossing exclusion");
+            require(PaddleScaleOcr::inputRegion(image,{}).image.rows==100,"no liquid preserves full image");
+            surface.y0=120;require(PaddleScaleOcr::inputRegion(image,surface).image.empty(),"fully masked image has no OCR region");
+        }
         if(argc==4&&(QString::fromLocal8Bit(argv[1])=="--dial"||QString::fromLocal8Bit(argv[1])=="--dial-baseline")) {
             auto image=CameraUndistortion::image(cv::imread(argv[2]));
             const auto dial=AutoDialCalibration::detect(image,QString::fromLocal8Bit(argv[1])!="--dial-baseline");require(dial.valid(),qPrintable(dial.error));
@@ -184,6 +217,16 @@ int main(int argc,char** argv) {
         cv::Mat endpointImage(800,800,CV_8UC3,cv::Scalar(245,245,245));
         for(const auto& t:endpointTicks)cv::line(endpointImage,point(t.angle,t.radius-t.length/2),point(t.angle,t.radius+t.length/2),{10,10,10},4);
         require(OcrDialRange::findEndpoints(endpointImage,endpointRange,{400,400},360,true).valid(),"two-label endpoint matching from actual line pixels");
+        cv::Mat splitZero(800,800,CV_8UC3,cv::Scalar(245,245,245));
+        cv::line(splitZero,point(135,245),point(135,272),{10,10,10},8);
+        cv::line(splitZero,point(135,270),point(135,312),{10,10,10},2);
+        cv::line(splitZero,point(143,282),point(143,307),{10,10,10},3);
+        const auto zeroPieces=OcrDialRange::majorTicks(splitZero,{}, {400,400},360,{});
+        int zeroCount=0;
+        for(const auto& piece:zeroPieces)if(AutoScaleCalibration::distance(piece.tick.angle,135)<1.7) {
+            ++zeroCount;require(piece.tick.length>55,"zero head and thin stem must retain their full radial extent");
+        }
+        require(zeroCount==1,"zero head and stem must form one major candidate rather than favor the next minor tick");
         QJsonArray merged;const QJsonObject middle{{"x",400},{"y",120},{"ratio",.5}};
         require(OcrDialRange::mergeEndpoints(QJsonArray{middle},matchedEndpoints,{400,400},800,true,merged)&&merged.size()==3&&merged[1].toObject()==middle,
             "endpoint replacement preserves existing middle points");
@@ -203,8 +246,15 @@ int main(int argc,char** argv) {
             "observed annulus support must allow unequal endpoint radii about an offset hub, while retaining the measured 270-degree span");
         const std::vector<Tick> distortedTicks{{point(146,280),146,280,38},{point(47,280),47,280,38}};
         const auto distorted=OcrDialRange::matchEndpoints(endpointRange,distortedTicks,{400,400},360,true);
-        require(!distorted.valid()&&distorted.error.contains(QStringLiteral(u"四切点")),
-            "reported 261-degree distorted endpoints must not be accepted as successful calibration");
+        require(!distorted.valid(),"261-degree endpoints must not admit an adjacent stroke as the minimum");
+        for(double end:{39.,51.}) {
+            const std::vector<Tick> boundary{{point(135,280),135,280,38},{point(end,280),end,280,38}};
+            require(OcrDialRange::matchEndpoints(endpointRange,boundary,{400,400},360,true).valid(),"both 6-degree tolerance boundaries are accepted");
+        }
+        const std::vector<Tick> excessive{{point(149,280),149,280,38},{point(46,280),46,280,38}};
+        require(!OcrDialRange::matchEndpoints(endpointRange,excessive,{400,400},360,true).valid(),"13-degree span error is still rejected");
+        const std::vector<Tick> adjacent{{point(144,280),144,280,38},{point(45,280),45,280,38}};
+        require(!OcrDialRange::matchEndpoints(endpointRange,adjacent,{400,400},360,true).valid(),"a nearby long zero-stop stroke cannot pass with a 9-degree endpoint error");
         require(!match({}, {},{400,400},360,1,1,true).valid(),"invalid range");
         // Major heads, thin stems, shorter intervening ticks and a nearby needle.
         // Validate against drawn pixel geometry, including all lower OCR values.
