@@ -355,6 +355,18 @@ int main(int argc,char** argv) {
         const auto resizedEndpoints=ScaleCalibration::scaled(planeEndpoints,2,2);
         require(ScaleCalibration::build(resizedEndpoints,{800,850},{},true,planeMapping)&&std::abs(planeMapping.offsets.back()-270)<.01,"scale origin must resize with frame resolution");
         std::cout<<"Multi-feature independent angle RMSE="<<structuralError<<" degrees\n";
+        // Printed loops must not borrow disconnected strokes as needle arms.
+        const cv::RotatedRect cap({100,100},{20,20},0);
+        cv::Mat detached(200,200,CV_8UC1,cv::Scalar(210));
+        cv::circle(detached,{100,100},10,cv::Scalar(20),-1);
+        cv::line(detached,{120,100},{146,100},cv::Scalar(20),3);
+        cv::line(detached,{54,100},{80,100},cv::Scalar(20),3);
+        require(AutoDialCalibration::needleSpokes(detached,cap,100)==0,
+            "separated text/tick strokes cannot establish an axis cap");
+        cv::line(detached,{109,100},{120,100},cv::Scalar(20),3);
+        cv::line(detached,{80,100},{91,100},cv::Scalar(20),3);
+        require(AutoDialCalibration::needleSpokes(detached,cap,100)>0,
+            "continuous opposing needle arms establish an axis cap");
         cv::Mat oblique;cv::warpPerspective(synthetic,oblique,knownProjection,{800,600});
         const auto autoDial=AutoDialCalibration::detect(oblique);
         require(autoDial.valid(),"automatic four-point detection on known projected dial");

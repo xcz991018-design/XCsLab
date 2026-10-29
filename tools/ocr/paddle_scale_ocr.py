@@ -18,6 +18,36 @@ def numeric_text(text):
     return text
 
 
+def narrow_digit_regions(view, numeric_heights):
+    """Find single upright glyphs even when the text detector omitted them."""
+    import cv2
+    import numpy as np
+
+    if not numeric_heights:
+        return []
+    digit_height = float(np.median(numeric_heights))
+    gray = cv2.cvtColor(view, cv2.COLOR_BGR2GRAY)
+    _, global_mask = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV | cv2.THRESH_OTSU)
+    # Local contrast survives the uneven lighting and liquid on a dial. Keep
+    # both segmentations: a stroke can merge with a tick in just one of them.
+    block = max(3, int(digit_height * 1.5) | 1)
+    local_mask = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                                     cv2.THRESH_BINARY_INV, block, 9)
+    regions = []
+    for mask in (global_mask, local_mask):
+        count, _, stats, _ = cv2.connectedComponentsWithStats(mask)
+        for left, top, w, h, area in stats[1:count]:
+            # A '1' is shorter than a decimal label's detector box (which
+            # includes padding). Antialiasing also widens its serif.
+            if not (.55*digit_height <= h <= 1.5*digit_height and
+                    max(3, .1*h) <= w <= .5*h and area >= .12*w*h):
+                continue
+            region = (int(left), int(top), int(left+w), int(top+h))
+            if region not in regions:
+                regions.append(region)
+    return regions
+
+
 def refine_tall_digits(pipeline_options, view, tokens, rotation, restore):
     """Recognize narrow boxes upright. The normal OCR crop rotates h/w>=1.5,
     which turns a single vertical '1' sideways before recognizing it.
@@ -36,7 +66,8 @@ def refine_tall_digits(pipeline_options, view, tokens, rotation, restore):
         left, top = np.floor(polygon.min(axis=0)).astype(int)
         right, bottom = np.ceil(polygon.max(axis=0)).astype(int)
         w, h = right-left, bottom-top
-        if NUMERIC.fullmatch(token["text"]) and token["score"] >= .7 and h > min(width,height)*.025:
+        if (NUMERIC.fullmatch(token["text"]) and len(token["text"]) <= 6 and
+                token["score"] >= .7 and min(width,height)*.025 < h < min(width,height)*.18):
             numeric_heights.append(h)
         tall = h > 1.3*w
         numeric_fragment = len(token["text"]) <= 6 and any(c.isdigit() for c in token["text"])
@@ -47,17 +78,10 @@ def refine_tall_digits(pipeline_options, view, tokens, rotation, restore):
         regions.append((max(0,left),max(0,top),min(width,right),min(height,bottom)))
     # A text detector can omit a lone '1' completely. Propose upright connected
     # glyphs of comparable height to detected numbers; recognition still decides.
-    if numeric_heights:
-        digit_height = float(np.median(numeric_heights))
-        gray = cv2.cvtColor(view, cv2.COLOR_BGR2GRAY)
-        _, mask = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV | cv2.THRESH_OTSU)
-        count, _, stats, _ = cv2.connectedComponentsWithStats(mask)
-        for left, top, w, h, area in stats[1:count]:
-            if not (.75*digit_height <= h <= 1.5*digit_height and 3 <= w <= .3*h and area >= .12*w*h):
-                continue
-            if any(abs(left-r[0])+abs(top-r[1]) < 12 for r in regions):
-                continue
-            regions.append((int(left),int(top),int(left+w),int(top+h)))
+    detected_regions = set(regions)
+    for region in narrow_digit_regions(view, numeric_heights):
+        if region not in regions:
+            regions.append(region)
     if not regions:
         return []
     model_name = pipeline_options.get("text_recognition_model_name", "PP-OCRv5_server_rec")
@@ -71,13 +95,21 @@ def refine_tall_digits(pipeline_options, view, tokens, rotation, restore):
         crop = view[top:bottom, left:right]
         # Add a small background margin without rotating the tall glyph.
         pad = max(3, int((bottom-top)*.12))
-        crop = cv2.copyMakeBorder(crop, pad, pad, pad, pad, cv2.BORDER_REPLICATE)
+        # Replicating a tight component's border extends its black stroke into
+        # the margin. Use the surrounding background instead.
+        context = view[max(0,top-pad):min(height,bottom+pad), max(0,left-pad):min(width,right+pad)]
+        background = tuple(float(c) for c in np.percentile(context, 75, axis=(0, 1)))
+        crop = cv2.copyMakeBorder(crop, pad, pad, pad, pad, cv2.BORDER_CONSTANT, value=background)
         crops.append(cv2.resize(crop, None, fx=2, fy=2, interpolation=cv2.INTER_CUBIC))
         owners.append(region)
     result = []
     for prediction, region in zip(recognizer.predict(crops), owners):
         text, confidence = numeric_text(prediction["rec_text"]), float(prediction["rec_score"])
         if not NUMERIC.fullmatch(text) or confidence < .65:
+            continue
+        # Component proposals may include tick strokes. Only use them to
+        # recover the narrow digit, and demand stronger recognition evidence.
+        if region not in detected_regions and (text != "1" or confidence < .9):
             continue
         left, top, right, bottom = region
         result.append(dict(text=text, score=confidence, rotation=rotation, orientation_preferred=True,

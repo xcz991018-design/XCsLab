@@ -63,7 +63,7 @@ inline Comparison compare(const Result& result,const QJsonArray& anchors,cv::Poi
     return out;
 }
 inline Result detect(const cv::Mat& image,const QJsonArray& anchors,cv::Point2f hub,double radius,
-                     double minimum,double maximum,bool clockwise,const LiquidSurface& surface,double pointerAngle=std::numeric_limits<double>::quiet_NaN(),double confirmedDivision=0) {
+                     double minimum,double maximum,bool clockwise,const LiquidSurface& requestedSurface,double pointerAngle=std::numeric_limits<double>::quiet_NaN(),double confirmedDivision=0) {
     Result out; ScaleCalibration::Mapping mapping;
     const bool manualDivision=std::isfinite(confirmedDivision)&&confirmedDivision>0;
     if(image.empty()||image.depth()!=CV_8U||radius<30||!std::isfinite(maximum-minimum)||maximum<=minimum||
@@ -71,6 +71,7 @@ inline Result detect(const cv::Mat& image,const QJsonArray& anchors,cv::Point2f 
        !ScaleCalibration::build(anchors,hub,{},clockwise,mapping)) {
         out.message=QStringLiteral(u"请先确认轴心、量程及至少两个有效大刻度锚点。");return out;
     }
+    const auto surface=requestedSurface;
     if(surface.ambiguous){out.message=QStringLiteral(u"液面有歧义，请先手动确认液面。");return out;}
     const auto center=ScaleCalibration::origin(anchors.first().toObject(),hub);
     for(const auto& v:anchors)if(cv::norm(ScaleCalibration::origin(v.toObject(),hub)-center)>1) {
@@ -83,7 +84,10 @@ inline Result detect(const cv::Mat& image,const QJsonArray& anchors,cv::Point2f 
     cv::Mat ink;
     int window=std::max(15,cvRound(radius*.085)|1);
     cv::adaptiveThreshold(gray,ink,255,cv::ADAPTIVE_THRESH_GAUSSIAN_C,cv::THRESH_BINARY_INV,window,7);
-    const auto lines=AutoScaleCalibration::ticks(gray,center,radius,.09,.018);
+    auto detectionGray=gray.clone();
+    if(surface.found)for(int y=0;y<gray.rows;++y)for(int x=0;x<gray.cols;++x)
+        if(surface.excludes(x,y))detectionGray.at<uchar>(y,x)=255;
+    const auto lines=AutoScaleCalibration::ticks(detectionGray,center,radius,.09,.018);
     auto point=[&](double angle,double r){const double a=angle*CV_PI/180;return center+cv::Point2f(float(r*std::cos(a)),float(r*std::sin(a)));};
     struct Model {int interval,n;double division,score,phase,step;};std::vector<Model> models;
     struct Interval {double start,sweep,leftRatio,rightRatio,ring;std::vector<int> marks;double middleOffset{-1},middleRatio{-1};bool minimumSide{true};};
@@ -113,7 +117,9 @@ inline Result detect(const cv::Mat& image,const QJsonArray& anchors,cv::Point2f 
             const double offset=ScaleCalibration::span(start,t.angle,clockwise);
             const auto a=point(t.angle,t.radius-t.length*.5),b=point(t.angle,t.radius+t.length*.5);
             if(std::isfinite(pointerAngle)&&AutoScaleCalibration::distance(t.angle,pointerAngle)<2.5)continue;
-            if(offset<1.4||offset>sweep-1.4||std::abs(t.radius-ring)>radius*.13||
+            bool excluded=false;
+            for(int sample=0;sample<=8;++sample){const auto p=a+(b-a)*(sample/8.f);excluded|=surface.excludes(p.x,p.y);}
+            if(excluded||offset<1.4||offset>sweep-1.4||std::abs(t.radius-ring)>radius*.13||
                // Small ticks share the outer ring with major ticks. A glyph
                // fragment may be radial but stops inside the major midpoint.
                t.radius+t.length*.5<ring-radius*.025||
@@ -147,7 +153,10 @@ inline Result detect(const cv::Mat& image,const QJsonArray& anchors,cv::Point2f 
             for(const auto& c:candidates){lengths.push_back(c.tick.length);if(c.offset>sweep*.35&&c.offset<sweep*.65&&c.confidence>=.6)central.push_back(&c);}
             std::sort(lengths.begin(),lengths.end());
             std::sort(central.begin(),central.end(),[](const Candidate* a,const Candidate* b){return a->tick.length>b->tick.length;});
-            if(!central.empty()&&!lengths.empty()&&central[0]->tick.length>lengths[lengths.size()/2]*1.3&&
+            // Occlusion can shorten a major stroke. Its unique prominence
+            // among central candidates and subsequent cross-interval lattice
+            // agreement are stronger evidence than a 30% length advantage.
+            if(!central.empty()&&!lengths.empty()&&central[0]->tick.length>lengths[lengths.size()/2]*1.1&&
                (central.size()==1||central[0]->tick.length>central[1]->tick.length*1.2)) {
                 int before=0,after=0;
                 for(const auto& c:candidates)if(c.offset<central[0]->offset-1)++before;else if(c.offset>central[0]->offset+1)++after;
@@ -169,7 +178,9 @@ inline Result detect(const cv::Mat& image,const QJsonArray& anchors,cv::Point2f 
             if(step<1.8)continue;
             std::set<int> occupied;int aligned=0;double error=0;
             for(const auto& c:candidates){const int k=cvRound((c.offset-phase)/step);const double e=std::abs(c.offset-phase-k*step)/step;
-                if(k>0&&k<n&&e<.22){occupied.insert(k);++aligned;error+=e;}}
+                // Residual perspective/refraction can shift a measured stroke
+                // by 0.3 of a cell; keep it well below the half-cell ambiguity.
+                if(k>0&&k<n&&e<.30){occupied.insert(k);++aligned;error+=e;}}
             int visibleCount=0;for(int k=1;k<n;++k){const double x=phase+k*step;
                 if(x>1.4&&x<sweep-1.4)visibleCount+=visible[std::clamp(cvRound(x/sweep*bins),0,bins)];}
             if(occupied.size()<3||visibleCount<3)continue;
@@ -215,7 +226,7 @@ inline Result detect(const cv::Mat& image,const QJsonArray& anchors,cv::Point2f 
                 const auto& m=out.marks[index];const auto mid=(m.a+m.b)*.5f;
                 const double a=AutoScaleCalibration::wrap(std::atan2(mid.y-center.y,mid.x-center.x)*180/CV_PI);
                 const double offset=ScaleCalibration::span(section.start,a,clockwise);const int k=cvRound((offset-model.phase)/step);
-                if(k>0&&k<model.n&&std::abs(offset-model.phase-k*step)<step*(manualDivision?.35:.22)&&m.confidence>=.60)slotsByIndex[k].push_back(index);
+                if(k>0&&k<model.n&&std::abs(offset-model.phase-k*step)<step*(manualDivision?.35:.30)&&m.confidence>=.60)slotsByIndex[k].push_back(index);
             }
             for(int k=1;k<model.n;++k) {
                 const double ratio=section.leftRatio+(section.rightRatio-section.leftRatio)*k/model.n;
@@ -257,6 +268,69 @@ inline Result detect(const cv::Mat& image,const QJsonArray& anchors,cv::Point2f 
             m.ratio=std::clamp(std::round(m.ratio/step)*step,0.,1.);
         }
     }
+    // Masked intervals cannot use whole-span angular interpolation: refraction
+    // and perspective change the spacing above an anchor. Count the observed
+    // strokes outward from each known value, using their local spacing. These
+    // remain estimates and never become saved calibration points.
+    const auto measuredPoints=out.previewPoints;
+    std::vector<bool> measuredAssignments;for(const auto& m:out.marks)measuredAssignments.push_back(m.assigned);
+    if(out.divisionConfirmed&&out.division>0)for(const auto& section:intervals) {
+        const double valueStep=out.division/(maximum-minimum);
+        for(bool fromLeft:{true,false}) {
+            struct Nearby {int index;double offset;};std::vector<Nearby> nearby;
+            for(int index:section.marks) {
+                const auto& mark=out.marks[index];
+                const auto p=(mark.a+mark.b)*.5f-center;
+                const double angle=AutoScaleCalibration::wrap(std::atan2(p.y,p.x)*180/CV_PI);
+                const double offset=ScaleCalibration::span(section.start,angle,clockwise);
+                nearby.push_back({index,fromLeft?offset:section.sweep-offset});
+            }
+            std::sort(nearby.begin(),nearby.end(),[](const Nearby& a,const Nearby& b){return a.offset<b.offset;});
+            if(nearby.size()<3)continue;
+            std::vector<double> spacings;
+            for(size_t i=1;i<std::min(size_t(5),nearby.size());++i) {
+                const double d=nearby[i].offset-nearby[i-1].offset;
+                if(d>1.4)spacings.push_back(d);
+            }
+            if(spacings.size()<2)continue;
+            std::sort(spacings.begin(),spacings.end());const double spacing=spacings[spacings.size()/2];
+            double previous=0;int count=0;
+            std::vector<int> chain;
+            for(const auto& candidate:nearby) {
+                const double delta=candidate.offset-previous;
+                if(candidate.offset>section.sweep*.5||delta<spacing*.5||delta>spacing*1.5)break;
+                ++count;previous=candidate.offset;
+                auto& mark=out.marks[candidate.index];
+                if(!mark.assigned)mark.ratio=std::clamp((fromLeft?section.leftRatio:section.rightRatio)+(fromLeft?1:-1)*count*valueStep,0.,1.);
+                chain.push_back(candidate.index);
+            }
+            // A confirmed global division plus a continuous, locally regular
+            // chain supplies evidence even when the opposite anchor is masked.
+            bool regular=chain.size()>=3;previous=0;
+            for(size_t i=0;i<chain.size();++i) {
+                const double delta=nearby[i].offset-previous;previous=nearby[i].offset;
+                regular&=std::abs(delta/spacing-1)<.25&&out.marks[chain[i]].confidence>=.6;
+            }
+            if(regular)for(int index:chain) {
+                auto& mark=out.marks[index];if(mark.assigned)continue;
+                const auto p=(mark.a+mark.b)*.5f;
+                mark.assigned=true;mark.confidence=std::min(mark.confidence,out.confidence);
+                out.previewPoints.append(QJsonObject{{"x",p.x},{"y",p.y},{"ratio",mark.ratio},{"origin_x",center.x},{"origin_y",center.y},{"source","minor_tick"}});
+            }
+        }
+    }
+    if(out.divisionConfirmed) {
+        const auto before=out.previewPoints;
+        std::vector<QJsonObject> ordered;for(const auto& p:before)ordered.push_back(p.toObject());
+        std::sort(ordered.begin(),ordered.end(),[](const QJsonObject& a,const QJsonObject& b){return a["ratio"].toDouble()<b["ratio"].toDouble();});
+        out.previewPoints={};for(const auto& p:ordered)out.previewPoints.append(p);
+        ScaleCalibration::Mapping checked;
+        if(!ScaleCalibration::valid(out.previewPoints,image.cols,image.rows,hub)||!ScaleCalibration::build(out.previewPoints,hub,{},clockwise,checked)) {
+            // Preserve the measured anchors; never persist a conflicting chain.
+            out.previewPoints=measuredPoints;
+            for(size_t i=0;i<out.marks.size();++i)out.marks[i].assigned=measuredAssignments[i];
+        }
+    }
     // Numerical labels must not make an unconfirmed subdivision look usable.
     if(!out.divisionConfirmed)for(auto& m:out.marks){m.ratio=-1;m.assigned=false;}
     const int gaps=int(std::count_if(out.marks.begin(),out.marks.end(),[](const Mark& m){return m.gap;}));
@@ -270,4 +344,3 @@ inline Result detect(const cv::Mat& image,const QJsonArray& anchors,cv::Point2f 
     return out;
 }
 }
-

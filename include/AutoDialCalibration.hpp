@@ -70,7 +70,10 @@ inline double needleSpokes(const cv::Mat& gray,const cv::RotatedRect& hub,double
                 if(x>=0&&y>=0&&x<gray.cols&&y<gray.rows)darkest=std::min(darkest,int(gray.at<uchar>(y,x)));
             }
             if(darkest<threshold){gap=0;last=d;}else ++gap;
-            if(gap>3)break;
+            // Permit a single antialiased sample, but do not bridge a blank
+            // gap from a printed digit to an unrelated tick or needle edge.
+            // Such bridges make an '8' look like a second axis cap.
+            if(gap>1)break;
         }
         return std::max(0.0,last-start);
     };

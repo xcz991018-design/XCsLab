@@ -1,9 +1,74 @@
 #include "MinorTickPreview.hpp"
 #include "AutoDialCalibration.hpp"
 #include "CameraUndistortion.hpp"
+#include "OcrDialRange.hpp"
 #include <iostream>
 #include <QJsonDocument>
 int main(int argc,char** argv){
+    if(argc==4&&std::string(argv[1])=="--seven") {
+        auto raw=CameraUndistortion::image(cv::imread(argv[2]));auto dial=AutoDialCalibration::detect(raw);if(!dial.valid())return 70;
+        auto H=cv::getPerspectiveTransform(dial.points,std::vector<cv::Point2f>{{405,40.5f},{769.5f,405},{405,769.5f},{40.5f,405}});
+        cv::Mat image;cv::warpPerspective(raw,image,H,{810,810},cv::INTER_CUBIC);
+        const cv::Point2f center(405,405);QJsonArray anchors;
+        for(const auto& p:std::vector<cv::Point3d>{{207,568,0},{132,348,.2},{672,346,.8},{578,578,1}})
+            anchors.append(QJsonObject{{"x",p.x},{"y",p.y},{"ratio",p.z}});
+        auto surface=detectLiquidSurface(image,center,364.5);
+        QJsonArray tokens;
+        for(const auto& p:std::vector<cv::Point3d>{{250,525,0},{201,354,.2},{604,354,.8},{552,525,1}})
+            tokens.append(QJsonObject{{"text",QString::number(p.z)},{"score",.99},{"polygon",QJsonArray{QJsonArray{p.x-18,p.y-25},QJsonArray{p.x+18,p.y-25},QJsonArray{p.x+18,p.y+25},QJsonArray{p.x-18,p.y+25}}}});
+        const auto calibration=OcrDialRange::calibrate(image,tokens,center,364.5,true,surface);
+        if(!calibration.valid())return 73;
+        anchors=calibration.points;
+        std::cout<<"surface "<<surface.found<<" ambiguous "<<surface.ambiguous<<" y "<<surface.y0<<"\n";
+        auto r=MinorTickPreview::detect(image,anchors,center,364.5,0,1,true,surface);
+        std::cout<<r.message.toStdString()<<"\n";
+        int upper=0;std::set<int> upperValues;
+        for(const auto& m:r.marks)if(!m.gap) {
+            for(int i=0;i<=8;++i){auto p=m.a+(m.b-m.a)*(i/8.f);if(surface.excludes(p.x,p.y))return 71;}
+            if(m.assigned&&m.ratio>.2&&m.ratio<.8){++upper;upperValues.insert(cvRound(m.ratio*100));}
+            std::cout<<(m.a+m.b)*.5f<<" value "<<m.ratio<<" assigned "<<m.assigned<<"\n";
+            cv::line(image,m.a,m.b,m.assigned?cv::Scalar(255,255,0):cv::Scalar(255,0,255),2);
+            cv::putText(image,MinorTickPreview::displayValue(m.ratio).toStdString(),(m.a+m.b)*.5f,cv::FONT_HERSHEY_SIMPLEX,.4,{0,0,255},1);
+        }
+        cv::imwrite(argv[3],image);
+        return surface.found&&r.divisionConfirmed&&upper==10&&upperValues==std::set<int>{22,24,26,28,30,70,72,74,76,78}?0:72;
+    }
+    if(argc==4&&(std::string(argv[1])=="--five"||std::string(argv[1])=="--five-raw")) {
+        auto full=cv::imread(argv[2]);cv::Mat image;
+        if(std::string(argv[1])=="--five-raw") {
+            auto raw=CameraUndistortion::image(full);auto dial=AutoDialCalibration::detect(raw);if(!dial.valid())return 60;
+            auto H=cv::getPerspectiveTransform(dial.points,std::vector<cv::Point2f>{{446.5f,44.65f},{848.35f,446.5f},{446.5f,848.35f},{44.65f,446.5f}});
+            cv::warpPerspective(raw,image,H,{893,893},cv::INTER_CUBIC);
+        } else {if(full.cols<1818||full.rows<1016)return 60;image=full(cv::Rect(925,123,893,893)).clone();}
+        const cv::Point2f center(447,447);QJsonArray anchors;
+        for(const auto& p:std::vector<cv::Point3d>{{233,631,0},{143,384,.2},{739,381,.8},{638,636,1}})
+            anchors.append(QJsonObject{{"x",p.x},{"y",p.y},{"ratio",p.z}});
+        LiquidSurface surface;surface.found=true;surface.centerX=447;surface.radius=405;surface.y0=188;surface.slope=-13;surface.margin=8;
+        auto r=MinorTickPreview::detect(image,anchors,center,405,0,1,true,surface);
+        std::cout<<r.message.toStdString()<<" confirmed="<<r.divisionConfirmed<<"\n";
+        for(const auto& m:r.marks)std::cout<<(m.a+m.b)*.5f<<" "<<m.ratio<<" "<<m.assigned<<"\n";
+        cv::imwrite(argv[3],image);
+        const int assigned=int(std::count_if(r.marks.begin(),r.marks.end(),[](const MinorTickPreview::Mark& m){return m.assigned;}));
+        return r.divisionConfirmed&&std::abs(r.division-.02)<1e-6&&assigned>=10?0:61;
+    }
+    if(argc==4&&std::string(argv[1])=="--masked-screenshot") {
+        auto full=cv::imread(argv[2]);if(full.cols<1617||full.rows<917)return 50;
+        auto image=full(cv::Rect(824,124,793,793)).clone();
+        const cv::Point2f center(396,396);QJsonArray anchors;
+        for(const auto& p:std::vector<cv::Point3d>{{206,562,0},{129,340,.2},{658,339,.8},{565,566,1}})
+            anchors.append(QJsonObject{{"x",p.x},{"y",p.y},{"ratio",p.z}});
+        LiquidSurface surface;surface.found=true;surface.centerX=396;surface.radius=360;surface.y0=150;surface.slope=-13;surface.margin=0;
+        auto result=MinorTickPreview::detect(image,anchors,center,360,0,1,true,surface,std::numeric_limits<double>::quiet_NaN(),.02);
+        bool left=false,right=false;
+        for(const auto& m:result.marks)if(!m.gap) {
+            const auto p=(m.a+m.b)*.5f;
+            std::cout<<p<<" value="<<m.ratio<<" assigned="<<m.assigned<<'\n';
+            if(cv::norm(p-cv::Point2f(166,195))<18){left=true;if(std::abs(m.ratio-.3)>1e-6)return 51;}
+            if(cv::norm(p-cv::Point2f(627,197))<18){right=true;if(std::abs(m.ratio-.7)>1e-6)return 52;}
+            cv::putText(image,MinorTickPreview::displayValue(m.ratio).toStdString(),p,cv::FONT_HERSHEY_SIMPLEX,.4,{0,0,255},1);
+        }
+        cv::imwrite(argv[3],image);return left&&right?0:53;
+    }
     if(argc==4&&(std::string(argv[1])=="--raw"||std::string(argv[1])=="--234")) {
         auto raw=CameraUndistortion::image(cv::imread(argv[2]));if(raw.empty())return 10;
         auto dial=AutoDialCalibration::detect(raw);if(!dial.valid()){std::cout<<dial.error.toStdString();return 11;}
@@ -145,4 +210,3 @@ int main(int argc,char** argv){
     if(MinorTickPreview::compare(proposal,base,center,true,0,1,40).valid)return 14;
     std::cout<<"PASS: assignment, missing indices, text exclusion, unchanged anchors, comparison and abstention"<<std::endl;
 }
-

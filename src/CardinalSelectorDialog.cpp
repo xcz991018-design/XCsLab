@@ -918,7 +918,13 @@ void CardinalSelectorDialog::onMinorTickPreview() {
     QJsonArray anchors;
     for(const auto& p:m_previewLabel->getScalePoints())if(p.toObject()["source"].toString()!="minor_tick")anchors.append(p);
     const auto center=m_previewLabel->getCenterPoint();
-    const auto surface=m_liquidMaskEnabled->isChecked()?m_previewLabel->liquidSurface():LiquidSurface{};
+    // Minor calibration always excludes detected liquid; display preferences
+    // must not permit refracted upper strokes to enter the calibration.
+    if(!m_previewLabel->liquidSurface().found) {
+        const auto detected=detectLiquidSurface(rectified,center,m_profile.rectified_size*.5-m_profile.rectified_margin);
+        m_previewLabel->setLiquidSurface(detected);m_previewLabel->showLiquidMask(true);
+    }
+    const auto surface=m_previewLabel->liquidSurface();
     const double minimum=m_rangeMinimum->value(),maximum=m_rangeMaximum->value();
     m_previewLabel->clearMinorPreview();setAutoDetectionBusy(true);
     m_autoProgressLabel->setText(tr("正在分析小刻度赋值并对比指针读数…"));
