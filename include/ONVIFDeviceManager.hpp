@@ -15,6 +15,7 @@
 struct ONVIFDeviceInfo {
     bool requireHttpSnapshot{false};
     bool preferHttpSnapshot{false};
+    bool allowLowerResolutionHttpSnapshot{false};
     std::string xaddr;
     std::string ipAddress{"192.168.1.101"};
     int port{80};
@@ -47,6 +48,7 @@ public:
     FrameCaptureResult readFrame() override;
     FrameCaptureResult captureSnapshot() override;
     FrameCaptureResult captureHttpSnapshot();
+    bool prepareSnapshot(); // Resolve metadata only; never starts a stream or captures a frame.
     void close() override;
     bool isOpened() const override;
     std::string getSourceName() const override;
@@ -64,11 +66,15 @@ public:
     void setSampleFrame(const cv::Mat& sample);
 
     ONVIFDeviceInfo getDeviceInfo() const { return m_info; }
-    void setDeviceInfo(const ONVIFDeviceInfo& info) { m_info = info; }
+    void setDeviceInfo(const ONVIFDeviceInfo& info) {
+        m_info = info;
+        m_mediaEndpoint.clear();m_snapshotUri.clear();m_selectedResolution={};
+    }
     void setDeviceIp(const std::string& ip) {
         m_info.ipAddress = ip;
         m_info.xaddr.clear();
         m_info.rtspUri.clear();
+        m_mediaEndpoint.clear();m_snapshotUri.clear();m_selectedResolution={};
     }
 
     using LogCallback = std::function<void(const std::string&)>;
@@ -80,7 +86,13 @@ private:
     static bool checkTcpPort(const std::string& ip, int port, int timeoutMs = 300);
 
     ONVIFDeviceInfo m_info;
+    cv::Size m_selectedResolution;
+    bool frameMeetsResolution(const cv::Mat& frame) const;
     std::string m_mediaEndpoint;
+    QString m_snapshotUri;
+    bool m_snapshotSingleUse{false};
+    std::chrono::steady_clock::time_point m_snapshotExpires;
+    bool resolveSnapshotUri();
     std::string m_lastError;
     std::atomic<bool> m_isOpen{false};
     bool m_capAttempted{false};

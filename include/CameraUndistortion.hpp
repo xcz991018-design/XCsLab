@@ -2,6 +2,9 @@
 #include <opencv2/opencv.hpp>
 #include <QJsonArray>
 #include <QJsonObject>
+#include <mutex>
+#include <list>
+#include <algorithm>
 
 // Calibration for the installed lens at 2304 x 1296. Keep the same K and
 // image extent after undistortion: no crop or additional change of coordinates.
@@ -20,8 +23,24 @@ inline cv::Mat coefficients() {
 inline cv::Mat image(const cv::Mat& raw) {
     if (raw.empty()) return {};
     cv::Mat corrected;
-    const auto K = matrix(raw.size());
-    cv::undistort(raw, corrected, K, coefficients(), K);
+    struct Maps {cv::Size size;cv::Mat xy,fraction;};
+    static std::mutex mutex;
+    static std::list<Maps> cache;
+    cv::Mat xy,fraction;
+    {
+        std::lock_guard<std::mutex> lock(mutex);
+        auto found=std::find_if(cache.begin(),cache.end(),[&](const Maps& m){return m.size==raw.size();});
+        if(found==cache.end()) {
+            Maps maps;maps.size=raw.size();
+            const auto K=matrix(raw.size());
+            cv::initUndistortRectifyMap(K,coefficients(),cv::Mat(),K,raw.size(),CV_16SC2,maps.xy,maps.fraction);
+            cache.push_front(std::move(maps));
+            // Bound retained memory; active calls hold their own Mat references.
+            if(cache.size()>2)cache.pop_back();
+        } else cache.splice(cache.begin(),cache,found);
+        xy=cache.front().xy;fraction=cache.front().fraction;
+    }
+    cv::remap(raw,corrected,xy,fraction,cv::INTER_LINEAR,cv::BORDER_CONSTANT);
     return corrected;
 }
 inline std::vector<cv::Point2f> points(const std::vector<cv::Point2f>& input,

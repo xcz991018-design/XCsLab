@@ -102,6 +102,10 @@ public:
     CardinalSelectorDialog(const cv::Mat& frame, GaugeProfile& profile, const QString& cameraId = "", QWidget *parent = nullptr, bool historicalSession = false);
     ~CardinalSelectorDialog() override = default;
     void reject() override;
+    void setCapturedFrame(const cv::Mat& frame);
+    void showCapturedPreview(const cv::Mat& frame);
+    void showAcquisitionError(const QString& reason);
+    bool awaitingFrame() const { return m_awaitingFrame; }
 
 private slots:
     void onPointsUpdated();
@@ -121,6 +125,7 @@ private:
     void startAutoDetection(bool cornersOnly);
     void finishAutomaticFailure(const QString& reason);
     bool m_autoSaved{false};
+    bool m_awaitingFrame{true};
     std::pair<cv::Point2f,QJsonArray> sourceAnnotations() const;
 
     cv::Mat m_rawFrame;

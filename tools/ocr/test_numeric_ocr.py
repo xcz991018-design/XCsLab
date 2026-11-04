@@ -3,7 +3,52 @@ import unittest
 import sys
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from paddle_scale_ocr import numeric_text, narrow_digit_regions, numeric_component_regions, tighten_numeric_boxes
+from paddle_scale_ocr import numeric_text, narrow_digit_regions, closed_digit_regions, numeric_component_regions, tighten_numeric_boxes
+
+class WorkerCacheTests(unittest.TestCase):
+    def test_cache_uses_pixels_and_returns_independent_tokens(self):
+        import tempfile
+        from unittest.mock import Mock, patch
+        import cv2
+        import numpy as np
+        import paddle_scale_ocr as adapter
+
+        pipeline = Mock()
+        pipeline.predict.return_value = []
+        adapter._recognize_encoded.cache_clear()
+        self.addCleanup(adapter._recognize_encoded.cache_clear)
+        with tempfile.TemporaryDirectory() as folder, \
+                patch.object(adapter, "create_pipeline", return_value=(pipeline, {})), \
+                patch.object(adapter, "refine_tall_digits", return_value=[]):
+            path = Path(folder) / "dial.png"
+            pixels = np.zeros((16, 16, 3), dtype=np.uint8)
+            path.write_bytes(cv2.imencode(".png", pixels)[1].tobytes())
+            adapter.recognize(path).append({"text": "mutated"})
+            self.assertEqual(adapter.recognize(path), [])
+            self.assertEqual(pipeline.predict.call_count, 1)
+            pixels[0, 0] = 1
+            path.write_bytes(cv2.imencode(".png", pixels)[1].tobytes())
+            pipeline.predict.side_effect = [ValueError("retry"), []]
+            with self.assertRaisesRegex(ValueError, "retry"):
+                adapter.recognize(path)
+            self.assertEqual(adapter.recognize(path), [])
+            self.assertEqual(pipeline.predict.call_count, 3)
+
+
+class ClosedDigitTests(unittest.TestCase):
+    def test_closed_zero_is_proposed_but_ticks_are_not(self):
+        import cv2
+        import numpy as np
+        for scale in (1, 3):
+            image = np.full((120*scale, 180*scale, 3), 180, dtype=np.uint8)
+            cv2.ellipse(image, (50*scale, 60*scale), (12*scale, 23*scale), 0, 0, 360, (20,20,20), 3*scale)
+            cv2.line(image, (110*scale, 40*scale), (110*scale, 80*scale), (20,20,20), 3*scale)
+            regions = closed_digit_regions(image, [50*scale])
+            self.assertTrue(any(l < 50*scale < r and t < 60*scale < b for l,t,r,b in regions))
+            self.assertFalse(any(l < 110*scale < r for l,t,r,b in regions))
+
+    def test_no_reference(self):
+        self.assertEqual(closed_digit_regions(None, []), [])
 
 class NumericTextTests(unittest.TestCase):
     def test_tick_suffix(self):

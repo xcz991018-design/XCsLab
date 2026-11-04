@@ -96,7 +96,12 @@ inline Result detect(const cv::Mat& image,const QJsonArray& anchors,cv::Point2f 
     for(const auto& major:OcrDialRange::majorTicks(gray,{},center,radius,surface))
         if(major.tick.length>=radius*.09)lines.push_back(major.tick);
     auto point=[&](double angle,double r){const double a=angle*CV_PI/180;return center+cv::Point2f(float(r*std::cos(a)),float(r*std::sin(a)));};
-    struct Model {int interval,n;double division,score,phase,step;};std::vector<Model> models;
+    struct Model {
+        int interval,n;double division,score,phase,step;
+        double split{-1},outerStep{0};
+        double offset(double index) const {return phase+std::min(index,split<0?index:split)*step+(split>=0?std::max(0.,index-split)*outerStep:0.);}
+        double index(double x) const {return split>=0&&x>phase+split*step?split+(x-phase-split*step)/outerStep:(x-phase)/step;}
+    };std::vector<Model> models;
     struct Interval {double start,sweep,leftRatio,rightRatio,ring;std::vector<int> marks;double middleOffset{-1},middleRatio{-1};bool minimumSide{true};};
     std::vector<Interval> intervals;
     for(int interval=1;interval<anchors.size();++interval) {
@@ -218,19 +223,28 @@ inline Result detect(const cv::Mat& image,const QJsonArray& anchors,cv::Point2f 
                 else {step=section.middleOffset/index;phase=0;}
             }
             if(step<1.8)continue;
+            Model model{id,n,0,0,phase,step};
+            // The measured half-major and both endpoints constrain two local
+            // spacings. Perspective need not preserve one angular step over
+            // the entire maximum-side arc; never synthesize missing strokes.
+            if(section.middleOffset>=0&&!section.minimumSide) {
+                model.split=n*(section.middleRatio-section.leftRatio)/(section.rightRatio-section.leftRatio);
+                model.outerStep=(sweep-section.middleOffset)/(n-model.split);
+                if(model.outerStep<1.8)continue;
+            }
             std::set<int> occupied;int aligned=0;double error=0;
-            for(const auto& c:candidates){const int k=cvRound((c.offset-phase)/step);const double e=std::abs(c.offset-phase-k*step)/step;
+            for(const auto& c:candidates){const double index=model.index(c.offset);const int k=cvRound(index);const double e=std::abs(index-k);
                 // Residual perspective/refraction can shift a measured stroke
                 // by 0.3 of a cell; keep it well below the half-cell ambiguity.
                 if(k>0&&k<n&&e<.30){occupied.insert(k);++aligned;error+=e;}}
-            int visibleCount=0;for(int k=1;k<n;++k){const double x=phase+k*step;
+            int visibleCount=0;for(int k=1;k<n;++k){const double x=model.offset(k);
                 if(x>1.4&&x<sweep-1.4)visibleCount+=visible[std::clamp(cvRound(x/sweep*bins),0,bins)];}
             if(occupied.size()<3||visibleCount<3)continue;
             const double score=std::min(1.,double(occupied.size())/visibleCount)*double(aligned)/std::max(size_t(1),candidates.size())*(1-error/std::max(1,aligned));
             const double division=(maximum-minimum)*(section.rightRatio-section.leftRatio)/n;
             if(!manualDivision&&!decimalDivision(division))continue;
             if(manualDivision&&std::abs(division-confirmedDivision)>confirmedDivision*.001)continue;
-            if(score>=(manualDivision?.35:.55))models.push_back({id,n,(maximum-minimum)*(section.rightRatio-section.leftRatio)/n,score,phase,step});
+            if(score>=(manualDivision?.35:.55)){model.division=division;model.score=score;models.push_back(model);}
         }
     }
     struct Consensus {double division,score;std::vector<Model> support;};std::vector<Consensus> groups;
@@ -271,8 +285,8 @@ inline Result detect(const cv::Mat& image,const QJsonArray& anchors,cv::Point2f 
             for(int index:section.marks) {
                 const auto& m=out.marks[index];const auto mid=(m.a+m.b)*.5f;
                 const double a=AutoScaleCalibration::wrap(std::atan2(mid.y-center.y,mid.x-center.x)*180/CV_PI);
-                const double offset=ScaleCalibration::span(section.start,a,clockwise);const int k=cvRound((offset-model.phase)/step);
-                if(k>0&&k<model.n&&std::abs(offset-model.phase-k*step)<step*(manualDivision?.35:.30)&&m.confidence>=.60)slotsByIndex[k].push_back(index);
+                const double offset=ScaleCalibration::span(section.start,a,clockwise);const double slot=model.index(offset);const int k=cvRound(slot);
+                if(k>0&&k<model.n&&std::abs(slot-k)<(manualDivision?.35:.30)&&m.confidence>=.60)slotsByIndex[k].push_back(index);
             }
             for(int k=1;k<model.n;++k) {
                 const double ratio=section.leftRatio+(section.rightRatio-section.leftRatio)*k/model.n;
@@ -281,7 +295,7 @@ inline Result detect(const cv::Mat& image,const QJsonArray& anchors,cv::Point2f 
                     m.confidence=std::min(m.confidence,model.score);
                     if(m.assigned) {const auto p=(m.a+m.b)*.5f;out.previewPoints.append(QJsonObject{{"x",p.x},{"y",p.y},{"ratio",ratio},{"origin_x",center.x},{"origin_y",center.y},{"source","minor_tick"}});}
                 } else if(slotsByIndex[k].empty()) {
-                    const double expectedOffset=model.phase+k*step;
+                    const double expectedOffset=model.offset(k);
                     if(expectedOffset<1.4||expectedOffset>section.sweep-1.4)continue;
                     const double a=section.start+(clockwise?1:-1)*expectedOffset;
                     const auto p=point(a,section.ring),a0=point(a,section.ring-radius*.065),b0=point(a,section.ring+radius*.14);

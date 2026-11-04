@@ -6,6 +6,7 @@
 #include "DeviceCodec.hpp"
 #include "InspectionCalibration.hpp"
 #include "EvidenceArchive.hpp"
+#include "PatrolRetry.hpp"
 #include <QFutureWatcher>
 #include <QtConcurrent/QtConcurrent>
 #include <QDir>
@@ -31,8 +32,9 @@ CameraSourcePtr createSource(const InspectionTask& task) {
         return std::make_shared<FileCameraSource>(task.localImagePath.toStdString());
     if (dev.protocolType == CameraProtocolType::ONVIF_RTSP_STREAM) {
         ONVIFDeviceInfo info;
-        info.preferHttpSnapshot = task.preferOnvifSnapshot || task.requireOnvifSnapshot;
-        info.requireHttpSnapshot = task.requireOnvifSnapshot;
+        info.preferHttpSnapshot = !task.requireOnvifSnapshot && task.preferOnvifSnapshot;
+        info.allowLowerResolutionHttpSnapshot = info.preferHttpSnapshot && task.allowLowerResolutionHttpSnapshot;
+        info.requireHttpSnapshot = false; // Requiring ONVIF acquisition does not require HTTP snapshots.
         info.ipAddress = dev.ipOrSn.toStdString();
         info.port = dev.port;
         info.username = dev.username.toStdString();
@@ -170,7 +172,8 @@ CapturedTask capture(const InspectionTask& task, const InspectionService::Source
             data.outcome.errorMessage=QStringLiteral(u"此操作要求设备使用 ONVIF 快照协议，请检查设备配置");
             return data;
         }
-        if (!task.requireOnvifSnapshot && !task.previewSnapshot.empty()) {
+        if (task.device.protocolType != CameraProtocolType::ONVIF_RTSP_STREAM &&
+            !task.requireOnvifSnapshot && !task.previewSnapshot.empty()) {
             const auto age = task.previewCapturedAt.msecsTo(QDateTime::currentDateTimeUtc());
             if (!task.previewCapturedAt.isValid() || age < 0 || age >= 2000) {
                 data.outcome.errorCode = "STALE_FRAME";
@@ -189,6 +192,7 @@ CapturedTask capture(const InspectionTask& task, const InspectionService::Source
             data.outcome.errorMessage = QStringLiteral(u"协议尚未接入生产采集服务");
         } else {
             const auto acquired = isolate ? isolatedCapture(task, cancel) : source->captureSnapshot();
+            data.outcome.timings["acquisition_details"] = acquired.timings;
             data.frame = acquired.frame;
             data.outcome.encodedOriginal = acquired.encodedOriginal;
             data.outcome.captureMethod = acquired.message == "ONVIF_HTTP" ? "ONVIF_HTTP"
@@ -388,6 +392,7 @@ InspectionOutcome persist(InspectionOutcome out, const InspectionTask& task,
         record["confidence"] = out.result.confidence;
         record["recognition_timings_ms"] = out.result.stageTimings;
         record["recognition_quality"] = out.result.recognitionQuality;
+        if(out.timings.contains("hd_retry")) record["hd_retry"] = out.timings["hd_retry"];
         record["error_code"] = out.errorCode;
         record["error_message"] = out.errorMessage.isEmpty() ? QString::fromStdString(out.result.errorMessage) : out.errorMessage;
         const auto resultSaveStarted = TimingClock::now();
@@ -459,9 +464,10 @@ CameraSourcePtr InspectionService::createCameraSource(const InspectionTask& task
 
 InspectionService::InspectionService(QObject* parent, int maxConcurrent, SourceFactory factory)
     : QObject(parent), m_factory(factory ? factory : SourceFactory(createSource)), m_isolateCapture(!factory),
-      m_limit(std::max(1, maxConcurrent)) {
+      m_limit(std::clamp(maxConcurrent, 1, 8)) {
     qRegisterMetaType<InspectionOutcome>();
     m_capturePool.setMaxThreadCount(m_limit);
+    m_prewarmPool.setMaxThreadCount(1);
     m_recognitionPool.setMaxThreadCount(m_limit);
     m_storagePool.setMaxThreadCount(1);
 }
@@ -469,14 +475,17 @@ InspectionService::InspectionService(QObject* parent, int maxConcurrent, SourceF
 InspectionService::~InspectionService() {
     stop();
     m_capturePool.waitForDone();
+    m_prewarmPool.waitForDone();
     m_recognitionPool.waitForDone();
     m_storagePool.waitForDone();
 }
 
 bool InspectionService::start(const QList<InspectionTask>& tasks) {
     if (m_running || tasks.isEmpty()) return false;
+    if(m_cancel)m_cancel->store(true); // Stop any remaining speculative work from the previous round.
     m_tasks = tasks;
     m_retryIndices.clear();
+    m_prewarmedIndices.clear();
     m_restartIndices.clear();
     m_taskCancels.clear();
     const auto queuedAt = TimingClock::now();
@@ -586,6 +595,27 @@ void InspectionService::exportImage(const cv::Mat& frame, const QString& path) {
     }));
 }
 
+void InspectionService::prewarmNext() {
+    if(!m_isolateCapture || !m_running || m_cancel->load() || m_prewarmActive)return;
+    // Only the next pipeline window; no frame acquisition or queue of all cameras.
+    for(int i=m_next;i<std::min(m_next+m_limit,m_tasks.size());++i) {
+        if(m_prewarmedIndices.contains(i))continue;
+        auto task=m_tasks[i];
+        if(task.inputKind!=InspectionInputKind::CameraSnapshot || task.device.protocolType!=CameraProtocolType::ONVIF_RTSP_STREAM)continue;
+        m_prewarmedIndices.insert(i);
+        task.captureTimeoutMs=std::min(task.captureTimeoutMs,2000);
+        auto cancel=m_cancel;
+        m_prewarmActive=true;
+        auto* watcher=new QFutureWatcher<void>(this);
+        connect(watcher,&QFutureWatcher<void>::finished,this,[this,watcher]{
+            watcher->deleteLater();m_prewarmActive=false;prewarmNext();
+        });
+        watcher->setFuture(QtConcurrent::run(&m_prewarmPool,[task,cancel]{prewarmIsolatedCapture(task,cancel);}));
+        return; // Never accumulate speculative jobs behind the running prewarm.
+
+    }
+}
+
 void InspectionService::dispatch() {
     while (!m_cancel->load() && m_active < m_limit && (!m_retryIndices.isEmpty() || m_next < m_tasks.size())) {
         const int index = m_retryIndices.isEmpty() ? m_next++ : m_retryIndices.takeFirst();
@@ -599,6 +629,7 @@ void InspectionService::dispatch() {
             auto captured = captureWatcher->result();
             captureWatcher->deleteLater();
             if (cancel->load()) { complete(captured.outcome, index); return; }
+            prewarmNext();
             auto* recognitionWatcher = new QFutureWatcher<InspectionOutcome>(this);
             connect(recognitionWatcher, &QFutureWatcher<InspectionOutcome>::finished, this, [this, recognitionWatcher, task, cancel, index]() {
                 auto outcome = recognitionWatcher->result();
@@ -617,9 +648,16 @@ void InspectionService::dispatch() {
                 }));
             });
             const auto recognitionQueued = TimingClock::now();
-            recognitionWatcher->setFuture(QtConcurrent::run(&m_recognitionPool, [captured, cancel, recognitionQueued]() {
+            recognitionWatcher->setFuture(QtConcurrent::run(&m_recognitionPool, [captured, cancel, recognitionQueued, factory=m_factory, isolate=m_isolateCapture]() {
                 const auto started = TimingClock::now();
                 auto outcome = recognize(captured, cancel);
+                outcome = PatrolRetry::retry(captured.task, std::move(outcome), cancel,
+                    [&](const InspectionTask& hd) {
+                        const auto captureStarted=TimingClock::now();
+                        auto retryFrame=capture(hd,factory,cancel,isolate);
+                        retryFrame.outcome.timings["capture_ms"]=elapsedMs(captureStarted);
+                        return recognize(std::move(retryFrame),cancel);
+                    });
                 outcome.timings["recognition_queue_ms"] = std::chrono::duration<double, std::milli>(started - recognitionQueued).count();
                 outcome.timings["recognition_ms"] = elapsedMs(started);
                 return outcome;

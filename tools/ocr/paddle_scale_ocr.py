@@ -1,5 +1,6 @@
 """PaddleOCR 3.x adapter. Result file separates JSON from library stdout logs."""
 import argparse
+from functools import lru_cache
 import json
 import os
 import re
@@ -45,6 +46,32 @@ def narrow_digit_regions(view, numeric_heights):
             region = (int(left), int(top), int(left+w), int(top+h))
             if region not in regions:
                 regions.append(region)
+    return regions
+
+
+def closed_digit_regions(view, numeric_heights):
+    """Propose omitted zero glyphs; require a closed hole and OCR confirmation."""
+    import cv2
+    import numpy as np
+    if not numeric_heights:
+        return []
+    height = float(np.median(numeric_heights))
+    gray = cv2.cvtColor(view, cv2.COLOR_BGR2GRAY)
+    mask = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                                 cv2.THRESH_BINARY_INV, max(3, int(height*1.5) | 1), 9)
+    contours, hierarchy = cv2.findContours(mask, cv2.RETR_CCOMP, cv2.CHAIN_APPROX_SIMPLE)
+    regions = []
+    if hierarchy is None:
+        return regions
+    for index, contour in enumerate(contours):
+        child = hierarchy[0][index][2]
+        if hierarchy[0][index][3] >= 0 or child < 0:
+            continue
+        x, y, w, h = cv2.boundingRect(contour)
+        area = cv2.contourArea(contour)
+        if (.55*height <= h <= 1.5*height and .25*h <= w <= .95*h and
+                area > 0 and .15 <= cv2.contourArea(contours[child])/area <= .8):
+            regions.append((x, y, x+w, y+h))
     return regions
 
 
@@ -98,13 +125,19 @@ def numeric_component_regions(view, numeric_heights):
     return regions
 
 
-def refine_tall_digits(pipeline_options, view, tokens, rotation, restore):
+@lru_cache(maxsize=1)
+def digit_recognizer(model_name, model_dir):
+    from paddleocr import TextRecognition
+    return TextRecognition(model_name=model_name, model_dir=model_dir,
+                           device="cpu", enable_mkldnn=False)
+
+
+def refine_tall_digits(pipeline_options, view, tokens, rotation, restore, shared_recognizer=None):
     """Recognize narrow boxes upright. The normal OCR crop rotates h/w>=1.5,
     which turns a single vertical '1' sideways before recognizing it.
     """
     import cv2
     import numpy as np
-    from paddleocr import TextRecognition
 
     height, width = view.shape[:2]
     regions = []
@@ -129,6 +162,10 @@ def refine_tall_digits(pipeline_options, view, tokens, rotation, restore):
     # A text detector can omit a lone '1' completely. Propose upright connected
     # glyphs of comparable height to detected numbers; recognition still decides.
     detected_regions = set(regions)
+    zero_regions = set(closed_digit_regions(view, numeric_heights))
+    for region in sorted(zero_regions):
+        if region not in regions:
+            regions.append(region)
     for region in narrow_digit_regions(view, numeric_heights):
         if region not in regions:
             regions.append(region)
@@ -143,8 +180,6 @@ def refine_tall_digits(pipeline_options, view, tokens, rotation, restore):
     if not regions:
         return []
     model_name = pipeline_options.get("text_recognition_model_name", "PP-OCRv5_server_rec")
-    recognizer = TextRecognition(model_name=model_name, model_dir=pipeline_options.get("text_recognition_model_dir"),
-                                 device="cpu", enable_mkldnn=False)
     crops, owners = [], []
     for region in regions[:64]:
         left, top, right, bottom = region
@@ -161,7 +196,14 @@ def refine_tall_digits(pipeline_options, view, tokens, rotation, restore):
         crops.append(cv2.resize(crop, None, fx=2, fy=2, interpolation=cv2.INTER_CUBIC))
         owners.append(region)
     result = []
-    for prediction, region in zip(recognizer.predict(crops), owners):
+    # One crop per inference preserves the standalone predictor's padding and
+    # batch shape without changing the full-image pipeline's batch settings.
+    if getattr(shared_recognizer, "model_name", None) == model_name:
+        predictions = (item for crop in crops for item in shared_recognizer.predict(crop))
+    else:
+        recognizer = digit_recognizer(model_name, pipeline_options.get("text_recognition_model_dir"))
+        predictions = recognizer.predict(crops)
+    for prediction, region in zip(predictions, owners):
         text, confidence = numeric_text(prediction["rec_text"]), float(prediction["rec_score"])
         if not NUMERIC.fullmatch(text) or confidence < .65:
             continue
@@ -169,14 +211,35 @@ def refine_tall_digits(pipeline_options, view, tokens, rotation, restore):
         # group recognition, and only accept '1' from lone-stroke proposals.
         if region in grouped_regions and confidence < .9:
             continue
-        if region not in detected_regions and region not in grouped_regions and (text != "1" or confidence < .9):
+        if region in zero_regions and region not in detected_regions and region not in grouped_regions:
+            if text != "0" or confidence < .95:
+                continue
+        elif region not in detected_regions and region not in grouped_regions and (text != "1" or confidence < .9):
             continue
         left, top, right, bottom = region
         result.append(dict(text=text, score=confidence, rotation=rotation, orientation_preferred=True,
-                           method="component_crop" if region in grouped_regions else "upright_crop", polygon=[list(restore(float(x),float(y))) for x,y in
+                           method="component_crop" if region in grouped_regions else "closed_digit_crop" if region in zero_regions and region not in detected_regions else "upright_crop", polygon=[list(restore(float(x),float(y))) for x,y in
                            ((left,top),(right,top),(right,bottom),(left,bottom))]))
-    recognizer.close()
-    return result
+    # Do not let a confidently recognized zero inside "0.2" or "0.8"
+    # replace the complete decimal label during downstream deduplication.
+    filtered = []
+    for candidate in result:
+        if candidate["method"] == "closed_digit_crop":
+            box = np.asarray(candidate["polygon"])
+            lo, hi = box.min(axis=0), box.max(axis=0)
+            contained = False
+            for other in tokens + result:
+                if other is candidate or len(other["text"]) <= 1 or other["score"] < .65 or not NUMERIC.fullmatch(other["text"]):
+                    continue
+                poly = np.asarray(other["polygon"])
+                overlap = np.maximum(0, np.minimum(hi, poly.max(axis=0))-np.maximum(lo, poly.min(axis=0)))
+                if np.prod(overlap) >= .8*np.prod(hi-lo):
+                    contained = True
+                    break
+            if contained:
+                continue
+        filtered.append(candidate)
+    return filtered
 
 
 def tighten_numeric_boxes(tokens, refinements):
@@ -202,6 +265,7 @@ def tighten_numeric_boxes(tokens, refinements):
                 token["polygon"] = [p[:] for p in group["polygon"]]
 
 
+@lru_cache(maxsize=1)
 def configure_runtime():
     root = Path(__file__).resolve().parent
     settings = root / "offline.json"
@@ -237,7 +301,8 @@ def configure_runtime():
     return options, cache
 
 
-def recognize(image):
+@lru_cache(maxsize=1)
+def create_pipeline():
     bundled_options, cache = configure_runtime()
     os.environ.setdefault("PADDLE_PDX_CACHE_HOME", str(cache))
     os.environ.setdefault("PADDLE_HOME", str(cache / "paddle"))
@@ -269,7 +334,21 @@ def recognize(image):
             if directory:
                 options[f"text_{kind}_model_dir"] = directory
     pipeline = PaddleOCR(**options)
-    pixels = cv2.imdecode(np.fromfile(image, dtype=np.uint8), cv2.IMREAD_COLOR)
+    return pipeline, options
+
+
+def recognize(image):
+    return json.loads(_recognize_encoded(Path(image).read_bytes()))
+
+
+@lru_cache(maxsize=1)
+def _recognize_encoded(encoded):
+    # The worker owns one fixed model configuration. Compare complete PNG bytes,
+    # so edited masks or changed pixels miss even if the file name is reused.
+    import cv2
+    import numpy as np
+    pipeline, options = create_pipeline()
+    pixels = cv2.imdecode(np.frombuffer(encoded, dtype=np.uint8), cv2.IMREAD_COLOR)
     if pixels is None:
         raise ValueError("Cannot decode dial image")
     height, width = pixels.shape[:2]
@@ -288,24 +367,41 @@ def recognize(image):
             points = [[float(p[0]), float(p[1])] for p in polygon]
             tokens.append(dict(text=numeric_text(text), raw_text=text, score=float(score), rotation=0,
                                orientation_preferred=True, view_polygon=points, polygon=points))
-    refinements = refine_tall_digits(options, pixels, tokens, 0, restore)
+    shared_recognizer = getattr(getattr(pipeline, "paddlex_pipeline", None), "text_rec_model", None)
+    refinements = refine_tall_digits(options, pixels, tokens, 0, restore, shared_recognizer)
     tighten_numeric_boxes(tokens, refinements)
     tokens.extend(refinements)
     for token in tokens:
         token.pop("view_polygon", None)
-    return tokens
+    return json.dumps(tokens, ensure_ascii=False, allow_nan=False)
 
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--image", required=True)
-    parser.add_argument("--output", required=True)
+    parser.add_argument("--worker", action="store_true")
+    parser.add_argument("--image")
+    parser.add_argument("--output")
     args = parser.parse_args()
+    if args.worker:
+        # File responses keep Paddle's native stdout logging out of the protocol.
+        for line in sys.stdin:
+            request = json.loads(line)
+            write_response(request["image"], request["output"])
+        return 0
+    if not args.image or not args.output:
+        parser.error("--image and --output are required unless --worker is used")
+    return write_response(args.image, args.output)
+
+
+def write_response(image, output):
     try:
-        payload = dict(tokens=recognize(args.image))
+        payload = dict(tokens=recognize(image))
     except Exception as error:
         payload = dict(error=f"{type(error).__name__}: {error}")
-    Path(args.output).write_text(json.dumps(payload, ensure_ascii=False, allow_nan=False), encoding="utf-8")
+    destination = Path(output)
+    pending = destination.with_suffix(".pending")
+    pending.write_text(json.dumps(payload, ensure_ascii=False, allow_nan=False), encoding="utf-8")
+    os.replace(pending, destination)
     return 1 if "error" in payload else 0
 
 

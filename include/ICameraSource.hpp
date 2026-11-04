@@ -5,6 +5,7 @@
 #include <string>
 #include <memory>
 #include <chrono>
+#include <QJsonObject>
 
 enum class CaptureFailure { None, NotOpen, OpenFailed, ReadFailed, NoFrame, StaleFrame, UnsupportedProtocol, InvalidInput, Timeout, Cancelled, WorkerFailed };
 inline const char* captureFailureName(CaptureFailure error) {
@@ -24,6 +25,7 @@ inline const char* captureFailureName(CaptureFailure error) {
     return "INVALID_INPUT";
 }
 struct FrameCaptureResult {
+    QJsonObject timings; // Capture pool and device acquisition stage timings.
     std::vector<uchar> encodedOriginal; // Exact HTTP payload, never recompressed.
     cv::Mat frame;
     CaptureFailure failure{CaptureFailure::None};

@@ -1,3 +1,4 @@
+#include "RectifiedResolution.hpp"
 #include "GaugeReaderEngine.hpp"
 #include "CameraUndistortion.hpp"
 #include "ScaleCalibration.hpp"
@@ -137,8 +138,23 @@ cv::Mat GaugeReaderEngine::rectifyPerspective(const cv::Mat& src, const std::vec
     dstPts[2] = cv::Point2f(S / 2.0f, S - m);   // 6H Bottom
     dstPts[3] = cv::Point2f(m, S / 2.0f);       // 9H Left
 
-    cv::Mat H = cv::getPerspectiveTransform(srcPts, dstPts);
-    invH = H.inv();
+    // Reuse geometry only for exactly matching calibration points and output size.
+    // Keep a private inverse for callers, which may modify the returned matrix.
+    struct GeometryCache {
+        std::vector<cv::Point2f> points;
+        int size{0}, margin{0};
+        cv::Mat H, inverse;
+    };
+    static thread_local GeometryCache geometry;
+    if (geometry.H.empty() || geometry.points != srcPts || geometry.size != outSize || geometry.margin != margin) {
+        geometry.points = srcPts;
+        geometry.size = outSize;
+        geometry.margin = margin;
+        geometry.H = cv::getPerspectiveTransform(srcPts, dstPts);
+        geometry.inverse = geometry.H.inv();
+    }
+    const cv::Mat& H = geometry.H;
+    invH = geometry.inverse.clone();
 
     cv::Mat rectified;
     cv::warpPerspective(src, rectified, H, cv::Size(outSize, outSize), cv::INTER_CUBIC);
@@ -148,6 +164,7 @@ cv::Mat GaugeReaderEngine::rectifyPerspective(const cv::Mat& src, const std::vec
 GaugeResult GaugeReaderEngine::process(const cv::Mat& rawFrame, GaugeProfile& storedProfile, GaugeRunMode mode) {
     // Work on a copy so repeated recognition never undistorts saved points twice.
     GaugeProfile profile = storedProfile;
+    RectifiedResolution::apply(profile, rawFrame.size());
     GaugeResult res;
     using Clock = std::chrono::steady_clock;
     const auto engineStarted = Clock::now();
@@ -175,7 +192,7 @@ GaugeResult GaugeReaderEngine::process(const cv::Mat& rawFrame, GaugeProfile& st
     if (debug) res.originalImage = res.step1_original;
 
     const cv::Mat frame = CameraUndistortion::image(rawFrame);
-    if (evidence) res.undistortedImage = frame.clone();
+    if (evidence) res.undistortedImage = frame; // Owned output; subsequent stages only read it.
     const cv::Size annotationSize(profile.calibrated_width > 0 ? profile.calibrated_width : frame.cols,
         profile.calibrated_height > 0 ? profile.calibrated_height : frame.rows);
     profile.perspective_pts = CameraUndistortion::points(profile.perspective_pts, annotationSize);
@@ -239,7 +256,7 @@ GaugeResult GaugeReaderEngine::process(const cv::Mat& rawFrame, GaugeProfile& st
     }
 
     mark("perspective_ms");
-    if (evidence) res.step2_rectified = workFrame.clone();
+    if (evidence) res.step2_rectified = workFrame; // Drawing uses a separate rectOverlay.
     if (debug) res.rectifiedImage = workFrame;
 
     mark("rectified_copy_ms");
@@ -293,7 +310,7 @@ GaugeResult GaugeReaderEngine::process(const cv::Mat& rawFrame, GaugeProfile& st
     bool confirmedHub = false;
     locateDialCircle(gray, checkedCenter, checkedRadius, &confirmedHub, &res.center);
     const double checkedOffset = cv::norm(checkedCenter - res.center);
-    const double centerTolerance = profile.center_search_tolerance > 0 ? profile.center_search_tolerance : 35;
+    const double centerTolerance = (profile.center_search_tolerance > 0 ? profile.center_search_tolerance : 35) * (invH.empty() ? 1.0 : RectifiedResolution::scale(profile));
     if (!profile.auto_detect_roi && confirmedHub && checkedOffset > centerTolerance) {
         res.centerInconsistent = true;
         res.centerOffsetDist = checkedOffset;
@@ -343,36 +360,37 @@ GaugeResult GaugeReaderEngine::process(const cv::Mat& rawFrame, GaugeProfile& st
     cfg.pointerMinAngle = minAngle;
     cfg.pointerMaxAngle = maxAngle;
     cfg.clockwise = profile.clockwise;
-    cfg.pointerBaseRadius = profile.pointerBaseRadius;
-    cfg.pointerMinWidth = profile.pointerMinWidth;
-    cfg.pointerMaxWidth = profile.pointerMaxWidth;
-    cfg.pointerMinLength = profile.pointerMinLength;
+    const double pixelScale = invH.empty() ? 1.0 : RectifiedResolution::scale(profile);
+    cfg.pointerBaseRadius = profile.pointerBaseRadius * pixelScale;
+    cfg.pointerMinWidth = profile.pointerMinWidth * pixelScale;
+    cfg.pointerMaxWidth = profile.pointerMaxWidth * pixelScale;
+    cfg.pointerMinLength = profile.pointerMinLength * pixelScale;
     cfg.coarseAngleStep = profile.coarseAngleStep;
     cfg.fineAngleStep = profile.fineAngleStep;
     cfg.fineAngleRange = profile.fineAngleRange;
     cfg.minValidSectionRatio = profile.minValidSectionRatio;
-    cfg.maxAllowedWidthStep = profile.maxAllowedWidthStep;
-    cfg.maxCenterlineOffset = profile.maxCenterlineOffset;
+    cfg.maxAllowedWidthStep = profile.maxAllowedWidthStep * pixelScale;
+    cfg.maxCenterlineOffset = profile.maxCenterlineOffset * pixelScale;
 
     // Forward anti-interference & text occlusion parameters from profile JSON
-    cfg.maxConsecutiveGapSamples = profile.maxConsecutiveGapSamples;
+    cfg.maxConsecutiveGapSamples = int(std::lround(profile.maxConsecutiveGapSamples * pixelScale));
     cfg.minEdgeSupportDensity = profile.minEdgeSupportDensity;
     cfg.rawGradientThreshold = profile.rawGradientThreshold;
     cfg.minGradientNormalAlignment = profile.minGradientNormalAlignment;
     cfg.minLocalStepContrast = profile.minLocalStepContrast;
-    cfg.maxStartBaseGapPx = profile.maxStartBaseGapPx;
+    cfg.maxStartBaseGapPx = profile.maxStartBaseGapPx * pixelScale;
     cfg.maxParallelAngleDiffDeg = profile.maxParallelAngleDiffDeg;
-    cfg.minCommonLengthPx = profile.minCommonLengthPx;
-    cfg.maxLineFitResidualPx = profile.maxLineFitResidualPx;
-    cfg.maxOcclusionGap = profile.maxOcclusionGap;
-    cfg.corridorHalfWidthPx = profile.corridorHalfWidthPx;
+    cfg.minCommonLengthPx = profile.minCommonLengthPx * pixelScale;
+    cfg.maxLineFitResidualPx = profile.maxLineFitResidualPx * pixelScale;
+    cfg.maxOcclusionGap = int(std::lround(profile.maxOcclusionGap * pixelScale));
+    cfg.corridorHalfWidthPx = profile.corridorHalfWidthPx * pixelScale;
 
     // Forward tail detection parameters
     cfg.enableTailDetection = profile.enable_tail_detection;
-    cfg.tailMaxRadius = profile.tail_max_radius;
-    cfg.tailMinWidth = profile.tail_min_width;
-    cfg.tailMaxWidth = profile.tail_max_width;
-    cfg.tailCorridorHalfWidth = profile.tail_corridor_half_width;
+    cfg.tailMaxRadius = profile.tail_max_radius * pixelScale;
+    cfg.tailMinWidth = profile.tail_min_width * pixelScale;
+    cfg.tailMaxWidth = profile.tail_max_width * pixelScale;
+    cfg.tailCorridorHalfWidth = profile.tail_corridor_half_width * pixelScale;
     cfg.tailMinGradientNormalAlignment = profile.tail_min_gradient_normal_alignment;
 
     // Forward optical polarity & dark entity constraints

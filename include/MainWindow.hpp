@@ -1,5 +1,6 @@
 #ifndef MAIN_WINDOW_HPP
 #define MAIN_WINDOW_HPP
+class CardinalSelectorDialog;
 
 #include <QMainWindow>
 #include <QLabel>
@@ -167,6 +168,9 @@ private:
     QString m_pendingCalibrationCamera;
     quint64 m_cameraConnectionGeneration{0};
     bool m_calibrationDialogOpen{false};
+    QPointer<CardinalSelectorDialog> m_liveCalibrationDialog;
+    std::shared_ptr<GaugeProfile> m_liveCalibrationProfile;
+    std::shared_ptr<std::atomic<bool>> m_calibrationCaptureCancel;
     bool m_historicalCalibrationPending{false};
     bool m_cameraHasFrame{false};
     FrameCaptureResult m_calibrationSnapshot;

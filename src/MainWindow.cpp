@@ -1059,6 +1059,7 @@ void MainWindow::onFilterDeviceList(const QString& filterText) {
 }
 
 MainWindow::~MainWindow() {
+    if(m_calibrationCaptureCancel)m_calibrationCaptureCancel->store(true);
     if (m_registryWatcher) m_registryWatcher->waitForFinished();
     DeviceConfigManager::instance().waitForDatabaseWrites();
     delete m_previewService;
@@ -1353,6 +1354,11 @@ void MainWindow::applyCameraCalibrationAndProfile(const QString& camId) {
         if (!reply.second.isEmpty() || !m_profile.loadFromJson(reply.first)) {
             m_cfgRange->setText(tr("量程范围：设备配置加载失败"));
             onLogReceived(tr("[TEMPLATE] %1").arg(reply.second));
+            if(m_liveCalibrationDialog && m_pendingCalibrationCamera==camId) {
+                m_liveCalibrationDialog->showAcquisitionError(tr("设备标定配置加载失败：%1").arg(reply.second));
+                m_pendingCalibrationCamera.clear();
+                if(m_calibrationCaptureCancel)m_calibrationCaptureCancel->store(true);
+            }
             return;
         }
         const auto item = m_discoveredItemsMap.value(camId);
@@ -1471,9 +1477,33 @@ void MainWindow::onCalibrateCardinalPoints() {
     m_calibrationQueries.clear();
     m_calibrationChecked.remove(cameraId);
     m_pendingCalibrationCamera = cameraId;
+    m_calibrationCaptureCancel=std::make_shared<std::atomic<bool>>(false);
+    auto sessionProfile=std::make_shared<GaugeProfile>(m_profile);
+    m_liveCalibrationProfile=sessionProfile;
+    auto* dialog=new CardinalSelectorDialog({},*sessionProfile,cameraId,this);
+    m_liveCalibrationDialog=dialog;m_calibrationDialogOpen=true;
+    dialog->setAttribute(Qt::WA_DeleteOnClose);
+    dialog->setWindowModality(Qt::WindowModal);
+    connect(dialog,&QDialog::finished,this,[this,cameraId,dialog,sessionProfile](int result){
+        if(m_liveCalibrationDialog!=dialog)return;
+        if(m_calibrationCaptureCancel)m_calibrationCaptureCancel->store(true);
+        ++m_cameraConnectionGeneration;
+        m_liveCalibrationDialog=nullptr;m_liveCalibrationProfile.reset();
+        m_calibrationDialogOpen=false;m_calibrationSnapshotLoading=false;
+        m_pendingCalibrationCamera.clear();m_calibrationSnapshotCamera.clear();m_calibrationSnapshot=FrameCaptureResult();
+        if(result==QDialog::Accepted) {
+            m_discoveredItemsMap[cameraId]=DeviceConfigManager::instance().getDevice(cameraId);
+            if(auto* row=findListItemByCameraId(cameraId))updateDeviceListItemWidget(row,m_discoveredItemsMap.value(cameraId));
+            if(m_analysisInput.device.cameraId==cameraId&&!m_analysisInput.useHistoricalConfiguration)
+                m_analysisInput.device=m_discoveredItemsMap.value(cameraId);
+            if(cameraId==makeSingleTask().device.cameraId)applyCameraCalibrationAndProfile(cameraId);
+            onLogReceived(tr("[CALIBRATION] 设备 %1 的表计标定已保存到数据库。").arg(cameraId));
+        }
+    });
+    dialog->open(); // Show the actual calibration window before any asynchronous prerequisites.
     applyCameraCalibrationAndProfile(cameraId);
     m_discoveryService->deferHealthForCapture(cameraId);
-    m_statusLabel->setText(tr("正在通过 ONVIF 获取设备 %1 的标定快照…").arg(cameraId));
+    m_statusLabel->setText(tr("正在通过高清 RTSP 获取设备 %1 的标定图片…").arg(cameraId));
     requestCalibrationSnapshot(cameraId);
     checkCameraCalibration(cameraId);
     tryOpenCameraCalibration();
@@ -1495,6 +1525,7 @@ void MainWindow::checkCameraCalibration(const QString& cameraId) {
         if (!reply.second.isEmpty()) {
             onLogReceived(tr("[CALIBRATION] 设备 %1 标定查询失败: %2；请保存设备档案后从右键菜单重试。").arg(cameraId, reply.second));
             m_statusLabel->setText(tr("设备 %1 标定查询失败，请从右键菜单重试。").arg(cameraId));
+            if(m_liveCalibrationDialog)m_liveCalibrationDialog->showAcquisitionError(reply.second);
             m_pendingCalibrationCamera.clear();
             return;
         }
@@ -1528,13 +1559,13 @@ void MainWindow::checkCameraCalibration(const QString& cameraId) {
 }
 
 void MainWindow::requestCalibrationSnapshot(const QString& cameraId) {
-    if (m_calibrationSnapshotLoading || m_calibrationDialogOpen || cameraId!=m_pendingCalibrationCamera) return;
+    if (m_calibrationSnapshotLoading || cameraId!=m_pendingCalibrationCamera) return;
     auto task=makeSingleTask();
     if (task.device.protocolType!=CameraProtocolType::ONVIF_RTSP_STREAM) {
         m_pendingCalibrationCamera.clear();
-        QMessageBox::warning(this,tr("无法获取标定底图"),tr("请为设备配置 ONVIF 协议后获取标定快照。")); return;
+        if(m_liveCalibrationDialog)m_liveCalibrationDialog->showAcquisitionError(tr("请为设备配置 ONVIF 协议后获取标定快照")); return;
     }
-    task.captureOnly=true; task.preferOnvifSnapshot=true; task.requireOnvifSnapshot=true; task.previewSnapshot.release();
+    task.captureOnly=true; task.preferOnvifSnapshot=false; task.requireOnvifSnapshot=true; task.previewSnapshot.release();
     task.captureTimeoutMs=12000;
     const auto generation=m_cameraConnectionGeneration;
     m_calibrationSnapshotLoading=true;
@@ -1543,77 +1574,68 @@ void MainWindow::requestCalibrationSnapshot(const QString& cameraId) {
         auto frame=watcher->result(); watcher->deleteLater();
         if (generation!=m_cameraConnectionGeneration || cameraId!=m_pendingCalibrationCamera) return;
         m_calibrationSnapshotLoading=false;
-        if (!frame.ok() || frame.message!="ONVIF_HTTP" || isUniformSnapshotFrame(frame.frame)) {
+        if (!frame.ok() || isUniformSnapshotFrame(frame.frame)) {
             m_pendingCalibrationCamera.clear();
-            const auto message=tr("设备 %1 的 ONVIF 快照获取失败或返回灰色/空白图像，请检查 ONVIF 地址、账号和快照服务后重试。")
-                .arg(cameraId);
+            const auto reason = !frame.ok()
+                ? (frame.message.empty() ? QString::fromLatin1(captureFailureName(frame.failure)) : QString::fromStdString(frame.message))
+                : tr("返回灰色或空白图像");
+            const auto message=tr("设备 %1 无法获取高分辨率标定底图。\n原因：%2")
+                .arg(cameraId, reason);
             m_statusLabel->setText(message); onLogReceived(message);
-            QMessageBox::warning(this,tr("无法获取标定底图"),message); return;
+            if(m_liveCalibrationDialog)m_liveCalibrationDialog->showAcquisitionError(message); return;
         }
         m_calibrationSnapshot=frame; m_calibrationSnapshot.frame=frame.frame.clone();
         m_calibrationSnapshotCamera=cameraId;
-        onLogReceived(tr("[CALIBRATION] 已获取设备 %1 的 ONVIF 快照用于表计标定。").arg(cameraId));
+        if(m_liveCalibrationDialog)m_liveCalibrationDialog->showCapturedPreview(frame.frame);
+        onLogReceived(tr("[CALIBRATION] 已获取设备 %1 的高分辨率标定底图，来源：%2，尺寸：%3×%4。")
+            .arg(cameraId, frame.message=="ONVIF_HTTP" ? QStringLiteral("ONVIF HTTP") : QStringLiteral("ONVIF RTSP"))
+            .arg(frame.frame.cols).arg(frame.frame.rows));
         tryOpenCameraCalibration();
     });
-    watcher->setFuture(QtConcurrent::run([task]{
-        return isolatedCapture(task,std::make_shared<std::atomic<bool>>(false));
+    const auto cancel=m_calibrationCaptureCancel;
+    watcher->setFuture(QtConcurrent::run([task,cancel]{
+        return isolatedCapture(task,cancel);
     }));
 }
 
 void MainWindow::tryOpenCameraCalibration() {
-    const QString cameraId = m_pendingCalibrationCamera;
-    if (cameraId.isEmpty() || cameraId != makeSingleTask().device.cameraId || !m_profileReady || m_calibrationDialogOpen || m_historicalCalibrationPending ||
-        !m_calibrationChecked.contains(cameraId) || m_calibrationQueries.contains(cameraId)) return;
-    if (m_calibrationSnapshotCamera!=cameraId || !m_calibrationSnapshot.ok()) {
-        requestCalibrationSnapshot(cameraId); return;
+    const QString cameraId=m_pendingCalibrationCamera;
+    if(cameraId.isEmpty() || cameraId!=makeSingleTask().device.cameraId || !m_profileReady ||
+       !m_liveCalibrationDialog || !m_liveCalibrationDialog->awaitingFrame() || m_historicalCalibrationPending ||
+       !m_calibrationChecked.contains(cameraId) || m_calibrationQueries.contains(cameraId))return;
+    if(m_calibrationSnapshotCamera!=cameraId || !m_calibrationSnapshot.ok()) {
+        requestCalibrationSnapshot(cameraId);return;
     }
     const auto frame=m_calibrationSnapshot;
-    m_calibrationSnapshot=FrameCaptureResult();
-    m_calibrationSnapshotCamera.clear();
+    m_calibrationSnapshot=FrameCaptureResult();m_calibrationSnapshotCamera.clear();
     m_pendingCalibrationCamera.clear();
-    m_calibrationDialogOpen = true;
-    // Queue the modal window outside the frame callback. Freeze this camera's real frame.
-    QTimer::singleShot(0, this, [this, cameraId, frame]() {
-        if (cameraId != makeSingleTask().device.cameraId) {
-            m_calibrationDialogOpen = false;
-            return;
-        }
-        const auto device = m_discoveredItemsMap.value(cameraId);
-        GaugeProfile profile = m_profile;
-        if(OcrDialRange::valid(device.meterRange)) {
-            profile.min_val=device.meterRange["min_val"].toDouble();profile.max_val=device.meterRange["max_val"].toDouble();
-            profile.unit=device.meterRange["unit"].toString("MPa").toStdString();
-        }
-        profile.scalePoints = {};
-        profile.perspective_correction_enabled = device.hasCalibration;
-        if (device.hasCalibration) {
-            const float sx = device.calibratedWidth > 0 ? float(frame.frame.cols) / device.calibratedWidth : 1;
-            const float sy = device.calibratedHeight > 0 ? float(frame.frame.rows) / device.calibratedHeight : 1;
-            profile.perspective_pts = {{float(device.pt0_x)*sx, float(device.pt0_y)*sy},
-                {float(device.pt1_x)*sx, float(device.pt1_y)*sy},
-                {float(device.pt2_x)*sx, float(device.pt2_y)*sy}, {float(device.pt3_x)*sx, float(device.pt3_y)*sy}};
-            profile.center = {float(device.centerX)*sx, float(device.centerY)*sy};
-            profile.scalePoints = ScaleCalibration::scaled(device.scalePoints,sx,sy);
-            profile.pointerBaseRadius = device.pointerBaseRadius * (sx+sy)/2;
-        } else {
-            profile.perspective_pts.clear();
-            profile.center = {-1, -1};
-        }
-        CardinalSelectorDialog dialog(frame.frame, profile, cameraId, this);
-        if (!device.hasCalibration)
-            dialog.setWindowTitle(tr("设备 %1 尚未标定 — 请完成表计标定并保存").arg(cameraId));
-        if (dialog.exec() == QDialog::Accepted) {
-            m_discoveredItemsMap[cameraId] = DeviceConfigManager::instance().getDevice(cameraId);
-            if (auto* row = findListItemByCameraId(cameraId))
-                updateDeviceListItemWidget(row, m_discoveredItemsMap.value(cameraId));
-            if (m_analysisInput.device.cameraId == cameraId && !m_analysisInput.useHistoricalConfiguration)
-                m_analysisInput.device = m_discoveredItemsMap.value(cameraId);
-
-            if (cameraId == makeSingleTask().device.cameraId) applyCameraCalibrationAndProfile(cameraId);
-            onLogReceived(tr("[CALIBRATION] 设备 %1 的表计标定已保存到 数据库。").arg(cameraId));
-        }
-        m_calibrationDialogOpen = false;
-    });
+    const auto device = m_discoveredItemsMap.value(cameraId);
+    GaugeProfile profile = m_profile;
+    if(OcrDialRange::valid(device.meterRange)) {
+        profile.min_val=device.meterRange["min_val"].toDouble();profile.max_val=device.meterRange["max_val"].toDouble();
+        profile.unit=device.meterRange["unit"].toString("MPa").toStdString();
+    }
+    profile.scalePoints = {};
+    profile.perspective_correction_enabled = device.hasCalibration;
+    if (device.hasCalibration) {
+        const float sx = device.calibratedWidth > 0 ? float(frame.frame.cols) / device.calibratedWidth : 1;
+        const float sy = device.calibratedHeight > 0 ? float(frame.frame.rows) / device.calibratedHeight : 1;
+        profile.perspective_pts = {{float(device.pt0_x)*sx, float(device.pt0_y)*sy},
+            {float(device.pt1_x)*sx, float(device.pt1_y)*sy},
+            {float(device.pt2_x)*sx, float(device.pt2_y)*sy}, {float(device.pt3_x)*sx, float(device.pt3_y)*sy}};
+        profile.center = {float(device.centerX)*sx, float(device.centerY)*sy};
+        profile.scalePoints = ScaleCalibration::scaled(device.scalePoints,sx,sy);
+        // Stored in 800-pixel reference units; the dialog applies the
+        // rectified-resolution scale once. Raw-frame scaling here would
+        // enlarge the hub deadzone twice when switching to HD capture.
+        profile.pointerBaseRadius = device.pointerBaseRadius;
+    } else {
+        profile.perspective_pts.clear();
+        profile.center = {-1, -1};
+    }
+    *m_liveCalibrationProfile=profile;
+    try {m_liveCalibrationDialog->setCapturedFrame(frame.frame);}
+    catch(const std::exception& error){m_liveCalibrationDialog->showAcquisitionError(QString::fromUtf8(error.what()));}
 }
 
 void MainWindow::onEditCameraInfo(QListWidgetItem *item, bool archiveOnly) {
@@ -2095,7 +2117,7 @@ void MainWindow::onCaptureAndRecognizeCurrent(const QString& cameraId) {
     InspectionTask task;
     task.device = m_discoveredItemsMap.value(cameraId);
     task.inputKind = InspectionInputKind::CameraSnapshot;
-    task.preferOnvifSnapshot=true; task.requireOnvifSnapshot=true;
+    task.preferOnvifSnapshot=false; task.requireOnvifSnapshot=true;
     task.captureTimeoutMs=12000;
     submitSingleTask(task);
 }
@@ -2193,7 +2215,7 @@ void MainWindow::onStartAllDevicesInspection() {
     for (const auto& device : devices) {
         InspectionTask task;
         task.device = device;
-        task.preferOnvifSnapshot = true;
+        task.requireOnvifSnapshot = device.protocolType == CameraProtocolType::ONVIF_RTSP_STREAM;
         if (device.protocolType == CameraProtocolType::LOCAL_FILE) task.inputKind = InspectionInputKind::LocalImage;
         task.runMode = GaugeRunMode::Evidence;
         task.localImagePath = m_hasAnalysisInput && m_analysisInput.inputKind == InspectionInputKind::LocalImage

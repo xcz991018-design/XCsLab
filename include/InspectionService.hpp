@@ -31,8 +31,9 @@ struct InspectionTask {
     QString parentTaskId;
     QDateTime originalCapturedAt;
     bool captureOnly{false};
-    bool requireOnvifSnapshot{false}; // HTTP snapshot only; never reuse preview or fall back to RTSP.
-    bool preferOnvifSnapshot{false}; // Batch inspection prefers HTTP; preview stays RTSP.
+    bool requireOnvifSnapshot{false}; // Require ONVIF acquisition; use selected high-resolution RTSP, never reuse preview.
+    bool preferOnvifSnapshot{false}; // Patrol HTTP preference; calibration/manual reading use RTSP.
+    bool allowLowerResolutionHttpSnapshot{false}; // Patrol only; never relax RTSP/high-resolution calibration checks.
     // Owned copy of the live preview frame selected by the snapshot button.
     cv::Mat previewSnapshot;
     QDateTime previewCapturedAt;
@@ -98,8 +99,10 @@ signals:
     void evidenceMaintenanceFinished(const QString& report);
 private:
     void dispatch();
+    void prewarmNext();
     void complete(InspectionOutcome outcome, int index);
     QThreadPool m_capturePool;
+    QThreadPool m_prewarmPool;
     QThreadPool m_recognitionPool;
     QThreadPool m_storagePool;
     SourceFactory m_factory;
@@ -107,6 +110,7 @@ private:
     QList<InspectionTask> m_tasks;
     QList<int> m_retryIndices;
     QSet<int> m_restartIndices;
+    QSet<int> m_prewarmedIndices;
     QHash<int, std::shared_ptr<std::atomic<bool>>> m_taskCancels;
     std::shared_ptr<std::atomic<bool>> m_cancel;
     int m_limit;
@@ -115,5 +119,6 @@ private:
     int m_completed{0};
     bool m_running{false};
     bool m_databaseRetryRunning{false};
+    bool m_prewarmActive{false};
     QDateTime m_lastEvidenceMaintenance;
 };

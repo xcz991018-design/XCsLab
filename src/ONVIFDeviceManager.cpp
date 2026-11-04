@@ -248,7 +248,7 @@ bool ONVIFDeviceManager::checkTcpPort(const std::string& ip, int port, int timeo
 bool ONVIFDeviceManager::open() {
     logMessage("Connecting to ONVIF Device XAddr: " + m_info.xaddr);
 
-    if (m_info.rtspUri.empty() && (!fetchProfiles() || fetchStreamUri().empty())) {
+    if (!fetchProfiles() || fetchStreamUri().empty()) {
         logMessage(m_lastError);
         return false;
     }
@@ -327,13 +327,32 @@ bool ONVIFDeviceManager::fetchProfiles() {
         "<trt:GetProfiles/>", QString::fromStdString(m_info.username), QString::fromStdString(m_info.password), error);
     QXmlStreamReader profiles(data);
     m_info.profileToken.clear();
+    m_selectedResolution = {};
+    qint64 bestArea = -1;
     while (!profiles.atEnd()) {
         profiles.readNext();
-        if (profiles.isStartElement() && profiles.name() == "Profiles") {
-            const auto token = profiles.attributes().value("token").toString();
-            if (!token.isEmpty()) { m_info.profileToken = token.toStdString(); break; }
+        if (!profiles.isStartElement() || profiles.name() != "Profiles") continue;
+        const auto token = profiles.attributes().value("token").toString();
+        int width = 0, height = 0;
+        while (profiles.readNextStartElement()) {
+            if (profiles.name() != "VideoEncoderConfiguration") { profiles.skipCurrentElement(); continue; }
+            while (profiles.readNextStartElement()) {
+                if (profiles.name() != "Resolution") { profiles.skipCurrentElement(); continue; }
+                while (profiles.readNextStartElement()) {
+                    if (profiles.name() == "Width") width = profiles.readElementText().toInt();
+                    else if (profiles.name() == "Height") height = profiles.readElementText().toInt();
+                    else profiles.skipCurrentElement();
+                }
+            }
+        }
+        const qint64 area = qint64(width) * height;
+        if (!token.isEmpty() && width > 0 && height > 0 && area > bestArea) {
+            bestArea = area;
+            m_info.profileToken = token.toStdString();
+            m_selectedResolution = {width, height};
         }
     }
+    if (profiles.hasError()) { m_info.profileToken.clear(); m_selectedResolution = {}; }
     m_lastError = error.isEmpty() ? "No ONVIF media profile returned" : error.toStdString();
     if (!m_info.profileToken.empty()) { m_lastError.clear(); return true; }
     return false;
@@ -461,6 +480,9 @@ FrameCaptureResult ONVIFDeviceManager::readFrame() {
     if (!m_isRealStreamActive || m_latestFrame.empty()) {
         result.failure = CaptureFailure::NoFrame;
         result.message = "No live frame available";
+    } else if (!frameMeetsResolution(m_latestFrame)) {
+        result.failure = CaptureFailure::ReadFailed;
+        result.message = "Live frame is below selected ONVIF resolution";
     } else if (std::chrono::steady_clock::now() - m_lastFrameTime >= std::chrono::seconds(2)) {
         result.failure = CaptureFailure::StaleFrame;
         result.message = "Cached frame is older than two seconds";
@@ -478,11 +500,16 @@ bool ONVIFDeviceManager::grabFrame(cv::Mat& frame) {
     return result.ok();
 }
 
-FrameCaptureResult ONVIFDeviceManager::captureHttpSnapshot() {
-    FrameCaptureResult result;
-    result.failure = CaptureFailure::ReadFailed;
-    result.message = "ONVIF HTTP snapshot unavailable";
-    if (m_mediaEndpoint.empty() && !fetchProfiles()) return result;
+bool ONVIFDeviceManager::prepareSnapshot() {
+    if(m_mediaEndpoint.empty() && (!fetchProfiles() || fetchStreamUri().empty()))return false;
+    if(m_info.preferHttpSnapshot || m_info.requireHttpSnapshot)resolveSnapshotUri();
+    return true;
+}
+
+bool ONVIFDeviceManager::resolveSnapshotUri() {
+    if(!m_snapshotUri.isEmpty() && std::chrono::steady_clock::now()<m_snapshotExpires)return true;
+    m_snapshotUri.clear();
+    if(m_mediaEndpoint.empty() && !fetchProfiles())return false;
     QString error;
     const auto xml = OnvifSoap::request(QUrl(QString::fromStdString(m_mediaEndpoint)),
         "http://www.onvif.org/ver10/media/wsdl/GetSnapshotUri",
@@ -492,8 +519,30 @@ FrameCaptureResult ONVIFDeviceManager::captureHttpSnapshot() {
     const auto address = OnvifSoap::element(xml, "Uri");
     QUrl uri = QUrl(QString::fromStdString(m_mediaEndpoint)).resolved(QUrl(address));
     if (address.isEmpty() || !uri.isValid() || uri.host() != QString::fromStdString(m_info.ipAddress) ||
-        (uri.scheme() != "http" && uri.scheme() != "https")) return result;
+        (uri.scheme() != "http" && uri.scheme() != "https")) return false;
     uri.setUserInfo(QString());
+    m_snapshotUri=uri.toString();
+    const auto singleUse=OnvifSoap::element(xml,"InvalidAfterConnect").trimmed().toLower();
+    m_snapshotSingleUse=singleUse=="true" || singleUse=="1";
+    const auto duration=OnvifSoap::element(xml,"Timeout").trimmed();
+    const auto match=QRegularExpression("^PT(?:(\\d+)H)?(?:(\\d+)M)?(?:(\\d+(?:\\.\\d+)?)S)?$").match(duration);
+    double seconds=60;
+    if(match.hasMatch())seconds=match.captured(1).toDouble()*3600+match.captured(2).toDouble()*60+match.captured(3).toDouble();
+    // Conservatively refresh nonpositive lifetimes rather than reuse an uncertain URI.
+    if(seconds<=0)seconds=0;
+    m_snapshotExpires=std::chrono::steady_clock::now()+std::chrono::milliseconds(qint64(std::min(seconds,600.)*1000));
+    return true;
+}
+
+FrameCaptureResult ONVIFDeviceManager::captureHttpSnapshot() {
+    FrameCaptureResult result;
+    result.failure=CaptureFailure::ReadFailed;
+    result.message="ONVIF HTTP snapshot unavailable";
+    QElapsedTimer stage;stage.start();
+    if(!resolveSnapshotUri())return result;
+    result.timings["snapshot_uri_ms"]=double(stage.elapsed());stage.restart();
+    const QUrl uri(m_snapshotUri);
+    if(m_snapshotSingleUse)m_snapshotUri.clear();
     QNetworkAccessManager manager;
     int authAttempts = 0;
     QObject::connect(&manager, &QNetworkAccessManager::authenticationRequired,
@@ -519,11 +568,18 @@ FrameCaptureResult ONVIFDeviceManager::captureHttpSnapshot() {
     timeout.start(2000);
     loop.exec();
     const auto bytes = reply->readAll();
+    result.timings["http_download_ms"]=double(stage.elapsed());stage.restart();
     const int status = reply->attribute(QNetworkRequest::HttpStatusCodeAttribute).toInt();
-    if (reply->error() != QNetworkReply::NoError || status != 200 || bytes.size() > 16 * 1024 * 1024) return result;
+    if (reply->error() != QNetworkReply::NoError || status != 200 || bytes.size() > 16 * 1024 * 1024) {m_snapshotUri.clear();return result;}
     try { result.frame = cv::imdecode(std::vector<uchar>(bytes.begin(), bytes.end()), cv::IMREAD_COLOR); }
     catch (...) { result.frame.release(); }
+    result.timings["image_decode_ms"]=double(stage.elapsed());
     if (isUniformSnapshotFrame(result.frame)) { result.frame.release(); return result; }
+    if (!m_info.allowLowerResolutionHttpSnapshot && !frameMeetsResolution(result.frame)) {
+        result.message = "HTTP snapshot is below selected ONVIF resolution";
+        result.frame.release();
+        return result;
+    }
     result.failure = CaptureFailure::None;
     result.capturedAt = std::chrono::system_clock::now();
     result.encodedOriginal.assign(bytes.begin(), bytes.end());
@@ -531,14 +587,27 @@ FrameCaptureResult ONVIFDeviceManager::captureHttpSnapshot() {
     return result;
 }
 
+bool ONVIFDeviceManager::frameMeetsResolution(const cv::Mat& frame) const {
+    return !frame.empty() && frame.cols >= m_selectedResolution.width && frame.rows >= m_selectedResolution.height;
+}
+
 FrameCaptureResult ONVIFDeviceManager::captureSnapshot() {
+    QElapsedTimer metadataTimer;metadataTimer.start();
+    if (m_mediaEndpoint.empty() && (!fetchProfiles() || fetchStreamUri().empty())) {
+        FrameCaptureResult failed;
+        failed.failure = CaptureFailure::OpenFailed;
+        failed.message = m_lastError;
+        return failed;
+    }
+    const double metadataMs=metadataTimer.elapsed();
     if (m_info.preferHttpSnapshot || m_info.requireHttpSnapshot) {
         auto snapshot = captureHttpSnapshot();
-        if (snapshot.ok() || m_info.requireHttpSnapshot) return snapshot;
+        snapshot.timings["onvif_metadata_ms"]=metadataMs;
+        if (snapshot.ok()) return snapshot;
         logMessage("ONVIF HTTP snapshot failed; falling back to RTSP");
     }
     auto cached = readFrame();
-    if (cached.ok() && !isUniformSnapshotFrame(cached.frame)) return cached;
+    if (cached.ok() && frameMeetsResolution(cached.frame) && !isUniformSnapshotFrame(cached.frame)) return cached;
     FrameCaptureResult result;
     // Use the configured, authenticated endpoint; never guess another identity or use samples.
     if (m_info.rtspUri.empty()) {
@@ -554,15 +623,31 @@ FrameCaptureResult ONVIFDeviceManager::captureSnapshot() {
         uri.setPassword(QString::fromStdString(m_info.password));
     }
     cv::VideoCapture cap;
+    QElapsedTimer rtspStage;rtspStage.start();
     const std::vector<int> params = {cv::CAP_PROP_OPEN_TIMEOUT_MSEC, 2000,
                                      cv::CAP_PROP_READ_TIMEOUT_MSEC, 2000};
     if (!cap.open(uri.toEncoded().toStdString(), cv::CAP_FFMPEG, params)) {
         result.failure = CaptureFailure::OpenFailed;
         result.message = "Unable to open configured camera stream";
+        result.timings["onvif_metadata_ms"]=metadataMs;
+        result.timings["rtsp_open_ms"]=double(rtspStage.elapsed());
         return result;
     }
-    return readDecodedSnapshot([&cap](cv::Mat& frame) { return cap.read(frame); }, SnapshotDecodePolicy(),
+    const double openMs=rtspStage.elapsed();rtspStage.restart();
+    result = readDecodedSnapshot([&cap](cv::Mat& frame) { return cap.read(frame); }, SnapshotDecodePolicy(),
                                [&cap]() { return static_cast<int>(cap.get(cv::CAP_PROP_FRAME_TYPE)); });
+    const double decodeMs=rtspStage.elapsed();rtspStage.restart();cap.release();
+    result.timings["onvif_metadata_ms"]=metadataMs;
+    result.timings["rtsp_open_ms"]=openMs;
+    result.timings["rtsp_decode_warmup_ms"]=decodeMs;
+    result.timings["rtsp_close_ms"]=double(rtspStage.elapsed());
+    if (result.ok())result.message="ONVIF_RTSP";
+    if (result.ok() && !frameMeetsResolution(result.frame)) {
+        result.failure = CaptureFailure::ReadFailed;
+        result.message = "RTSP frame is below selected ONVIF resolution";
+        result.frame.release();
+    }
+    return result;
 }
 
 bool ONVIFDeviceManager::captureSingleSnapshot(cv::Mat& frame) {

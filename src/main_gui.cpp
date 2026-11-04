@@ -12,6 +12,7 @@ int main(int argc, char *argv[]) {
     qputenv("OPENCV_FFMPEG_CAPTURE_OPTIONS", "fflags;nobuffer|flags;low_delay|framedrop|max_delay;0|rtsp_transport;tcp|stimeout;3000000");
 
     QApplication app(argc, argv);
+    CapturePoolLifetime capturePoolLifetime;
     app.setStyleSheet(UiTheme::scrollAndTableStyle());
     
     // Set High DPI scaling policy for modern Windows displays
@@ -20,9 +21,15 @@ int main(int argc, char *argv[]) {
     #endif
 
     constexpr int logoutExitCode = 1001;
+    // Temporary local startup mode. Set false to restore the login screen.
+    constexpr bool skipLogin = true;
     for (;;) {
         QApplication::setQuitOnLastWindowClosed(false);
-        if (!authenticateApplication()) return 0;
+        if (skipLogin) {
+            AccessControl::login(AccessControl::Administrator, QStringLiteral("local"));
+        } else if (!authenticateApplication()) {
+            return 0;
+        }
         int result;
         {
             MainWindow window;
@@ -32,6 +39,7 @@ int main(int argc, char *argv[]) {
         } // Drain session workers before changing identity or allowing a new login.
         QThreadPool::globalInstance()->waitForDone();
         AccessControl::beginGui();
+        if (skipLogin && result == logoutExitCode) return 0;
         if (result != logoutExitCode) return result;
     }
 }

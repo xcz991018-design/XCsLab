@@ -20,6 +20,7 @@ int main(int argc, char** argv) {
     const int workerExit = runCaptureWorker(argc, argv);
     if (workerExit >= 0) return workerExit;
     QCoreApplication app(argc, argv);
+    CapturePoolLifetime capturePoolLifetime;
     QCommandLineParser parser;
     parser.setApplicationDescription("Headless gauge inspection runtime");
     parser.addHelpOption();
@@ -37,7 +38,7 @@ int main(int argc, char** argv) {
         QCommandLineOption("check-database", "Check database template and device references without capture"),
         QCommandLineOption("output", "Evidence directory", "path", "inspection_snapshots"),
         QCommandLineOption("image", "Explicit image for LOCAL_FILE devices", "path"),
-        QCommandLineOption("concurrency", "Maximum in-flight tasks", "count", "4"),
+        QCommandLineOption("concurrency", "Maximum in-flight tasks (1-8; network capture pool is capped at 4)", "count", "4"),
         QCommandLineOption("capture-timeout", "Whole network acquisition deadline in milliseconds", "ms", "8000"),
         QCommandLineOption("mode", "Diagnostic replay rendering: production, evidence, debug (inspection uses unified image retention)", "mode", "evidence"),
         QCommandLineOption("interval", "Repeat interval in seconds (0: one pass)", "seconds", "0")
@@ -257,7 +258,7 @@ int main(int argc, char** argv) {
     const int concurrency = parser.value("concurrency").toInt(&concurrencyOk);
     const int interval = parser.value("interval").toInt(&intervalOk);
     if (!captureTimeoutOk || captureTimeout < 100 || captureTimeout > 120000 ||
-        !concurrencyOk || concurrency < 1 || concurrency > 128 || !intervalOk || interval < 0 || interval > 2147483)
+        !concurrencyOk || concurrency < 1 || concurrency > 8 || !intervalOk || interval < 0 || interval > 2147483)
         return 2;
     auto& registry = DeviceConfigManager::instance();
     if (!DatabaseSettings::fromEnvironment().enabled)
@@ -273,7 +274,7 @@ int main(int argc, char** argv) {
         InspectionTask task;
         task.captureTimeoutMs = captureTimeout;
         task.device = device;
-        task.preferOnvifSnapshot = true;
+        task.requireOnvifSnapshot = device.protocolType == CameraProtocolType::ONVIF_RTSP_STREAM;
         if (device.protocolType == CameraProtocolType::LOCAL_FILE)
             task.inputKind = InspectionInputKind::LocalImage;
         task.runMode = mode;

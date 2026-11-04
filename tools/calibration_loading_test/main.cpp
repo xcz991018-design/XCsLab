@@ -1,8 +1,10 @@
+#include "RectifiedResolution.hpp"
 #include "CardinalSelectorDialog.hpp"
 #include "CameraInfoEditDialog.hpp"
 #include "CameraUndistortion.hpp"
 #include "GaugeReaderEngine.hpp"
 #include <QApplication>
+#include <QFontDatabase>
 #include <QEventLoop>
 #include <QSemaphore>
 #include <QThreadPool>
@@ -15,10 +17,59 @@ static void require(bool ok, const char* message) {
     if (!ok) throw std::runtime_error(message);
 }
 
+// Replay the actual automatic dialog with an empty device ID so no database write is possible.
+static void benchmarkCalibration(const QString& outputPath, const QStringList& images) {
+    require(!images.isEmpty(),"supply at least one input image");
+    QFile output(outputPath);
+    require(output.open(QIODevice::WriteOnly | QIODevice::NewOnly),"choose a new benchmark output file");
+    for (const auto& path : images) {
+        const auto raw=cv::imread(path.toStdString());
+        require(!raw.empty(),"cannot load benchmark image");
+        qInfo().noquote()<<"benchmark image"<<path;
+        GaugeProfile profile;
+        QElapsedTimer timer;
+        timer.start();
+        CardinalSelectorDialog dialog(raw,profile);
+        dialog.setAttribute(Qt::WA_DontShowOnScreen);
+        dialog.show();
+        auto* status=dialog.findChild<QLabel*>("calibrationLoadingStatus");
+        auto* preview=dialog.findChild<InteractiveImageLabel*>("rectifiedCalibrationImage");
+        require(status && preview,"missing calibration widgets");
+        while (!status->text().startsWith(QStringLiteral(u"自动标定未完成"))) {
+            require(timer.elapsed()<300000,"calibration replay timed out");
+            QApplication::processEvents(QEventLoop::AllEvents,10);
+            QThread::msleep(2);
+        }
+        const auto elapsed=timer.elapsed();
+        const auto minor=preview->minorPreview();
+        QJsonArray corners;
+        for (const auto& p:dialog.findChild<InteractiveImageLabel*>("perspectiveImage")->getPoints())
+            corners.append(QJsonArray{p.x,p.y});
+        const auto hub=preview->getCenterPoint();
+        const QJsonObject result{{"corners",corners},{"hub",QJsonArray{hub.x,hub.y}},
+            {"ocr",preview->ocrNumbers()},{"scale_points",preview->getScalePoints()},
+            {"range_min",dialog.findChild<QDoubleSpinBox*>("ocrRangeMinimum")->value()},
+            {"range_max",dialog.findChild<QDoubleSpinBox*>("ocrRangeMaximum")->value()},
+            {"preview_division",minor.division},{"preview_confirmed",minor.divisionConfirmed},{"preview_points",minor.previewPoints},
+            {"message",minor.message},{"stop",status->text()}};
+        const QByteArray record=QJsonDocument(QJsonObject{{"image",path},{"elapsed_ms",double(elapsed)},
+            {"result",result}}).toJson(QJsonDocument::Compact)+'\n';
+        require(output.write(record)==record.size() && output.flush(),"cannot write benchmark result");
+    }
+}
+
 int main(int argc, char** argv) {
     QApplication app(argc, argv);
     app.setQuitOnLastWindowClosed(false);
+    if(!qEnvironmentVariable("GAUGE_TEST_PROGRESS_IMAGE").isEmpty()) {
+        QFontDatabase::addApplicationFont("C:/Windows/Fonts/segoeui.ttf");
+        QFontDatabase::addApplicationFont("C:/Windows/Fonts/msyh.ttc");
+    }
     try {
+        if (app.arguments().value(1)=="--benchmark") {
+            benchmarkCalibration(app.arguments().value(2),app.arguments().mid(3));
+            return 0;
+        }
         CameraInfoEditDialog archive("",nullptr,false,{},true);
         archive.setAttribute(Qt::WA_DontShowOnScreen);
         require(!archive.findChild<QComboBox*>("deviceGaugeTemplate"),"archive must no longer require template selection");
@@ -66,8 +117,34 @@ int main(int argc, char** argv) {
         require(cv::norm(result.step1_original,originalPixels,cv::NORM_INF)==0 &&
             cv::norm(lensFrame,originalPixels,cv::NORM_INF)==0,"evidence and input must preserve the raw snapshot");
         require(lensProfile.toJson()==saved,"recognition must not persist corrected coordinates");
+        const auto originalInverse=inverse.clone();
+        inverse.setTo(0);
+        const auto cachedRectified=engine.rectifyPerspective(CameraUndistortion::image(lensFrame),
+            CameraUndistortion::points(lensProfile.perspective_pts,size),inverse,
+            lensProfile.rectified_size,lensProfile.rectified_margin);
+        require(cv::norm(cachedRectified,expected,cv::NORM_INF)==0 &&
+            cv::norm(inverse,originalInverse,cv::NORM_INF)==0,"callers must not mutate cached homography");
         const auto repeated=engine.process(lensFrame,lensProfile,GaugeRunMode::Debug);
         require(cv::norm(repeated.step2_rectified,expected,cv::NORM_INF)==0,"repeated recognition must not double-correct");
+        // Legacy raw annotations and their scale origins must map to the same
+        // normalized position on a native-resolution rectified canvas.
+        cv::Mat nativeFrame; cv::resize(lensFrame,nativeFrame,nativeSize,0,0,cv::INTER_CUBIC);
+        const auto nativeResult=engine.process(nativeFrame,lensProfile,GaugeRunMode::Debug);
+        require(nativeResult.step2_rectified.size()==cv::Size(2304,2304),"native snapshot must retain a high resolution rectified canvas");
+        require(cv::norm(nativeResult.center-result.center*(2304.0f/800))<1.0,"legacy hub must scale with the homography");
+        require(lensProfile.toJson()==saved,"high resolution recognition must preserve legacy calibration");
+        GaugeProfile resolutionProfile=lensProfile;
+        RectifiedResolution::apply(resolutionProfile,nativeSize);
+        require(resolutionProfile.rectified_size==2304 && resolutionProfile.rectified_margin==115,"canvas margin must scale proportionally");
+        RectifiedResolution::apply(resolutionProfile,nativeSize);
+        require(resolutionProfile.rectified_margin==115,"resolution selection must be idempotent");
+        GaugeProfile nativeDialogProfile=lensProfile;
+        CardinalSelectorDialog nativeDialog(nativeFrame,nativeDialogProfile,{},nullptr,true);
+        const auto nativeCorners=nativeDialog.findChild<InteractiveImageLabel*>("perspectiveImage")->getPoints();
+        const auto expectedCorners=CameraUndistortion::points(lensProfile.perspective_pts,size);
+        require(cv::norm(nativeCorners[0]-expectedCorners[0]*4)<.01,"calibration editor must rescale legacy raw annotations before displaying a native snapshot");
+        nativeDialog.reject();
+        require(nativeDialogProfile.toJson()==saved,"cancelling native calibration must preserve persisted coordinates and detector lengths");
         CardinalSelectorDialog lensDialog(lensFrame,lensProfile,{},nullptr,true);
         const auto displayed=lensDialog.findChild<InteractiveImageLabel*>("perspectiveImage")->getPoints();
         const auto correctedCorners=CameraUndistortion::points(lensProfile.perspective_pts,size);
@@ -90,6 +167,20 @@ int main(int argc, char** argv) {
             "scale positions must return to raw coordinates while ratios remain intact");
         require(std::abs(lensProfile.scalePoints[0].toObject()["origin_y"].toDouble()-158)<.001,
             "calibration UI save must persist the printed plane origin separately from the hub");
+
+        // Repeated native-resolution save/reopen must not compound the display scale.
+        auto radiusProfile=lensProfile;
+        radiusProfile.pointerBaseRadius=47;
+        for(int cycle=0;cycle<3;++cycle) {
+            CardinalSelectorDialog radiusDialog(nativeFrame,radiusProfile,QStringLiteral("radius-test"),nullptr,true);
+            auto* preview=radiusDialog.findChild<InteractiveImageLabel*>("rectifiedCalibrationImage");
+            require(preview && std::abs(preview->getPointerBaseRadius()-135.4)<.1,
+                "2304-pixel preview must scale 47 reference pixels once, not to 390 pixels");
+            for(auto* box:radiusDialog.findChildren<QCheckBox*>())box->setChecked(true);
+            require(QMetaObject::invokeMethod(&radiusDialog,"onSaveAndApply",Qt::DirectConnection),"radius save slot");
+            require(radiusDialog.result()==QDialog::Accepted && std::abs(radiusProfile.pointerBaseRadius-47)<.05,
+                "saving HD radius must return to reference units across repeated reopen cycles");
+        }
 
         GaugeProfile profile;
         cv::Mat frame(600, 600, CV_8UC3, cv::Scalar(220,220,220));
@@ -322,6 +413,29 @@ int main(int argc, char** argv) {
         QSemaphore entered, release;
         auto blocker=QtConcurrent::run([&] {entered.release();release.acquire();});
         entered.acquire();
+        {
+            GaugeProfile pendingProfile=profile;
+            CardinalSelectorDialog pending({},pendingProfile);
+            pending.setAttribute(Qt::WA_DontShowOnScreen);pending.show();
+            auto* loading=pending.findChild<QProgressBar*>("calibrationLoadingProgress");
+            auto* right=pending.findChild<InteractiveImageLabel*>("rectifiedCalibrationImage");
+            require(pending.isVisible() && pending.awaitingFrame() && loading->isVisible() && right->isVisible(),
+                "calibration window must open immediately before any image is acquired");
+            require(pending.findChild<QLabel*>("calibrationLoadingStatus")->text().contains("RTSP"),
+                "waiting window identifies the pending high-resolution RTSP acquisition");
+            require(!pending.findChild<QPushButton*>("saveCalibrationButton")->isEnabled(),"cannot save while acquiring image");
+            const auto progressOutput=qEnvironmentVariable("GAUGE_TEST_PROGRESS_IMAGE");
+            if(!progressOutput.isEmpty())require(pending.grab().save(progressOutput),"save immediate loading preview");
+            pending.showCapturedPreview(frame);
+            require(pending.awaitingFrame(),"showing captured image must not start calibration before configuration arrives");
+            pending.setCapturedFrame(frame);
+            require(!pending.awaitingFrame() && right->isVisible(),"same window receives image and begins automatic calibration");
+            require(right->getScalePoints().isEmpty(),"old calibration must not be presented as new stage output");
+            pending.showAcquisitionError(QStringLiteral("test failure"));
+            require(!loading->isVisible() && pending.findChild<QLabel*>("calibrationLoadingStatus")->text().contains("test failure"),
+                "acquisition failures remain visible in the same window without an endless spinner");
+            pending.reject();
+        }
         auto* closing=new CardinalSelectorDialog(frame, profile);
         closing->setAttribute(Qt::WA_DontShowOnScreen);
         closing->show();
@@ -330,8 +444,8 @@ int main(int argc, char** argv) {
             require(button->isVisible()==(button->objectName()=="exportCalibrationOriginalButton"),"automatic result view must expose only original-image export");
         for(auto* spin:closing->findChildren<QDoubleSpinBox*>())
             require(!spin->isVisible(),"automatic result view must expose no manual numeric fields");
-        require(!closing->findChild<InteractiveImageLabel*>("rectifiedCalibrationImage")->isVisible(),
-            "intermediate or stale calibration must not appear as the final result");
+        require(closing->findChild<InteractiveImageLabel*>("rectifiedCalibrationImage")->isVisible(),
+            "right pane must remain visible throughout automatic calibration");
         require(!closing->findChild<QLabel*>("calibrationLoadingStatus")->text().isEmpty(),
             "loading message must exist before the first event loop iteration");
         app.processEvents(); // Starts the automatic detection scheduled on opening.

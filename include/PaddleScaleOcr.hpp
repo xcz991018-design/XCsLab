@@ -1,6 +1,7 @@
 #pragma once
 #include "AutoScaleCalibration.hpp"
 #include "LiquidSurface.hpp"
+#include "OcrWorker.hpp"
 #include <QCoreApplication>
 #include <QDir>
 #include <QFile>
@@ -14,27 +15,40 @@
 
 namespace PaddleScaleOcr {
 struct Recognition { QJsonArray tokens; QString error; bool valid() const {return error.isEmpty();} };
-struct InputRegion {cv::Mat image;int top{0};};
-inline InputRegion inputRegion(const cv::Mat& image,const LiquidSurface& surface) {
-    if(!surface.found||image.empty())return {image,0};
-    cv::Mat masked=image.clone();int top=image.rows;
-    for(int x=0;x<image.cols;++x) {
-        const double boundary=surface.yAt(x)+surface.margin;
-        if(!std::isfinite(boundary))return {{},0};
-        const int first=int(std::clamp(std::floor(boundary)+1,0.,double(image.rows)));
+// Four cardinal points map to (S/2,m), (S-m,S/2), (S/2,S-m), (m,S/2).
+// Keep their entire bounding box at native resolution, including boundary pixels.
+inline cv::Rect rectifiedDialBounds(cv::Size size,int margin) {
+    const cv::Rect full(0,0,size.width,size.height);
+    if(margin<=0 || margin>=std::min(size.width,size.height)/2)return full;
+    return cv::Rect(margin,margin,size.width-2*margin+1,size.height-2*margin+1)&full;
+}
+struct InputRegion {cv::Mat image;int top{0};int left{0};};
+inline InputRegion inputRegion(const cv::Mat& image,const LiquidSurface& surface,cv::Rect bounds={}) {
+    if(image.empty())return {};
+    const cv::Rect full(0,0,image.cols,image.rows);
+    if(bounds.empty())bounds=full;
+    bounds &= full;
+    if(bounds.empty())return {};
+    if(!surface.found)return {image(bounds),bounds.y,bounds.x};
+    cv::Mat masked=image(bounds).clone();int top=masked.rows;
+    for(int x=0;x<masked.cols;++x) {
+        // Liquid geometry stays in full rectified coordinates, even for sloped surfaces.
+        const double boundary=surface.yAt(x+bounds.x)+surface.margin-bounds.y;
+        if(!std::isfinite(boundary))return {};
+        const int first=int(std::clamp(std::floor(boundary)+1,0.,double(masked.rows)));
         top=std::min(top,first);
         if(first>0)masked(cv::Rect(x,0,1,first)).setTo(cv::Scalar::all(255));
     }
-    if(top>=image.rows)return {{},top};
-    return {masked(cv::Rect(0,top,image.cols,image.rows-top)).clone(),top};
+    if(top>=masked.rows)return {{},bounds.y+top,bounds.x};
+    return {masked(cv::Rect(0,top,masked.cols,masked.rows-top)),bounds.y+top,bounds.x};
 }
-inline QJsonArray restoreTokens(const QJsonArray& tokens,int top,const LiquidSurface& surface) {
+inline QJsonArray restoreTokens(const QJsonArray& tokens,int top,const LiquidSurface& surface,int left=0) {
     QJsonArray restored;
     for(const auto& entry:tokens) {
         auto token=entry.toObject();QJsonArray polygon;bool excluded=false;
         for(const auto& vertex:token["polygon"].toArray()) {
             const auto p=vertex.toArray();if(p.size()!=2){excluded=true;break;}
-            polygon.append(QJsonArray{p[0].toDouble(),p[1].toDouble()+top});
+            polygon.append(QJsonArray{p[0].toDouble()+left,p[1].toDouble()+top});
         }
         if(polygon.size()!=4)continue;
         for(int i=0;i<4;++i) {
@@ -48,11 +62,12 @@ inline QJsonArray restoreTokens(const QJsonArray& tokens,int top,const LiquidSur
     }
     return restored;
 }
-inline Recognition recognize(const cv::Mat& image,const std::shared_ptr<std::atomic_bool>& cancelled,const LiquidSurface& surface={}) {
+inline Recognition recognize(const cv::Mat& image,const std::shared_ptr<std::atomic_bool>& cancelled,const LiquidSurface& surface={},cv::Rect bounds={}) {
     Recognition result;
     try {
+        if(cancelled && cancelled->load()){result.error=QStringLiteral(u"OCR 已取消。");return result;}
         if(surface.ambiguous){result.error=QStringLiteral(u"液面位置有歧义，未执行 OCR。");return result;}
-        const auto region=inputRegion(image,surface);
+        const auto region=inputRegion(image,surface,bounds);
         if(region.image.empty()){result.error=QStringLiteral(u"液面屏蔽后没有有效 OCR 区域。");return result;}
         const auto appDir=QCoreApplication::applicationDirPath();
         QString ocrDir=appDir+"/ocr";
@@ -73,37 +88,23 @@ inline Recognition recognize(const cv::Mat& image,const std::shared_ptr<std::ato
         QTemporaryDir temporary;
         if(!temporary.isValid()) {result.error=QStringLiteral(u"无法创建 OCR 临时目录。");return result;}
         const auto input=temporary.filePath("dial.png"),output=temporary.filePath("result.json");
-        std::vector<uchar> encoded; cv::imencode(".png",region.image,encoded);
+        std::vector<uchar> encoded; cv::imencode(".png",region.image,encoded,{cv::IMWRITE_PNG_COMPRESSION,1});
         QFile file(input);
         if(!file.open(QIODevice::WriteOnly)||file.write(reinterpret_cast<const char*>(encoded.data()),qint64(encoded.size()))!=qint64(encoded.size())) {result.error=QStringLiteral(u"无法写入 OCR 图像。");return result;}file.close();
-        QProcess process;
         auto environment=QProcessEnvironment::systemEnvironment();
         for(const auto& name:{"PYTHONHOME","PYTHONPATH","PYTHONUSERBASE","VIRTUAL_ENV","__PYVENV_LAUNCHER__"})environment.remove(name);
         environment.insert("PYTHONDONTWRITEBYTECODE","1");
-        process.setProcessEnvironment(environment);
-        process.start(python,{"-B",script,"--image",input,"--output",output});
-        if(!process.waitForStarted(5000)) {
-            result.error=portable?QStringLiteral(u"离线 OCR 运行时启动失败，请完整解压部署包并检查运行库。"):
-                QStringLiteral(u"无法启动 PaddleOCR Python，请按 SERVICE.md 安装 OCR 环境并配置 GAUGE_OCR_PYTHON。");return result;
-        }
-        QElapsedTimer timer;timer.start();QByteArray errors;
-        while(process.state()!=QProcess::NotRunning) {
-            process.waitForFinished(100);
-            process.readAllStandardOutput();errors+=process.readAllStandardError();errors=errors.right(3000);
-            if(cancelled->load()||timer.elapsed()>180000) {
-                process.kill();process.waitForFinished(3000);
-                result.error=cancelled->load()?QStringLiteral(u"OCR 已取消。"):QStringLiteral(u"PaddleOCR 超时（180秒），请检查本地模型配置与电脑性能。");return result;
-            }
-        }
+        result.error=OcrWorker::instance().run(python,script,environment,input,output,cancelled);
+        if(!result.error.isEmpty())return result;
         QFile response(output);
-        if(!response.open(QIODevice::ReadOnly)) {result.error=QStringLiteral(u"PaddleOCR 未返回结果：%1").arg(QString::fromUtf8(errors.right(1200)));return result;}
+        if(!response.open(QIODevice::ReadOnly)) {result.error=QStringLiteral(u"PaddleOCR 未返回结果：%1").arg(QStringLiteral(u"响应文件不可读"));return result;}
         QJsonParseError parseError;
         const auto doc=QJsonDocument::fromJson(response.readAll(),&parseError);const auto data=doc.object();
-        if(parseError.error!=QJsonParseError::NoError || !data["tokens"].isArray() || process.exitStatus()!=QProcess::NormalExit || process.exitCode()!=0) {
+        if(parseError.error!=QJsonParseError::NoError || !data["tokens"].isArray()) {
             result.error=QStringLiteral(u"PaddleOCR 识别失败：%1。使用的 Python：%2。请检查 OCR 环境及模型配置。")
-                .arg(data["error"].toString(QString::fromUtf8(errors.right(1200))),python);return result;
+                .arg(data["error"].toString(QStringLiteral(u"响应文件不可读")),python);return result;
         }
-        result.tokens=surface.found?restoreTokens(data["tokens"].toArray(),region.top,surface):data["tokens"].toArray();return result;
+        result.tokens=(surface.found||region.top||region.left)?restoreTokens(data["tokens"].toArray(),region.top,surface,region.left):data["tokens"].toArray();return result;
     } catch(const std::exception& error) {result.error=QString::fromUtf8(error.what());return result;}
 }
 // Upright dial inspection accepts the built-in 0..2 vocabulary in steps of 0.1.

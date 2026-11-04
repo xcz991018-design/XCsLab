@@ -151,7 +151,7 @@ HEADERS += $$PWD/include/UiTheme.hpp
 
 HEADERS += $$PWD/include/DeviceConnection.hpp
 
-HEADERS += $$PWD/include/AutoScaleCalibration.hpp $$PWD/include/PaddleScaleOcr.hpp
+HEADERS += $$PWD/include/AutoScaleCalibration.hpp $$PWD/include/PaddleScaleOcr.hpp $$PWD/include/OcrWorker.hpp
 ocr_deploy.target = deploy_ocr
 ocr_deploy.commands = if not exist $$shell_quote($$shell_path($$OUT_PWD/ocr)) $$QMAKE_MKDIR $$shell_quote($$shell_path($$OUT_PWD/ocr)) $$escape_expand(\n\t) \
     $(COPY_FILE) $$shell_quote($$shell_path($$PWD/tools/ocr/paddle_scale_ocr.py)) $$shell_quote($$shell_path($$OUT_PWD/ocr/paddle_scale_ocr.py)) $$escape_expand(\n\t) \

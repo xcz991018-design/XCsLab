@@ -12,23 +12,50 @@ static cv::Point2f point(double angle,double r=260) {
 int main(int argc,char** argv) {
     QCoreApplication app(argc,argv);
     try {
-        if(argc==4&&(QString::fromLocal8Bit(argv[1])=="--ocr-liquid"||QString::fromLocal8Bit(argv[1])=="--ocr-liquid800")) {
+        {
+            cv::Mat image(800,800,CV_8UC3);cv::randu(image,0,256);
+            const auto bounds=PaddleScaleOcr::rectifiedDialBounds(image.size(),40);
+            require(bounds==cv::Rect(40,40,721,721),"dial crop includes all four cardinal boundaries");
+            const auto cropped=PaddleScaleOcr::inputRegion(image,{},bounds);
+            require(cropped.left==40 && cropped.top==40 &&
+                cv::norm(cropped.image,image(bounds),cv::NORM_INF)==0,"dial crop preserves native pixels");
+            QJsonArray local{QJsonObject{{"text","0.2"},{"score",.99},{"polygon",QJsonArray{
+                QJsonArray{10,20},QJsonArray{30,20},QJsonArray{30,40},QJsonArray{10,40}}}}};
+            const auto restored=PaddleScaleOcr::restoreTokens(local,cropped.top,{},cropped.left);
+            require(restored[0].toObject()["polygon"].toArray()[0].toArray()==QJsonArray{50,60},
+                "OCR polygons return to full rectified coordinates without liquid");
+            LiquidSurface surface;surface.found=true;surface.centerX=400;surface.radius=360;
+            surface.y0=300;surface.slope=70;surface.margin=8;
+            const auto fullLiquid=PaddleScaleOcr::inputRegion(image,surface);
+            const auto dialLiquid=PaddleScaleOcr::inputRegion(image,surface,bounds);
+            const cv::Rect equivalent(dialLiquid.left,dialLiquid.top-fullLiquid.top,dialLiquid.image.cols,dialLiquid.image.rows);
+            require(cv::norm(dialLiquid.image,fullLiquid.image(equivalent),cv::NORM_INF)==0,
+                "sloped liquid masking uses full-image coordinates after dial crop");
+            const auto mapped=PaddleScaleOcr::restoreTokens(local,dialLiquid.top,surface,dialLiquid.left);
+            require(!mapped.empty(),"visible numeric token survives combined crop");
+            require(PaddleScaleOcr::rectifiedDialBounds(image.size(),500)==cv::Rect(0,0,800,800),
+                "invalid margin safely preserves full image");
+            require(PaddleScaleOcr::inputRegion(image,{},cv::Rect(900,900,20,20)).image.empty(),
+                "outside crop must not access image memory");
+        }
+        if(argc==4&&(QString::fromLocal8Bit(argv[1])=="--ocr-liquid"||QString::fromLocal8Bit(argv[1])=="--ocr-liquid800"||QString::fromLocal8Bit(argv[1])=="--ocr-liquid-hd")) {
             auto image=CameraUndistortion::image(cv::imread(argv[2]));const auto dial=AutoDialCalibration::detect(image);require(dial.valid(),"liquid OCR dial");
-            const int size=QString::fromLocal8Bit(argv[1])=="--ocr-liquid800"?800:810;
+            const int size=QString::fromLocal8Bit(argv[1])=="--ocr-liquid-hd"?std::max(image.cols,image.rows):QString::fromLocal8Bit(argv[1])=="--ocr-liquid800"?800:810;
             const float half=size*.5f,margin=size*.05f;const cv::Point2f center(half,half);const double radius=half-margin;
             auto H=cv::getPerspectiveTransform(dial.points,std::vector<cv::Point2f>{{half,margin},{size-margin,half},{half,size-margin},{margin,half}});
             cv::Mat rectified;cv::warpPerspective(image,rectified,H,{size,size},cv::INTER_CUBIC);
             const auto surface=detectLiquidSurface(rectified,center,radius);require(surface.found,"liquid surface");
-            const auto region=PaddleScaleOcr::inputRegion(rectified,surface);cv::imwrite(std::string(argv[3])+"-input.png",region.image);
+            const auto bounds=PaddleScaleOcr::rectifiedDialBounds(rectified.size(),cvRound(margin));
+            const auto region=PaddleScaleOcr::inputRegion(rectified,surface,bounds);cv::imwrite(std::string(argv[3])+"-input.png",region.image);
             auto cancelled=std::make_shared<std::atomic_bool>(false);QElapsedTimer timer;timer.start();
-            const auto result=PaddleScaleOcr::recognize(rectified,cancelled,surface);require(result.valid(),qPrintable(result.error));
+            const auto result=PaddleScaleOcr::recognize(rectified,cancelled,surface,bounds);require(result.valid(),qPrintable(result.error));
             auto tokens=PaddleScaleOcr::numericTokens(result.tokens);std::vector<double> values;
             for(auto t:tokens){auto o=t.toObject();values.push_back(o["text"].toString().toDouble());}
-            for(double expected:{0.,.2,.8,1.})require(std::any_of(values.begin(),values.end(),[&](double v){return std::abs(v-expected)<1e-6;}),"masked OCR must retain endpoints and lower major labels");
             const auto calibration=OcrDialRange::calibrate(rectified,result.tokens,center,radius,true,surface);
             QFile out(QString::fromLocal8Bit(argv[3])+".json");require(out.open(QIODevice::WriteOnly),"masked OCR output");
             out.write(QJsonDocument(QJsonObject{{"tokens",tokens},{"elapsed_ms",double(timer.elapsed())},{"crop_top",region.top},{"points",calibration.points}}).toJson());
             out.close();cv::imwrite(std::string(argv[3])+"-full.png",rectified);
+            for(double expected:{0.,.2,.8,1.})require(std::any_of(values.begin(),values.end(),[&](double v){return std::abs(v-expected)<1e-6;}),"masked OCR must retain endpoints and lower major labels");
             require(calibration.valid(),qPrintable(calibration.error));
             std::cout<<"PASS cropped OCR: "<<region.image.cols<<"x"<<region.image.rows<<" top="<<region.top<<" tokens="<<tokens.size()<<" elapsed_ms="<<timer.elapsed()<<'\n';return 0;
         }
@@ -104,6 +131,12 @@ int main(int argc,char** argv) {
             auto cancelled=std::make_shared<std::atomic_bool>(false);
             const auto result=PaddleScaleOcr::run(image,{400,400},360,0,1.6,true,cancelled);
             require(result.valid() && result.points.size()==9,"subprocess JSON protocol and real pixel matching");
+            const auto cropOcr=PaddleScaleOcr::recognize(image,cancelled,{},PaddleScaleOcr::rectifiedDialBounds(image.size(),40));
+            require(cropOcr.valid(),"cropped subprocess OCR succeeds");
+            const auto cropMatched=AutoScaleCalibration::match(AutoScaleCalibration::numbers(cropOcr.tokens,0,1.6),
+                AutoScaleCalibration::ticks(image,{400,400},360),{400,400},360,0,1.6,true);
+            require(cropMatched.valid() && cropMatched.points==result.points,
+                "cropped OCR coordinates produce identical full-image scale calibration");
             qputenv("GAUGE_OCR_FIXTURE_MODE","invalid");
             require(!PaddleScaleOcr::run(image,{400,400},360,0,1.6,true,cancelled).valid(),"malformed subprocess response rejected");
             qputenv("GAUGE_OCR_FIXTURE_MODE","sleep");cancelled->store(true);
