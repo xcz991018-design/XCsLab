@@ -110,6 +110,7 @@ private slots:
     void onAddNewDevice();
     void onRemoveSelectedDevice();
     void onDeviceCustomContextMenu(const QPoint& pos);
+    void onViewCurrentCalibration(const QString& cameraId);
 
     // Pointer diagnostic window
     void onShowDiagnosticWindow();

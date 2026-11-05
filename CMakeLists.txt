@@ -122,6 +122,21 @@ target_link_libraries(gauge_reader_gui PRIVATE ${OpenCV_LIBS} ${QT_LIBS} gauge_m
 
 # Copy DLLs and config files to target binary directory
 if(WIN32)
+    # Use the deployment tool from the selected Qt installation so DLLs and
+    # platform plugins always match the target's Qt version and configuration.
+    if(Qt5_FOUND)
+        get_target_property(QT_QMAKE_EXECUTABLE Qt5::qmake IMPORTED_LOCATION)
+    else()
+        get_target_property(QT_QMAKE_EXECUTABLE Qt6::qmake IMPORTED_LOCATION)
+    endif()
+    get_filename_component(QT_BIN_DIR "${QT_QMAKE_EXECUTABLE}" DIRECTORY)
+    find_program(QT_WINDEPLOYQT windeployqt HINTS "${QT_BIN_DIR}" NO_DEFAULT_PATH REQUIRED)
+    add_custom_command(TARGET gauge_reader_gui POST_BUILD
+        COMMAND "${QT_WINDEPLOYQT}"
+            "$<IF:$<CONFIG:Debug>,--debug,--release>"
+            --no-translations --no-compiler-runtime
+            "$<TARGET_FILE:gauge_reader_gui>"
+        VERBATIM)
     if(MSVC)
         add_custom_command(TARGET gauge_reader_gui POST_BUILD
             COMMAND ${CMAKE_COMMAND} -E copy_if_different

@@ -1,5 +1,8 @@
 #include "RectifiedResolution.hpp"
 #include "CardinalSelectorDialog.hpp"
+#include "CurrentCalibrationDialog.hpp"
+#include "CalibrationArchive.hpp"
+#include <QTemporaryDir>
 #include "CameraInfoEditDialog.hpp"
 #include "CameraUndistortion.hpp"
 #include "GaugeReaderEngine.hpp"
@@ -35,7 +38,8 @@ static void benchmarkCalibration(const QString& outputPath, const QStringList& i
         auto* status=dialog.findChild<QLabel*>("calibrationLoadingStatus");
         auto* preview=dialog.findChild<InteractiveImageLabel*>("rectifiedCalibrationImage");
         require(status && preview,"missing calibration widgets");
-        while (!status->text().startsWith(QStringLiteral(u"自动标定未完成"))) {
+        while (!status->text().startsWith(QStringLiteral(u"自动标定未完成")) &&
+               !status->text().startsWith(QStringLiteral(u"自动标定完成"))) {
             require(timer.elapsed()<300000,"calibration replay timed out");
             QApplication::processEvents(QEventLoop::AllEvents,10);
             QThread::msleep(2);
@@ -60,12 +64,73 @@ static void benchmarkCalibration(const QString& outputPath, const QStringList& i
 
 int main(int argc, char** argv) {
     QApplication app(argc, argv);
+    try {
+        GaugeReaderEngine engine;
+        cv::Mat source(800,800,CV_8UC3);cv::randu(source,0,256);
+        const std::vector<cv::Point2f> points{{400,40},{760,400},{400,760},{40,400}};
+        cv::Mat fullInverse,cropInverse;
+        const auto full=engine.rectifyPerspective(source,points,fullInverse,800,40);
+        const auto crop=engine.rectifyPerspective(source,points,cropInverse,800,40,true);
+        require(crop.size()==cv::Size(721,721) && cv::norm(crop,full(cv::Rect(40,40,721,721)),cv::NORM_INF)==0,
+            "patrol dial canvas must preserve preview pixels and all cardinal boundaries");
+        std::vector<cv::Point2f> hub{{400,400}},local;
+        cv::perspectiveTransform(hub,local,cropInverse.inv());
+        require(cv::norm(local[0]-cv::Point2f(360,360))<.001,"crop must translate calibrated hub");
+        cv::perspectiveTransform(local,local,cropInverse);
+        require(cv::norm(local[0]-hub[0])<.001,"crop inverse must restore source annotations");
+        cv::Mat repeatedInverse;
+        const auto repeated=engine.rectifyPerspective(source,points,repeatedInverse,800,40);
+        require(cv::norm(repeated,full,cv::NORM_INF)==0 && cv::norm(repeatedInverse,fullInverse,cv::NORM_INF)==0,
+            "patrol crop must not change cached calibration preview geometry");
+        std::cout<<"PASS: patrol dial crop pixels and coordinate mapping"<<std::endl;
+    } catch(const std::exception& error) {std::cerr<<error.what()<<std::endl;return 1;}
+    if(app.arguments().contains("--dial-crop-only"))return 0;
     app.setQuitOnLastWindowClosed(false);
     if(!qEnvironmentVariable("GAUGE_TEST_PROGRESS_IMAGE").isEmpty()) {
         QFontDatabase::addApplicationFont("C:/Windows/Fonts/segoeui.ttf");
         QFontDatabase::addApplicationFont("C:/Windows/Fonts/msyh.ttc");
     }
     try {
+        if(app.arguments().value(1)=="--view-test") {
+            QFontDatabase::addApplicationFont("C:/Windows/Fonts/msyh.ttc");
+            app.setFont(QFont("Microsoft YaHei",10));
+            CurrentCalibrationDialog empty("unconfigured");
+            require(!empty.setDevice({}),"unconfigured device must not render a calibration");
+            DiscoveredCameraItem device;device.cameraId="read-only-test";device.hasCalibration=true;device.perspectiveEnabled=true;
+            device.calibratedWidth=800;device.calibratedHeight=800;
+            device.pt0_x=400;device.pt0_y=40;device.pt1_x=760;device.pt1_y=400;
+            device.pt2_x=400;device.pt2_y=760;device.pt3_x=40;device.pt3_y=400;
+            device.centerX=400;device.centerY=400;device.pointerBaseRadius=50;
+            device.meterRange=QJsonObject{{"min_val",0},{"max_val",1.6},{"unit","MPa"}};
+            for(const auto p:std::vector<cv::Point3d>{{200,600,0},{120,300,.25},{680,300,.75},{600,600,1}})
+                device.scalePoints.append(QJsonObject{{"x",p.x},{"y",p.y},{"ratio",p.z}});
+            CurrentCalibrationDialog view("read-only-test");
+            require(view.setDevice(device),"saved device calibration must display");
+            auto* table=view.findChild<QTableWidget*>();
+            require(table&&table->rowCount()==9&&table->editTriggers()==QAbstractItemView::NoEditTriggers,"all saved annotations must be read only");
+            require(view.findChildren<InteractiveImageLabel*>().size()==2,"original and rectified calibration previews");
+            require(view.findChildren<QPushButton*>().size()==1,"viewer must have only a close button");
+            cv::Mat frame(800,800,CV_8UC3,cv::Scalar(235,235,235));cv::circle(frame,{400,400},320,{40,40,40},3);
+            QTemporaryDir archive(QCoreApplication::applicationDirPath()+"/calibration-archive-XXXXXX");
+            require(archive.isValid(),"archive test directory");
+            require(!CalibrationArchive::load(device.cameraId,archive.path()).valid(),"legacy calibrations must report a missing original");
+            require(CalibrationArchive::save(device,frame,archive.path()).isEmpty(),"archive frozen original and saved parameters");
+            const auto stored=CalibrationArchive::load(device.cameraId,archive.path());
+            require(stored.valid()&&CalibrationArchive::matches(device,stored.device)&&cv::norm(frame,stored.original,cv::NORM_INF)==0,"offline reload must preserve original pixels and calibration");
+            auto changed=device;changed.centerX+=1;
+            require(!CalibrationArchive::matches(changed,stored.device),"a different saved calibration must not reuse the old original");
+            require(!CalibrationArchive::save(changed,cv::Mat(),archive.path()).isEmpty()&&CalibrationArchive::matches(device,CalibrationArchive::load(device.cameraId,archive.path()).device),"failed archive save must retain the last successful record");
+            QFile corrupt(CalibrationArchive::path(device.cameraId,archive.path()));
+            require(corrupt.open(QIODevice::ReadWrite),"archive corruption fixture");
+            auto record=QJsonDocument::fromJson(corrupt.readAll()).object();record["sha256"]="invalid";corrupt.resize(0);corrupt.write(QJsonDocument(record).toJson());corrupt.close();
+            require(!CalibrationArchive::load(device.cameraId,archive.path()).valid(),"corrupted original must be rejected");
+            view.setFrame(frame,{});view.show();QApplication::processEvents();
+            if(!app.arguments().value(2).isEmpty())require(view.grab().save(app.arguments().value(2)),"viewer screenshot");
+            view.setFrame(cv::Mat(400,800,CV_8UC3),{});
+            bool mismatch=false;for(auto* label:view.findChildren<QLabel*>())mismatch|=label->text().contains(QStringLiteral(u"宽高比"));
+            require(mismatch,"mismatched live frame must retain the saved coordinate diagram");
+            std::cout<<"PASS: offline original archive, pixel equality, calibration version matching, failed-save preservation, corruption rejection and read-only previews"<<std::endl;return 0;
+        }
         if (app.arguments().value(1)=="--benchmark") {
             benchmarkCalibration(app.arguments().value(2),app.arguments().mid(3));
             return 0;
@@ -155,8 +220,14 @@ int main(int argc, char** argv) {
         saveDialog.findChild<QDoubleSpinBox*>("ocrRangeMinimum")->setValue(-.2);
         saveDialog.findChild<QDoubleSpinBox*>("ocrRangeMaximum")->setValue(2.5);
         for (auto* box : saveDialog.findChildren<QCheckBox*>()) box->setChecked(true);
+        MinorTickPreview::Result rejectedMinor;
+        rejectedMinor.divisionConfirmed=false;
+        rejectedMinor.marks.emplace_back();
+        rejectedMinor.marks.back().assigned=true;
+        rejectedMinor.previewPoints=QJsonArray{QJsonObject{{"ratio",.5},{"source","minor_tick"}}};
+        saveDialog.findChild<InteractiveImageLabel*>("rectifiedCalibrationImage")->setMinorPreview(rejectedMinor);
         require(QMetaObject::invokeMethod(&saveDialog,"onSaveAndApply",Qt::DirectConnection),"save slot missing");
-        require(saveDialog.result()==QDialog::Accepted,"historical calibration must save without a database write");
+        require(saveDialog.result()==QDialog::Accepted,"unconfirmed minor ticks must not block saving existing major anchors");
         require(lensProfile.min_val==-.2&&lensProfile.max_val==2.5&&lensProfile.spec.range_max==2.5,
             "saving edited range updates effective profile and meter specification together");
         require(cv::norm(lensProfile.center-cv::Point2f(288,162))<.001 &&

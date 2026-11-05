@@ -23,50 +23,12 @@ double GaugeReaderEngine::normalizeAngle(double angleDeg) {
 
 
 
-bool GaugeReaderEngine::locateDialCircle(const cv::Mat& gray, cv::Point2f& center, float& radius,
-    bool* hubDetected, const cv::Point2f* expectedHub) {
-    if (hubDetected) *hubDetected = false;
-    cv::Mat blurred;
-    cv::GaussianBlur(gray, blurred, cv::Size(9, 9), 2.0);
-
-    std::vector<cv::Vec3f> circles;
-    int minR = std::min(gray.cols, gray.rows) / 6;
-    int maxR = std::min(gray.cols, gray.rows) / 2;
-
-    cv::HoughCircles(blurred, circles, cv::HOUGH_GRADIENT, 1.2, gray.rows / 4, 100, 40, minR, maxR);
-
-    cv::Point2f bestCenter(gray.cols / 2.0f, gray.rows / 2.0f);
-    float bestRadius = std::min(gray.cols, gray.rows) * 0.38f;
-    bool found = false;
-
-    if (!circles.empty()) {
-        cv::Point2f imgCenter(gray.cols / 2.0f, gray.rows / 2.0f);
-        float minDist = 1e9f;
-        int bestIdx = 0;
-
-        for (size_t i = 0; i < circles.size(); ++i) {
-            cv::Point2f c(circles[i][0], circles[i][1]);
-            float dist = cv::norm(c - imgCenter);
-            if (dist < minDist) {
-                minDist = dist;
-                bestIdx = static_cast<int>(i);
-            }
-        }
-
-        bestCenter = cv::Point2f(circles[bestIdx][0], circles[bestIdx][1]);
-        bestRadius = circles[bestIdx][2];
-        found = true;
-    }
-
-    // Refine center by finding the needle rotation axis (central hub pin/rivet cap)
-    const auto hubAnchor = expectedHub ? *expectedHub : bestCenter;
+static bool locateHubPin(const cv::Mat& gray, cv::Point2f hubAnchor, float bestRadius, cv::Point2f& center) {
     int roiR = static_cast<int>(bestRadius * 0.25f);
     int x1 = std::max(0, static_cast<int>(hubAnchor.x) - roiR);
     int y1 = std::max(0, static_cast<int>(hubAnchor.y) - roiR);
     int x2 = std::min(gray.cols, static_cast<int>(hubAnchor.x) + roiR);
     int y2 = std::min(gray.rows, static_cast<int>(hubAnchor.y) + roiR);
-
-    cv::Point2f refinedCenter = bestCenter;
 
     if (x2 > x1 && y2 > y1) {
         cv::Mat roi = gray(cv::Rect(x1, y1, x2 - x1, y2 - y1));
@@ -105,11 +67,60 @@ bool GaugeReaderEngine::locateDialCircle(const cv::Mat& gray, cv::Point2f& cente
             }
             // Text arcs and cast-shadow intersections lack a coherent circular rim.
             if(bestSupport>=0.75) {
-                refinedCenter=cv::Point2f(x1+bestPin[0],y1+bestPin[1]);
-                if(hubDetected) *hubDetected=true;
+                center=cv::Point2f(x1+bestPin[0],y1+bestPin[1]);
+                return true;
             }
         }
     }
+
+    return false;
+}
+
+static bool locateDialRim(const cv::Mat& gray, cv::Point2f& bestCenter, float& bestRadius) {
+    cv::Mat blurred;
+    cv::GaussianBlur(gray, blurred, cv::Size(9, 9), 2.0);
+
+    std::vector<cv::Vec3f> circles;
+    int minR = std::min(gray.cols, gray.rows) / 6;
+    int maxR = std::min(gray.cols, gray.rows) / 2;
+
+    cv::HoughCircles(blurred, circles, cv::HOUGH_GRADIENT, 1.2, gray.rows / 4, 100, 40, minR, maxR);
+
+    bestCenter = cv::Point2f(gray.cols / 2.0f, gray.rows / 2.0f);
+    bestRadius = std::min(gray.cols, gray.rows) * 0.38f;
+    bool found = false;
+
+    if (!circles.empty()) {
+        cv::Point2f imgCenter(gray.cols / 2.0f, gray.rows / 2.0f);
+        float minDist = 1e9f;
+        int bestIdx = 0;
+
+        for (size_t i = 0; i < circles.size(); ++i) {
+            cv::Point2f c(circles[i][0], circles[i][1]);
+            float dist = cv::norm(c - imgCenter);
+            if (dist < minDist) {
+                minDist = dist;
+                bestIdx = static_cast<int>(i);
+            }
+        }
+
+        bestCenter = cv::Point2f(circles[bestIdx][0], circles[bestIdx][1]);
+        bestRadius = circles[bestIdx][2];
+        found = true;
+    }
+
+    return found;
+}
+
+bool GaugeReaderEngine::locateDialCircle(const cv::Mat& gray, cv::Point2f& center, float& radius,
+    bool* hubDetected, const cv::Point2f* expectedHub) {
+    cv::Point2f bestCenter;
+    float bestRadius;
+    const bool found = locateDialRim(gray, bestCenter, bestRadius);
+    const auto hubAnchor = expectedHub ? *expectedHub : bestCenter;
+    cv::Point2f refinedCenter = bestCenter;
+    const bool pinFound = locateHubPin(gray, hubAnchor, bestRadius, refinedCenter);
+    if (hubDetected) *hubDetected = pinFound;
 
     center = refinedCenter;
     radius = bestRadius;
@@ -122,7 +133,7 @@ std::vector<cv::Point2f> GaugeReaderEngine::autoDetectCardinalPoints(const cv::M
     return result.valid()?result.points:std::vector<cv::Point2f>{};
 }
 
-cv::Mat GaugeReaderEngine::rectifyPerspective(const cv::Mat& src, const std::vector<cv::Point2f>& quadPts, cv::Mat& invH, int outSize, int margin) {
+cv::Mat GaugeReaderEngine::rectifyPerspective(const cv::Mat& src, const std::vector<cv::Point2f>& quadPts, cv::Mat& invH, int outSize, int margin, bool dialOnly) {
     if (quadPts.size() != 4 || src.empty()) return src.clone();
 
     // quadPts are explicitly defined in order [0: 12H Top, 1: 3H Right, 2: 6H Bottom, 3: 9H Left]
@@ -153,15 +164,23 @@ cv::Mat GaugeReaderEngine::rectifyPerspective(const cv::Mat& src, const std::vec
         geometry.H = cv::getPerspectiveTransform(srcPts, dstPts);
         geometry.inverse = geometry.H.inv();
     }
-    const cv::Mat& H = geometry.H;
-    invH = geometry.inverse.clone();
+    cv::Mat H = geometry.H.clone();
+    int canvasSize=outSize;
+    if(dialOnly && margin>0 && margin<outSize/2) {
+        // Same native pixels as the calibration preview's dial rectangle,
+        // including both cardinal boundaries; omit the surrounding margin.
+        const cv::Mat shift=(cv::Mat_<double>(3,3)<<1,0,-margin,0,1,-margin,0,0,1);
+        H=shift*H;
+        canvasSize=outSize-2*margin+1;
+        invH=H.inv();
+    } else invH = geometry.inverse.clone();
 
     cv::Mat rectified;
-    cv::warpPerspective(src, rectified, H, cv::Size(outSize, outSize), cv::INTER_CUBIC);
+    cv::warpPerspective(src, rectified, H, cv::Size(canvasSize, canvasSize), cv::INTER_CUBIC);
     return rectified;
 }
 
-GaugeResult GaugeReaderEngine::process(const cv::Mat& rawFrame, GaugeProfile& storedProfile, GaugeRunMode mode) {
+GaugeResult GaugeReaderEngine::process(const cv::Mat& rawFrame, GaugeProfile& storedProfile, GaugeRunMode mode, bool deferCalibratedHubCheck) {
     // Work on a copy so repeated recognition never undistorts saved points twice.
     GaugeProfile profile = storedProfile;
     RectifiedResolution::apply(profile, rawFrame.size());
@@ -247,7 +266,7 @@ GaugeResult GaugeReaderEngine::process(const cv::Mat& rawFrame, GaugeProfile& st
         }
 
         if (pts.size() == 4) {
-            workFrame = rectifyPerspective(frame, pts, invH, profile.rectified_size, profile.rectified_margin);
+            workFrame = rectifyPerspective(frame, pts, invH, profile.rectified_size, profile.rectified_margin, deferCalibratedHubCheck);
         } else {
             workFrame = frame;
         }
@@ -274,6 +293,7 @@ GaugeResult GaugeReaderEngine::process(const cv::Mat& rawFrame, GaugeProfile& st
 
     mark("gray_preview_ms");
     // Step 4: 识别 (Dial Center, Pointer Angle, Value & Overlay Result)
+    bool hasCalibratedHub = false;
     if (profile.perspective_correction_enabled && !profile.auto_detect_roi && profile.center.x > 0 && profile.center.y > 0 && !invH.empty()) {
         float sx = (profile.calibrated_width > 0) ? (static_cast<float>(frame.cols) / profile.calibrated_width) : 1.0f;
         float sy = (profile.calibrated_height > 0) ? (static_cast<float>(frame.rows) / profile.calibrated_height) : 1.0f;
@@ -287,17 +307,19 @@ GaugeResult GaugeReaderEngine::process(const cv::Mat& rawFrame, GaugeProfile& st
         if (dstC[0].x >= 20.0f && dstC[0].x <= gray.cols - 20.0f &&
             dstC[0].y >= 20.0f && dstC[0].y <= gray.rows - 20.0f) {
             res.center = dstC[0];
+            hasCalibratedHub = true;
         } else {
             res.center = cv::Point2f(gray.cols * 0.5f, gray.rows * 0.5f);
         }
-        res.radius = (gray.cols * 0.5f) - profile.rectified_margin;
+        res.radius = profile.rectified_size * 0.5f - profile.rectified_margin;
     } else if (profile.perspective_correction_enabled || profile.auto_detect_roi) {
         res.center = cv::Point2f(gray.cols * 0.5f, gray.rows * 0.5f);
-        res.radius = (gray.cols * 0.5f) - profile.rectified_margin;
+        res.radius = invH.empty() ? (gray.cols * 0.5f) - profile.rectified_margin : profile.rectified_size * 0.5f - profile.rectified_margin;
     } else {
         if (profile.center.x > 0 && profile.center.y > 0 && profile.center.x < gray.cols && profile.center.y < gray.rows && profile.radius > 0) {
             res.center = profile.center;
             res.radius = profile.radius;
+            hasCalibratedHub = !profile.auto_detect_roi;
         } else {
             locateDialCircle(gray, res.center, res.radius);
         }
@@ -306,28 +328,62 @@ GaugeResult GaugeReaderEngine::process(const cv::Mat& rawFrame, GaugeProfile& st
     // A displaced manual hub can force the radial search onto a cast shadow.
     // Require a detected pin/rivet (not a dial-circle fallback) before rejecting.
     cv::Point2f checkedCenter;
-    float checkedRadius = 0;
-    bool confirmedHub = false;
-    locateDialCircle(gray, checkedCenter, checkedRadius, &confirmedHub, &res.center);
-    const double checkedOffset = cv::norm(checkedCenter - res.center);
-    const double centerTolerance = (profile.center_search_tolerance > 0 ? profile.center_search_tolerance : 35) * (invH.empty() ? 1.0 : RectifiedResolution::scale(profile));
-    if (!profile.auto_detect_roi && confirmedHub && checkedOffset > centerTolerance) {
-        res.centerInconsistent = true;
-        res.centerOffsetDist = checkedOffset;
-        res.errorStep = "轴心标定检查";
-        res.errorMessage = "轴心标定与实际轴帽中心不一致（偏差 " + std::to_string(checkedOffset) +
-            " px），请重新完成视场切点标定中的中心点；未输出识别读数";
-        res.warningMessage = res.errorMessage;
-        if (evidence) {
-            res.step4_recognition = workFrame.clone();
-            cv::circle(res.step4_recognition, res.center, 8, cv::Scalar(0,165,255), 2);
-            cv::circle(res.step4_recognition, checkedCenter, 8, cv::Scalar(0,255,0), 2);
-            cv::line(res.step4_recognition, res.center, checkedCenter, cv::Scalar(0,165,255), 2);
-            cv::putText(res.step4_recognition, "CALIBRATION CENTER MISMATCH - NO READING", {15,30},
-                cv::FONT_HERSHEY_SIMPLEX, 0.55, cv::Scalar(0,165,255), 2);
+    const bool deferHub = deferCalibratedHubCheck && hasCalibratedHub;
+    bool hubChecked = false;
+    auto verifyHub = [&]() {
+        hubChecked = true;
+        float checkedRadius = 0;
+        bool confirmedHub = false;
+        const double centerTolerance = (profile.center_search_tolerance > 0 ? profile.center_search_tolerance : 35) * (invH.empty() ? 1.0 : RectifiedResolution::scale(profile));
+        if (hasCalibratedHub && res.radius > 0) {
+            const auto started = Clock::now();
+            // Only a close match can avoid the independent dial-radius estimate.
+            // Borderline offsets still go through the original displacement check.
+            confirmedHub = locateHubPin(gray, res.center, res.radius, checkedCenter)
+                && cv::norm(checkedCenter - res.center) <= std::min(centerTolerance, res.radius * .02);
+            res.stageTimings["local_hub_check_ms"] = std::chrono::duration<double, std::milli>(Clock::now()-started).count();
         }
-        finish(); return res;
-    }
+        if (!confirmedHub && hasCalibratedHub && !invH.empty() && gray.cols > 800) {
+            const auto started = Clock::now();
+            // The rectified image is square. Estimate the large rim at reference
+            // resolution, then verify the pin on the original pixels.
+            cv::Mat small;
+            cv::resize(gray, small, {800,800}, 0, 0, cv::INTER_AREA);
+            cv::Point2f rimCenter;
+            float rimRadius;
+            if (locateDialRim(small, rimCenter, rimRadius)) {
+                const float scale = float(gray.cols)/small.cols;
+                confirmedHub = locateHubPin(gray, res.center, rimRadius*scale, checkedCenter)
+                    && cv::norm(checkedCenter-res.center) <= centerTolerance;
+            }
+            res.stageTimings["scaled_dial_check_ms"] = std::chrono::duration<double, std::milli>(Clock::now()-started).count();
+        }
+        if (!confirmedHub) {
+            const auto started = Clock::now();
+            locateDialCircle(gray, checkedCenter, checkedRadius, &confirmedHub, &res.center);
+            res.stageTimings["full_dial_check_ms"] = std::chrono::duration<double, std::milli>(Clock::now()-started).count();
+        }
+        const double checkedOffset = cv::norm(checkedCenter - res.center);
+        if (!profile.auto_detect_roi && confirmedHub && checkedOffset > centerTolerance) {
+            res.centerInconsistent = true;
+            res.centerOffsetDist = checkedOffset;
+            res.errorStep = "轴心标定检查";
+            res.errorMessage = "轴心标定与实际轴帽中心不一致（偏差 " + std::to_string(checkedOffset) +
+                " px），请重新完成视场切点标定中的中心点；未输出识别读数";
+            res.warningMessage = res.errorMessage;
+            if (evidence) {
+                res.step4_recognition = workFrame.clone();
+                cv::circle(res.step4_recognition, res.center, 8, cv::Scalar(0,165,255), 2);
+                cv::circle(res.step4_recognition, checkedCenter, 8, cv::Scalar(0,255,0), 2);
+                cv::line(res.step4_recognition, res.center, checkedCenter, cv::Scalar(0,165,255), 2);
+                cv::putText(res.step4_recognition, "CALIBRATION CENTER MISMATCH - NO READING", {15,30},
+                    cv::FONT_HERSHEY_SIMPLEX, 0.55, cv::Scalar(0,165,255), 2);
+            }
+            return false;
+        }
+        return true;
+    };
+    if (!deferHub && !verifyHub()) { finish(); return res; }
 
     // Transform all device scale points with the same homography as the hub.
     ScaleCalibration::Mapping scaleMapping;
@@ -346,7 +402,7 @@ GaugeResult GaugeReaderEngine::process(const cv::Mat& rawFrame, GaugeProfile& st
         }
         res.center=hub[0];
         if (!ScaleCalibration::valid(points,frame.cols,frame.rows,{float(profile.center.x*sx),float(profile.center.y*sy)}) ||
-            !ScaleCalibration::build(points,res.center,invH.empty()?cv::Mat():invH.inv(),profile.clockwise,scaleMapping)) {
+            !ScaleCalibration::buildForPointer(points,res.center,invH.empty()?cv::Mat():invH.inv(),profile.clockwise,scaleMapping)) {
             res.errorStep = "Scale calibration";
             res.errorMessage = "刻度标定无效：请检查端点、中间点顺序和数值增长方向";
             finish(); return res;
@@ -428,6 +484,17 @@ GaugeResult GaugeReaderEngine::process(const cv::Mat& rawFrame, GaugeProfile& st
                                                 debug ? &rectOverlay : nullptr);
     mark("pointer_detection_ms");
     res.stageTimings["pointer_details"] = res.pointerDetectorResult.stageTimings;
+    if (deferHub) {
+        const auto& pointer = res.pointerDetectorResult;
+        const bool check = !pointer.valid || lowInspectionConfidence(pointer.confidence);
+        res.stageTimings["hub_check_reason"] = !pointer.valid ? "pointer_failed" :
+            check ? "low_confidence" : "skipped_confident";
+        if (check) {
+            const bool consistent = verifyHub();
+            mark("post_detection_hub_ms");
+            if (!consistent) { finish(); return res; }
+        }
+    }
     if (debug) {
         res.diagnosticHudImage = res.pointerDetectorResult.hudImage;
         res.diagnosticText = res.pointerDetectorResult.hudText;
@@ -488,32 +555,28 @@ GaugeResult GaugeReaderEngine::process(const cv::Mat& rawFrame, GaugeProfile& st
 
     mark("rendering_ms");
     // Check calibration against the independently located hub.
-    cv::Point2f autoCenter;
-    float autoRadius{0.0f};
-    autoCenter = checkedCenter;
-    autoRadius = checkedRadius;
+    if (hubChecked) {
+        cv::Point2f expectedCenter = res.center;
+        if (!profile.auto_detect_roi && profile.center.x > 0 && profile.center.y > 0 && !invH.empty()) {
+            std::vector<cv::Point2f> srcC = { {profile.center.x * (profile.calibrated_width>0?float(frame.cols)/profile.calibrated_width:1), profile.center.y * (profile.calibrated_height>0?float(frame.rows)/profile.calibrated_height:1)} };
+            std::vector<cv::Point2f> dstC;
+            cv::perspectiveTransform(srcC, dstC, invH.inv());
+            expectedCenter = dstC[0];
+        }
 
-    cv::Point2f expectedCenter = res.center;
-    if (!profile.auto_detect_roi && profile.center.x > 0 && profile.center.y > 0 && !invH.empty()) {
-        std::vector<cv::Point2f> srcC = { {profile.center.x * (profile.calibrated_width>0?float(frame.cols)/profile.calibrated_width:1), profile.center.y * (profile.calibrated_height>0?float(frame.rows)/profile.calibrated_height:1)} };
-        std::vector<cv::Point2f> dstC;
-        cv::perspectiveTransform(srcC, dstC, invH.inv());
-        expectedCenter = dstC[0];
+        double centerOffsetDist = cv::norm(checkedCenter - expectedCenter);
+        double tolerance = (profile.center_search_tolerance > 0.0f) ? profile.center_search_tolerance : 35.0;
+
+        if (centerOffsetDist > tolerance) {
+            res.centerInconsistent = true;
+            res.centerOffsetDist = centerOffsetDist;
+            char warnBuf[256];
+            snprintf(warnBuf, sizeof(warnBuf), "⚠️ [防错报警] 自动检测轴心 (%.1f, %.1f) 与标定中心 (%.1f, %.1f) 偏差 %.1f px > 容忍极值 %.1f px！",
+                     checkedCenter.x, checkedCenter.y, expectedCenter.x, expectedCenter.y, centerOffsetDist, tolerance);
+            res.warningMessage = warnBuf;
+
+        }
     }
-
-    double centerOffsetDist = cv::norm(autoCenter - expectedCenter);
-    double tolerance = (profile.center_search_tolerance > 0.0f) ? profile.center_search_tolerance : 35.0;
-
-    if (centerOffsetDist > tolerance) {
-        res.centerInconsistent = true;
-        res.centerOffsetDist = centerOffsetDist;
-        char warnBuf[256];
-        snprintf(warnBuf, sizeof(warnBuf), "⚠️ [防错报警] 自动检测轴心 (%.1f, %.1f) 与标定中心 (%.1f, %.1f) 偏差 %.1f px > 容忍极值 %.1f px！",
-                 autoCenter.x, autoCenter.y, expectedCenter.x, expectedCenter.y, centerOffsetDist, tolerance);
-        res.warningMessage = warnBuf;
-
-    }
-
     mark("center_check_ms");
     if (debug && profile.save_debug_images) {
         std::filesystem::create_directories("debug_images");

@@ -249,7 +249,7 @@ inline cv::RotatedRect printedRing(const std::vector<MajorTick>& ticks,cv::Point
     if(inliers.size()<18||inliers.size()<tips.size()*.8)return {};
     ellipse=cv::fitEllipse(inliers);return valid(ellipse)?ellipse:cv::RotatedRect{};
 }
-inline Calibration calibrate(const cv::Mat& image,const QJsonArray& tokens,cv::Point2f center,double radius,bool clockwise,const LiquidSurface& surface={}) {
+inline Calibration calibrate(const cv::Mat& image,const QJsonArray& tokens,cv::Point2f center,double radius,bool clockwise,const LiquidSurface& surface={},QJsonArray* diagnostics=nullptr) {
     using namespace AutoScaleCalibration;
     Calibration result;
     if(surface.ambiguous){result.error=QStringLiteral(u"液面位置有歧义，请先确认液面；原刻度标定保留。");return result;}
@@ -280,27 +280,36 @@ inline Calibration calibrate(const cv::Mat& image,const QJsonArray& tokens,cv::P
             // interval occupied by that stroke, allowing at most one degree of
             // measured half-width beyond the nominal 5-degree model residual.
             const double uncertainty=std::min(1.,std::atan2(std::max(m.innerWidth,m.outerWidth)*.5,t.radius)*180/CV_PI);
-            bool sameRing=std::abs(t.radius-ring)<=radius*.08;
-            if(printed.size.width>0) {
-                const double a=t.angle*CV_PI/180;const auto tip=center+cv::Point2f(float((t.radius+t.length*.5)*std::cos(a)),float((t.radius+t.length*.5)*std::sin(a)));
-                const auto d=tip-printed.center;const double r=printed.angle*CV_PI/180;
-                sameRing=std::abs(std::hypot((d.x*std::cos(r)+d.y*std::sin(r))/(printed.size.width*.5),(-d.x*std::sin(r)+d.y*std::cos(r))/(printed.size.height*.5))-1)<.055;
-            }
+            auto onRing=[&](const Tick& t) {
+                bool sameRing=std::abs(t.radius-ring)<=radius*.08;
+                if(printed.size.width>0) {
+                    const double a=t.angle*CV_PI/180;const auto tip=center+cv::Point2f(float((t.radius+t.length*.5)*std::cos(a)),float((t.radius+t.length*.5)*std::sin(a)));
+                    const auto d=tip-printed.center;const double r=printed.angle*CV_PI/180;
+                    sameRing=std::abs(std::hypot((d.x*std::cos(r)+d.y*std::sin(r))/(printed.size.width*.5),(-d.x*std::sin(r)+d.y*std::cos(r))/(printed.size.height*.5))-1)<.055;
+                }
+                return sameRing;
+            };
+            const bool sameRing=onRing(t);
             const double labelError=distance(t.angle,labelAngle);
+            if(diagnostics)diagnostics->append(QJsonObject{{"stage","geometry"},{"value",number.value},{"tick",i},{"angle",t.angle},{"angular_error",angularError},{"label_error",labelError},{"same_ring",sameRing},{"radius",t.radius},{"label_radius",labelRadius},{"length",t.length}});
             if(labelError>14||!sameRing||t.radius<labelRadius+radius*.035)continue;
             if(ScaleCalibration::span(firstAngle,t.angle,clockwise)>=sweep)continue;
             double longest=t.length,nextLength=0;
-            for(const auto& other:ticks)if(distance(other.angle,t.angle)<16&&std::abs(other.radius-t.radius)<radius*.1) {
+            // Off-ring edges cannot compete with printed graduations.
+            for(const auto& other:ticks)if(onRing(other)&&distance(other.angle,t.angle)<16&&std::abs(other.radius-t.radius)<radius*.1) {
                 longest=std::max(longest,other.length);
                 if(distance(other.angle,t.angle)>2.5)nextLength=std::max(nextLength,other.length);
             }
             if(t.length<longest*.70)continue;
             const double taper=std::clamp(m.innerWidth/std::max(1.,m.outerWidth)-1.,0.,2.);
-            // An unambiguous thick-headed major immediately outside its label,
+            // An unambiguous major immediately outside its label,
             // on a distributed observed ring, is stronger evidence than uniform
             // angular spacing in a view with residual perspective. Keep the
-            // default tight prior for short, straight or competing strokes.
-            const bool directMajor=printed.size.width>0&&labelError<=4&&taper>=.25&&t.length>=radius*.11&&t.length>=nextLength*1.35;
+            // default tight prior for short or competing strokes. A clear
+            // length advantage also supports straight or weakly tapered heads.
+            const bool directMajor=printed.size.width>0&&labelError<=4&&t.length>=radius*.11&&
+                t.length>=nextLength*1.35&&(taper>=.25||t.length>=nextLength*1.7);
+            if(diagnostics)diagnostics->append(QJsonObject{{"stage","angle"},{"value",number.value},{"tick",i},{"angular_error",angularError},{"limit",(directMajor?8.:5.)+uncertainty},{"direct_major",directMajor},{"next_length",nextLength},{"taper",taper}});
             if(angularError>(directMajor?8.:5.)+uncertainty)continue;
             // A nearby needle edge can be closer to the uniform-angle prior
             // than the real printed tick. Give the observed numeric label

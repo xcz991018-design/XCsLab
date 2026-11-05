@@ -130,11 +130,17 @@ win32-msvc {
     OPENCV_RUNTIME_PATH = $$shell_path($$OPENCV_RUNTIME)
     RUNTIME_OUT_PATH = $$shell_path($$OUT_PWD)
     QMAKE_POST_LINK += $(COPY_FILE) $$shell_quote($$OPENCV_RUNTIME_PATH) $$shell_quote($$RUNTIME_OUT_PATH)
+    # Deploy beside the executable (debug/release), including platforms/qwindows.
+    QT_DEPLOY_TOOL = $$shell_path($$[QT_INSTALL_BINS]/windeployqt.exe)
+    CONFIG(debug, debug|release): QT_DEPLOY_MODE = --debug
+    else: QT_DEPLOY_MODE = --release
+    QMAKE_POST_LINK += $$escape_expand(\n\t) $$shell_quote($$QT_DEPLOY_TOOL) $$QT_DEPLOY_MODE --no-translations --no-compiler-runtime $$shell_quote($(DESTDIR_TARGET))
 }
 
 HEADERS += $$PWD/include/ScaleCalibration.hpp
 
 HEADERS += $$PWD/include/RecognitionQuality.hpp
+HEADERS += $$PWD/include/PointerOcclusion.hpp
 
 HEADERS += $$PWD/include/DeviceCredentialStore.hpp
 
@@ -152,6 +158,8 @@ HEADERS += $$PWD/include/UiTheme.hpp
 HEADERS += $$PWD/include/DeviceConnection.hpp
 
 HEADERS += $$PWD/include/AutoScaleCalibration.hpp $$PWD/include/PaddleScaleOcr.hpp $$PWD/include/OcrWorker.hpp
+HEADERS += $$PWD/include/CurrentCalibrationDialog.hpp
+HEADERS += $$PWD/include/CalibrationArchive.hpp
 ocr_deploy.target = deploy_ocr
 ocr_deploy.commands = if not exist $$shell_quote($$shell_path($$OUT_PWD/ocr)) $$QMAKE_MKDIR $$shell_quote($$shell_path($$OUT_PWD/ocr)) $$escape_expand(\n\t) \
     $(COPY_FILE) $$shell_quote($$shell_path($$PWD/tools/ocr/paddle_scale_ocr.py)) $$shell_quote($$shell_path($$OUT_PWD/ocr/paddle_scale_ocr.py)) $$escape_expand(\n\t) \

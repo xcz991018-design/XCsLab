@@ -87,6 +87,7 @@ int main(int argc,char** argv) {
                 {"liquid_excluded",dial.graduationLiquidExcluded},{"liquid_ambiguous",dial.graduationLiquidAmbiguous},
                 {"structural_rectification",dial.structuralRectification},{"structural_support",dial.structuralSupport},{"structural_symmetric_pairs",dial.structuralSymmetricPairs},
                 {"structural_before",dial.structuralErrorBefore},{"structural_after",dial.structuralErrorAfter},
+                {"span_before",dial.structuralSpanBefore},{"span_after",dial.structuralSpanAfter},
                 {"scale_origin_x",dial.graduationCenter.x},{"scale_origin_y",dial.graduationCenter.y},
                 {"initial_graduation_aspect",dial.initialGraduationAspect}}).toJson());
             std::cout<<"PASS dial hub="<<dial.hub<<" coverage="<<dial.rimCoverage<<" ticks="<<dial.graduationSupport<<" residual="<<dial.graduationResidual<<" aspect="<<dial.graduationAspect
@@ -417,6 +418,16 @@ int main(int argc,char** argv) {
         require(structuralError<.1,"independent physical angles must be recovered, rather than merely making an ellipse circular");
         require(!GraduationRectification::fit(std::vector<cv::Vec4f>(projectedLines.begin(),projectedLines.begin()+12),initial,
             [](const cv::RotatedRect& ellipse,cv::Point2f center){return AutoDialCalibration::metricHomography(ellipse,center);}).valid(),"partial single arc cannot justify structural rectification");
+        const double shift=.065, ringRadius=275./300;
+        const cv::Mat circularBias=(cv::Mat_<double>(3,3)<<std::sqrt(1-shift*shift),0,0,
+            0,1,shift*ringRadius,0,shift/ringRadius,1);
+        const auto spanOnly=GraduationRectification::fit(graduationLines,circularBias*normalize,
+            [](const cv::RotatedRect& ellipse,cv::Point2f center){return AutoDialCalibration::metricHomography(ellipse,center);});
+        require(spanOnly.valid()&&spanOnly.before<.001&&std::abs(spanOnly.spanBefore-270)>3&&
+            std::abs(spanOnly.spanAfter-270)<.1,"endpoint feedback must recover a biased span even on a circular ring");
+        require(!GraduationRectification::fit(graduationLines,normalize,
+            [](const cv::RotatedRect& ellipse,cv::Point2f center){return AutoDialCalibration::metricHomography(ellipse,center);}).valid(),
+            "a circular ring with correct endpoint span must keep its original handles");
         auto non270=graduationLines;
         for(int i=0;i<int(non270.size());++i) {
             std::vector<cv::Point2f> p{point(150+i*4.,245),point(150+i*4.,275)};cv::perspectiveTransform(p,p,knownProjection);
@@ -427,6 +438,19 @@ int main(int argc,char** argv) {
         auto planeEndpoints=matchedEndpoints.points;
         for(int i=0;i<planeEndpoints.size();++i){auto p=planeEndpoints[i].toObject();p["origin_x"]=400.;p["origin_y"]=400.;planeEndpoints[i]=p;}
         ScaleCalibration::Mapping planeMapping;
+        ScaleCalibration::Mapping pointerMapping,legacyMapping;
+        auto hubEndpoints=planeEndpoints;
+        for(int i=0;i<hubEndpoints.size();++i){auto p=hubEndpoints[i].toObject();p.remove("origin_x");p.remove("origin_y");hubEndpoints[i]=p;}
+        require(ScaleCalibration::buildForPointer(planeEndpoints,{400,425},{},true,pointerMapping)&&
+            ScaleCalibration::build(hubEndpoints,{400,425},{},true,legacyMapping)&&
+            pointerMapping.angles==legacyMapping.angles,
+            "pointer mapping must measure scale angles from the needle hub regardless of printed origins");
+        const auto projectedPointerEndpoints=ScaleCalibration::transformed(planeEndpoints,knownProjection);
+        require(ScaleCalibration::buildForPointer(projectedPointerEndpoints,{400,425},knownProjection.inv(),true,pointerMapping),
+            "pointer mapping must accept persisted projected scale points");
+        for(size_t i=0;i<pointerMapping.angles.size();++i)
+            require(AutoScaleCalibration::distance(pointerMapping.angles[i],legacyMapping.angles[i])<.001,
+                "homography must transform scale positions but not transform the destination hub twice");
         require(ScaleCalibration::build(planeEndpoints,{400,425},{},true,planeMapping)&&std::abs(planeMapping.offsets.back()-270)<.01,
             "raised cap offset must not change the printed scale angles");
         const auto projectedEndpoints=ScaleCalibration::transformed(planeEndpoints,knownProjection);

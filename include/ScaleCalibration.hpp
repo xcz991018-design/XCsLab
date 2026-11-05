@@ -89,6 +89,19 @@ inline bool build(const QJsonArray& points, cv::Point2f center, const cv::Mat& H
     }
     return previous>=1 && previous<359;
 }
+// PointerDetector measures directions from the needle hub. Printed-plane origins
+// are useful for detecting graduations, but cannot be used for these directions.
+// center is already in the destination frame, as in build().
+inline bool buildForPointer(const QJsonArray& points, cv::Point2f center, const cv::Mat& H,
+                            bool clockwise, Mapping& result) {
+    QJsonArray hubPoints;
+    for (const auto& value : points) {
+        auto p=value.toObject();
+        p.remove("origin_x"); p.remove("origin_y");
+        hubPoints.append(p);
+    }
+    return build(hubPoints,center,H,clockwise,result);
+}
 inline double ratio(const Mapping& mapping, double offset) {
     offset=std::clamp(offset,0.0,mapping.offsets.back());
     for (size_t i=1;i<mapping.offsets.size();++i)

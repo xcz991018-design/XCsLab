@@ -1,10 +1,73 @@
 #include "MinorTickPreview.hpp"
+#include "PointerOcclusion.hpp"
 #include "AutoDialCalibration.hpp"
 #include "CameraUndistortion.hpp"
 #include "OcrDialRange.hpp"
 #include <iostream>
 #include <QJsonDocument>
 int main(int argc,char** argv){
+    {
+        auto token=[](const char* text,double score,int x,int y,int w,int h){
+            return QJsonObject{{"text",text},{"score",score},{"polygon",QJsonArray{QJsonArray{x,y},QJsonArray{x+w,y},QJsonArray{x+w,y+h},QJsonArray{x,y+h}}}};
+        };
+        const auto broad=token("0.2",.93,0,0,123,72),tight=token("0.2",.99,65,17,79,50);
+        const auto distant=token("0.2",.98,250,0,79,50),other=token("0.8",.99,500,0,79,50);
+        for(const auto& input:std::vector<QJsonArray>{{broad,tight,distant,other},{other,distant,tight,broad}}) {
+            const auto filtered=PaddleScaleOcr::numericTokens(input);
+            if(filtered.size()!=3 || filtered.contains(broad) || !filtered.contains(tight) || !filtered.contains(distant) || !filtered.contains(other))return 89;
+        }
+    }
+    // Replay the observed major anchors from the dialog benchmark. This isolates
+    // minor tick matching from OCR and permits a known pointer mask angle.
+    if(argc==6 && (std::string(argv[1])=="--dialog-points" || std::string(argv[1])=="--dialog-calibration" || std::string(argv[1])=="--401-regression" || std::string(argv[1])=="--957-regression")) {
+        QFile input(argv[3]);if(!input.open(QIODevice::ReadOnly))return 80;
+        const auto record=QJsonDocument::fromJson(input.readLine()).object()["result"].toObject();
+        const auto raw=cv::imread(argv[2]);if(raw.empty())return 10;
+        const auto hub=record["hub"].toArray();
+        std::vector<cv::Point2f> corners;
+        for(auto v:record["corners"].toArray())corners.emplace_back(v.toArray()[0].toDouble(),v.toArray()[1].toDouble());
+        if(corners.size()!=4||hub.size()!=2)return 81;
+        const float size=float(std::max({800,raw.cols,raw.rows})),mid=size*.5f,margin=float(std::round(size*.05));
+        const auto H=cv::getPerspectiveTransform(corners,std::vector<cv::Point2f>{{mid,margin},{size-margin,mid},{mid,size-margin},{margin,mid}});
+        cv::Mat image;cv::warpPerspective(CameraUndistortion::image(raw),image,H,{int(size),int(size)},cv::INTER_CUBIC);
+        const cv::Point2f center(hub[0].toDouble(),hub[1].toDouble());
+        QJsonArray anchors,diagnostics;
+        for(auto v:record["scale_points"].toArray())if(v.toObject()["source"].toString()!="minor_tick")anchors.append(v);
+        if(std::string(argv[1])!="--dialog-points") {
+            const auto surface=detectLiquidSurface(image,center,mid-margin);
+            const auto tokens=record["ocr"].toArray();
+            QJsonArray probes,majors;
+            for(const auto& m:OcrDialRange::majorTicks(image,tokens,center,mid-margin,surface,&probes))
+                majors.append(QJsonObject{{"angle",m.tick.angle},{"radius",m.tick.radius},{"length",m.tick.length},{"inner",m.innerWidth},{"outer",m.outerWidth}});
+            QJsonArray matching;
+            const auto calibrated=OcrDialRange::calibrate(image,tokens,center,mid-margin,true,surface,&matching);
+            QFile debug(QString::fromLocal8Bit(argv[4])+"-majors.json");debug.open(QIODevice::WriteOnly);
+            debug.write(QJsonDocument(QJsonObject{{"majors",majors},{"probes",probes},{"matching",matching},{"anchors",calibrated.points}}).toJson());
+            anchors=calibrated.points;
+            if(std::string(argv[1])=="--957-regression") {
+                const auto count=std::count_if(anchors.begin(),anchors.end(),[](const QJsonValue& p){return std::abs(p.toObject()["ratio"].toDouble()-.2)<1e-6;});
+                if(count!=1)return 88;
+            }
+        }
+        const auto result=MinorTickPreview::detect(image,anchors,center,mid-margin,record["range_min"].toDouble(),record["range_max"].toDouble(),true,
+            detectLiquidSurface(image,center,mid-margin),std::stod(argv[5]),0,&diagnostics);
+        std::cout<<result.message.toStdString()<<std::endl;
+        QJsonArray marks;
+        for(const auto& m:result.marks) {
+            const auto p=(m.a+m.b)*.5f;
+            marks.append(QJsonObject{{"x",p.x},{"y",p.y},{"ratio",m.ratio},{"assigned",m.assigned},{"gap",m.gap},{"confidence",m.confidence}});
+            cv::line(image,m.a,m.b,m.assigned?cv::Scalar(0,220,0):cv::Scalar(255,0,255),3);
+        }
+        cv::imwrite(std::string(argv[4])+".png",image);
+        QFile output(argv[4]);if(!output.open(QIODevice::WriteOnly))return 80;
+        output.write(QJsonDocument(QJsonObject{{"diagnostics",diagnostics},{"points",result.previewPoints},{"marks",marks}}).toJson());
+        if(std::string(argv[1])=="--401-regression") {
+            const bool middle=std::any_of(anchors.begin(),anchors.end(),[](const QJsonValue& p){return std::abs(p.toObject()["ratio"].toDouble()-.75)<1e-6;});
+            const int right=std::count_if(result.marks.begin(),result.marks.end(),[](const MinorTickPreview::Mark& m){return m.assigned&&m.ratio>.75&&m.ratio<1;});
+            if(!middle||right!=19||std::abs(result.division-.02)>1e-6)return 85;
+        }
+        return result.divisionConfirmed?0:82;
+    }
     if((argc==5||argc==6)&&std::string(argv[1])=="--calibrated") {
         auto image=cv::imread(argv[2]);const float s=image.cols*.5f;const cv::Point2f center(s,s);const double radius=s*.9;
         QFile input(argv[3]);if(!input.open(QIODevice::ReadOnly))return 80;
@@ -170,6 +233,9 @@ int main(int argc,char** argv){
             for(const auto& mark:filtered.marks)if(!mark.gap&&cv::norm(mark.b-center)<220)return 7;
         }
         const auto original=anchors;auto result=MinorTickPreview::detect(image,anchors,center,radius,0,1,clockwise,{});
+        if(!shadedOblique && (result.coverage.size()!=2 ||
+           !result.coverage.front().contains(missing?QStringLiteral(u"最大插值跨度 2 格"):QStringLiteral(u"最大插值跨度 1 格"))))
+            return 82;
         std::cout<<clockwise<<" "<<missing<<" "<<result.message.toStdString()<<std::endl;
         for(const auto& m:result.marks)if(!m.gap&&m.ratio<0)return 20;
         const auto persisted=QJsonDocument::fromJson(QJsonDocument(result.previewPoints).toJson()).array();
@@ -190,9 +256,32 @@ int main(int argc,char** argv){
             const auto single=MinorTickPreview::detect(image,endpoints,center,radius,0,1,clockwise,{});
             if(single.divisionConfirmed||std::any_of(single.marks.begin(),single.marks.end(),[](const MinorTickPreview::Mark& m){return m.assigned;}))return 17;
             const double needleAngle=clockwise?44:76;
-            const auto occluded=MinorTickPreview::detect(image,anchors,center,radius,0,1,clockwise,{},needleAngle);
+            PointerResult needle;needle.success=true;
+            const double radians=needleAngle*CV_PI/180;
+            const cv::Point2d normal(-std::sin(radians),std::cos(radians));
+            for(double r=180;r<=250;r+=2.5) {
+                RadialSection s;s.valid=true;s.radius=r;
+                s.leftPoint=cv::Point2d(point(needleAngle,r))-normal*2;
+                s.rightPoint=cv::Point2d(point(needleAngle,r))+normal*2;
+                needle.sections.push_back(s);
+            }
+            const auto mask=pointerOcclusionMask(needle,image.size());
+            // A nearby visible stroke survives even inside the former 2.5-degree wedge.
+            auto withNeighbor=image.clone();
+            cv::line(withNeighbor,point(needleAngle+2,220),point(needleAngle+2,244),cv::Scalar(0),2,cv::LINE_AA);
+            const auto occluded=MinorTickPreview::detect(withNeighbor,anchors,center,radius,0,1,clockwise,{},needleAngle,0,nullptr,{},mask);
+            bool visibleNeighbor=false;
             for(const auto& m:occluded.marks)if(!m.gap){const auto p=(m.a+m.b)*.5f-center;
-                if(AutoScaleCalibration::distance(std::atan2(p.y,p.x)*180/CV_PI,needleAngle)<2.5)return 18;}
+                const double delta=AutoScaleCalibration::distance(std::atan2(p.y,p.x)*180/CV_PI,needleAngle);
+                if(delta<.4)return 18;
+                if(std::abs(delta-2)<.5)visibleNeighbor=true;
+            }
+            if(!visibleNeighbor)return 85;
+            if(cv::countNonZero(pointerOcclusionMask(PointerResult{},image.size())))return 86;
+            needle.sections[10].valid=false;
+            const auto broken=pointerOcclusionMask(needle,image.size());
+            const auto gap=point(needleAngle,needle.sections[10].radius);
+            if(broken.at<uchar>(cvRound(gap.y),cvRound(gap.x)))return 87;
         }
         const int gaps=int(std::count_if(result.marks.begin(),result.marks.end(),[](const MinorTickPreview::Mark& m){return m.gap;}));
         if(!shadedOblique&&(gaps!=(missing?1:0)||int(result.marks.size())-gaps!=(missing?17:18)))return 2;

@@ -31,6 +31,7 @@ struct InspectionTask {
     QString parentTaskId;
     QDateTime originalCapturedAt;
     bool captureOnly{false};
+    bool patrolReading{false};
     bool requireOnvifSnapshot{false}; // Require ONVIF acquisition; use selected high-resolution RTSP, never reuse preview.
     bool preferOnvifSnapshot{false}; // Patrol HTTP preference; calibration/manual reading use RTSP.
     bool allowLowerResolutionHttpSnapshot{false}; // Patrol only; never relax RTSP/high-resolution calibration checks.

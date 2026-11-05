@@ -10,6 +10,8 @@
 #include "DeviceArchiveSummary.hpp"
 #include "RecognitionQuality.hpp"
 #include "CardinalSelectorDialog.hpp"
+#include "CurrentCalibrationDialog.hpp"
+#include "CalibrationArchive.hpp"
 #include "ScaleCalibration.hpp"
 #include "IsolatedCapture.hpp"
 #include "SnapshotFrameReader.hpp"
@@ -1034,6 +1036,7 @@ void MainWindow::onDeviceCustomContextMenu(const QPoint& pos) {
         });
         menu.addAction(tr("⚙️ 设备安装档案..."), this, [this, item]() { onEditCameraInfo(item, true); });
         menu.addAction(tr("🎯 表计标定..."), this, &MainWindow::onCalibrateCardinalPoints);
+        menu.addAction(tr("查看当前标定"), this, [this, camId]() { onViewCurrentCalibration(camId); });
         if (AccessControl::administrator()) menu.addAction(tr("🗑️ 从设备库移除此设备"), this, &MainWindow::onRemoveSelectedDevice);
         menu.addSeparator();
     }
@@ -1042,6 +1045,36 @@ void MainWindow::onDeviceCustomContextMenu(const QPoint& pos) {
     if (AccessControl::administrator()) menu.addAction(tr("🔄 刷新局域网探针设备状态"), this, &MainWindow::onTriggerAutoDiscovery);
 
     menu.exec(m_deviceListWidget->mapToGlobal(pos));
+}
+
+void MainWindow::onViewCurrentCalibration(const QString& cameraId) {
+    if(!m_discoveredItemsMap.contains(cameraId))return;
+    auto* dialog=new CurrentCalibrationDialog(cameraId,this);
+    dialog->setAttribute(Qt::WA_DeleteOnClose);dialog->setWindowModality(Qt::WindowModal);
+    struct Reply {DiscoveredCameraItem device;cv::Mat original;QString error,note;};
+    auto* watcher=new QFutureWatcher<Reply>(dialog);
+    connect(watcher,&QFutureWatcher<Reply>::finished,dialog,[dialog,watcher]() {
+        const auto reply=watcher->result();watcher->deleteLater();
+        if(!reply.error.isEmpty()){dialog->showError(reply.error);return;}
+        if(dialog->setDevice(reply.device))dialog->setFrame(reply.original,reply.note);
+    });
+    dialog->open();
+    const auto device=m_discoveredItemsMap.value(cameraId);
+    watcher->setFuture(QtConcurrent::run([cameraId,device]() -> Reply {
+        const auto archived=CalibrationArchive::load(cameraId);
+        auto current=device;
+        QString note;
+        try {
+            DeviceConfigManager::instance().waitForDatabaseWrites();
+            if(DatabaseSettings::fromEnvironment().enabled)current=MySqlRepository().loadDevice(cameraId);
+        }catch(const std::exception& e){
+            if(!archived.valid())return {device,{},QString::fromUtf8(e.what()),{}};
+            current=archived.device;
+            note=QStringLiteral(u"数据库暂不可用，显示本地保存的上次标定。");
+        }
+        if(archived.valid()&&CalibrationArchive::matches(current,archived.device))return {current,archived.original,{},note};
+        return {current,{},{},archived.valid()?QStringLiteral(u"已归档原图与当前标定版本不一致，未叠加旧底图。请重新标定并保存原图。"):archived.error};
+    }));
 }
 
 void MainWindow::onFilterDeviceList(const QString& filterText) {
@@ -2215,6 +2248,7 @@ void MainWindow::onStartAllDevicesInspection() {
     for (const auto& device : devices) {
         InspectionTask task;
         task.device = device;
+        task.patrolReading = true;
         task.requireOnvifSnapshot = device.protocolType == CameraProtocolType::ONVIF_RTSP_STREAM;
         if (device.protocolType == CameraProtocolType::LOCAL_FILE) task.inputKind = InspectionInputKind::LocalImage;
         task.runMode = GaugeRunMode::Evidence;

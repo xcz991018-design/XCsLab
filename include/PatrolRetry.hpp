@@ -11,7 +11,7 @@ inline QString reason(const InspectionTask& task, const InspectionOutcome& out) 
         return "recognition_failed";
     if (!out.errorCode.isEmpty() || !out.recognitionPerformed) return {};
     if (!out.result.success) return "recognition_failed";
-    if (!std::isfinite(out.result.confidence) || out.result.confidence < 0.4) return "low_confidence";
+    if (lowInspectionConfidence(out.result.confidence)) return "low_confidence";
     if (!std::isfinite(out.result.value)) return "invalid_reading";
     if (out.result.centerInconsistent || !out.result.warningMessage.empty() ||
         out.result.recognitionQuality["status"].toString() != "trusted") return "quality_review";

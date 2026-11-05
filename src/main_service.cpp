@@ -28,6 +28,7 @@ int main(int argc, char** argv) {
         QCommandLineOption("export-algorithm-parameters", "Initialize independent pointer algorithm JSON from current database templates"),
         QCommandLineOption("sync-camera-clock", "Correct a registered camera to computer UTC when offset exceeds 5 seconds, then verify", "camera-id"),
         QCommandLineOption("diagnose-snapshot", "Offline replay using an exported snapshot.json and --image", "path"),
+        QCommandLineOption("replay-patrol", "Apply patrol's conditional hub check during diagnostic replay"),
         QCommandLineOption("diagnose-task", "Read-only replay of a historical DB task; exports original, frozen config and diagnostics", "task-id"),
         QCommandLineOption("devices", "Explicit credential/registry JSON override (default: user data directory)", "path"),
         QCommandLineOption("credential-path", "Print the shared user credential path without opening a camera"),
@@ -119,7 +120,7 @@ int main(int argc, char** argv) {
                 throw std::runtime_error("Invalid diagnostic run mode");
             const auto mode = modeName == "production" ? GaugeRunMode::Production :
                 modeName == "evidence" ? GaugeRunMode::Evidence : GaugeRunMode::Debug;
-            const auto result = GaugeReaderEngine().process(frame,profile,mode);
+            const auto result = GaugeReaderEngine().process(frame,profile,mode,parser.isSet("replay-patrol"));
             if (!result.step2_rectified.empty()) cv::imwrite(dir.filePath("rectified.png").toStdString(),result.step2_rectified);
             if (!result.overlayImage.empty()) cv::imwrite(dir.filePath("overlay.png").toStdString(),result.overlayImage);
             if (!result.diagnosticHudImage.empty()) cv::imwrite(dir.filePath("hud.png").toStdString(),result.diagnosticHudImage);
@@ -129,7 +130,7 @@ int main(int argc, char** argv) {
             const auto tail=[](const TailDirectionProfile& p) { return QJsonObject{{"valid",p.valid},{"reach",p.reach},
                 {"width",p.medianWidth},{"slope",p.widthSlope},{"widening",p.wideningScore},{"score",p.tailScore}}; };
             QJsonObject report{{"task_id",stored.inspection.taskId},{"mode",modeName},{"success",result.success},{"value",result.value},
-                {"angle",result.pointer_angle_deg},{"head",QString(QChar(r.headEnd))}, {"likelihood_a",r.tipLikelihoodA},
+                {"confidence",result.confidence},{"engine_steps",result.stageTimings},{"angle",result.pointer_angle_deg},{"head",QString(QChar(r.headEnd))}, {"likelihood_a",r.tipLikelihoodA},
                 {"likelihood_b",r.tipLikelihoodB},{"body_a",body(r.directionA)},{"body_b",body(r.directionB)},
                 {"tail_a",tail(r.tailA)},{"tail_b",tail(r.tailB)},{"error",QString::fromStdString(result.errorMessage)}};
             write("report.json",QJsonDocument(report).toJson());
@@ -272,6 +273,7 @@ int main(int argc, char** argv) {
     QList<InspectionTask> tasks;
     for (const auto& device : devices) {
         InspectionTask task;
+        task.patrolReading = true;
         task.captureTimeoutMs = captureTimeout;
         task.device = device;
         task.requireOnvifSnapshot = device.protocolType == CameraProtocolType::ONVIF_RTSP_STREAM;

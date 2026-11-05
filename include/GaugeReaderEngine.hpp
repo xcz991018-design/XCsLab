@@ -62,6 +62,10 @@ struct GaugeResult {
     QJsonObject recognitionQuality; // Advisory; never changes success/value/confidence.
 };
 
+inline bool lowInspectionConfidence(double confidence) {
+    return !std::isfinite(confidence) || confidence < 0.4;
+}
+
 class GaugeReaderEngine {
 public:
     GaugeReaderEngine() = default;
@@ -72,12 +76,12 @@ public:
      * Saved profile annotations use raw pixels; conversion uses a private copy.
      */
     GaugeResult process(const cv::Mat& frame, GaugeProfile& profile,
-                        GaugeRunMode mode = GaugeRunMode::Debug);
+                        GaugeRunMode mode = GaugeRunMode::Debug, bool deferCalibratedHubCheck = false);
 
     /**
      * @brief Apply a homography represented by 4 editable mapping handles (Top, Right, Bottom, Left).
      */
-    cv::Mat rectifyPerspective(const cv::Mat& src, const std::vector<cv::Point2f>& quadPts, cv::Mat& invH, int outSize = 800, int margin = 40);
+    cv::Mat rectifyPerspective(const cv::Mat& src, const std::vector<cv::Point2f>& quadPts, cv::Mat& invH, int outSize = 800, int margin = 40, bool dialOnly = false);
 
     /**
      * @brief Estimate dial-plane geometry from the rim and reliable printed graduations; return equivalent mapping handles.

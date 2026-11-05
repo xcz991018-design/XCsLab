@@ -123,7 +123,7 @@ inline const std::vector<double>& builtInDialValues() {
 }
 inline QJsonArray numericTokens(const QJsonArray& tokens,const std::vector<double>& allowedValues=builtInDialValues()) {
     const QRegularExpression numeric(QStringLiteral("^[+-]?(?:[0-9]+(?:\\.[0-9]*)?|\\.[0-9]+)$"));
-    struct Candidate {QJsonObject token;cv::Point2f center;double extent;};
+    struct Candidate {QJsonObject token;cv::Point2f center;double extent;cv::Rect bounds;};
     std::vector<Candidate> candidates;
     for(const auto& entry:tokens) {
         auto token=entry.toObject();QString text=token["text"].toString().trimmed();
@@ -150,7 +150,7 @@ inline QJsonArray numericTokens(const QJsonArray& tokens,const std::vector<doubl
         }
         if(points.size()!=4)continue;
         const double extent=std::max(cv::norm(points[0]-points[1]),cv::norm(points[1]-points[2]));
-        if(extent>1)candidates.push_back({token,center,extent});
+        if(extent>1)candidates.push_back({token,center,extent,cv::boundingRect(points)});
     }
     std::sort(candidates.begin(),candidates.end(),[](const Candidate& a,const Candidate& b){
         const bool uprightA=a.token["orientation_preferred"].toBool(),uprightB=b.token["orientation_preferred"].toBool();
@@ -159,6 +159,23 @@ inline QJsonArray numericTokens(const QJsonArray& tokens,const std::vector<doubl
     });
     std::vector<Candidate> selected;
     for(const auto& candidate:candidates) {
+        // A broad crop may recognize the same label while also enclosing ink
+        // from a graduation. Prefer a reliable, substantially tighter box;
+        // otherwise that broad box erases real strokes during text masking.
+        if(std::any_of(candidates.begin(),candidates.end(),[&](const Candidate& tight){
+            return std::abs(tight.token["text"].toString().toDouble()-candidate.token["text"].toString().toDouble())<1e-6 &&
+                tight.token["score"].toDouble()>=.9 &&
+                tight.token["score"].toDouble()>=candidate.token["score"].toDouble()-.03 &&
+                tight.bounds.area()<candidate.bounds.area()*.65 &&
+                (tight.bounds & candidate.bounds).area()>=tight.bounds.area()*.7;
+        }))continue;
+        const auto glyph=candidate.token["text"].toString();
+        if(glyph.size()==1 && std::any_of(candidates.begin(),candidates.end(),[&](const Candidate& label){
+            const auto text=label.token["text"].toString();
+            return text.contains('.') && text.contains(glyph) && label.token["score"].toDouble()>=.9 &&
+                candidate.bounds.width<.65*label.bounds.width &&
+                (candidate.bounds & label.bounds).area()>=.8*candidate.bounds.area();
+        }))continue;
         const bool duplicate=std::any_of(selected.begin(),selected.end(),[&](const Candidate& existing){
             return cv::norm(candidate.center-existing.center)<std::min(candidate.extent,existing.extent)*.4;
         });

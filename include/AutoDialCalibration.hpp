@@ -21,6 +21,7 @@ struct Result {
     cv::Point2f graduationCenter{-1,-1};
     int structuralSupport{0},structuralSymmetricPairs{0};
     double structuralErrorBefore{0},structuralErrorAfter{0};
+    double structuralSpanBefore{0},structuralSpanAfter{0};
     QString error;
     bool valid() const {return error.isEmpty() && points.size()==4;}
 };
@@ -341,12 +342,87 @@ inline cv::RotatedRect refinePrintedGeometry(cv::RotatedRect rim,cv::Point2f hub
     }
     return rim;
 }
-inline Result detect(const cv::Mat& input,bool refineGeometry=true) {
+// A liquid boundary can hide the upper arc. Approximate the verified dial-plane
+// fit using handles on the measured rim; reserve alternate ticks for acceptance.
+inline bool boundedGraduationFeedback(const std::vector<cv::Vec4f>& lines,const cv::Mat& initial,
+    const std::vector<cv::Point2f>& unit,const Result& dial,cv::Size size,cv::Point2f sourceOrigin,
+    GraduationRectification::Result& fit,std::vector<cv::Point2f>& handles,cv::Mat& H) {
+    const auto strokes=GraduationRectification::observations(lines,initial);
+    std::vector<cv::Point2f> training{fit.firstTip,fit.lastTip},validation;
+    for(size_t i=0;i<strokes.size();++i) {
+        if(i%2)validation.push_back(strokes[i].outer);
+        else training.push_back(strokes[i].outer);
+    }
+    std::vector<cv::Point2f> target;
+    cv::perspectiveTransform(training,target,fit.correction);
+    const cv::Mat inverse=initial.inv();
+    auto centered=[&](const cv::Mat& warp)->cv::Mat {
+        std::vector<cv::Point2f> center{sourceOrigin};cv::perspectiveTransform(center,center,warp);
+        const cv::Mat translate=(cv::Mat_<double>(3,3)<<1,0,-center[0].x,0,1,-center[0].y,0,0,1);
+        return translate*warp*inverse;
+    };
+    auto loss=[&](const std::vector<cv::Point2f>& candidate) {
+        const auto warp=cv::getPerspectiveTransform(candidate,unit);
+        std::vector<cv::Point2f> mapped;cv::perspectiveTransform(training,mapped,centered(warp));
+        double error=0;
+        for(size_t i=0;i<mapped.size();++i) {
+            const auto delta=mapped[i]-target[i];
+            error+=delta.dot(delta)*(i<2?4:1);
+        }
+        const double span=GraduationRectification::angle(mapped[1])-GraduationRectification::angle(mapped[0]);
+        const double arcError=(span-270)*CV_PI/180;
+        return error+4*arcError*arcError;
+    };
+    handles=dial.points;
+    double best=loss(handles);
+    const double minor=std::min(dial.rim.size.width,dial.rim.size.height);
+    for(double step=minor*.025;step>=minor*.001;step*=.5) {
+        for(int pass=0;pass<6;++pass) {
+            const double previous=best;
+            for(size_t i=0;i<handles.size();++i) {
+                const auto base=handles[i];
+                for(auto direction:{cv::Point2f(1,0),cv::Point2f(-1,0),cv::Point2f(0,1),cv::Point2f(0,-1)}) {
+                    auto candidate=handles;candidate[i]=base+direction*float(step);
+                    if(!supportedMappingHandles(candidate,dial.points,dial.rim,size))continue;
+                    const double cost=loss(candidate);
+                    if(cost<best){best=cost;handles=candidate;}
+                }
+            }
+            if(best==previous)break;
+        }
+    }
+    H=cv::getPerspectiveTransform(handles,unit);
+    const auto correction=centered(H);
+    std::vector<cv::Point2f> tips{fit.firstTip,fit.lastTip};
+    cv::perspectiveTransform(tips,tips,correction);
+    fit.spanAfter=GraduationRectification::angle(tips[1])-GraduationRectification::angle(tips[0]);
+    auto scatter=[](const std::vector<cv::Point2f>& points) {
+        std::vector<double> radii;for(auto p:points)radii.push_back(cv::norm(p));
+        const double radius=GraduationRectification::median(radii);
+        for(auto& r:radii)r=std::abs(r-radius);
+        return GraduationRectification::median(radii);
+    };
+    fit.before=scatter(validation);
+    cv::perspectiveTransform(validation,validation,correction);
+    fit.after=scatter(validation);
+    const auto actual=graduationFit(lines,correction*initial);
+    std::vector<cv::Point2f> all;
+    for(const auto& stroke:strokes)all.push_back(stroke.outer);
+    int initialPairs=0;
+    const double initialSymmetry=GraduationRectification::symmetryError(all,initialPairs);
+    cv::perspectiveTransform(all,all,correction);
+    const double symmetry=GraduationRectification::symmetryError(all,fit.symmetricPairs);
+    fit.support=actual.support;
+    return fit.symmetricPairs>=6&&symmetry<=.045&&symmetry<=std::max(.035,initialSymmetry)&&
+        actual.support>=24&&actual.aspect>=dial.graduationAspect+.015&&
+        fit.after<fit.before*.8&&std::abs(fit.spanAfter-270)<=2;
+}
+inline Result detectAtResolution(const cv::Mat& input,bool refineGeometry,int workingSize) {
     Result failure;
     if(input.empty()||input.depth()!=CV_8U||std::min(input.cols,input.rows)<120){failure.error=QStringLiteral(u"图像为空、过小或格式不支持，请使用清晰原图。");return failure;}
     cv::Mat image,gray;
     // Keep contour, hub and stroke thresholds on the same working resolution.
-    const double scale=800.0/std::max(input.cols,input.rows);
+    const double scale=double(workingSize)/std::max(input.cols,input.rows);
     cv::resize(input,image,{},scale,scale,cv::INTER_AREA);
     if(image.channels()==3)cv::cvtColor(image,gray,cv::COLOR_BGR2GRAY);
     else if(image.channels()==4)cv::cvtColor(image,gray,cv::COLOR_BGRA2GRAY);
@@ -421,7 +497,13 @@ inline Result detect(const cv::Mat& input,bool refineGeometry=true) {
             if(offset>.62||size<major*.025||size>major*.15||std::min(pin.ellipse.size.width,pin.ellipse.size.height)/size<.35)continue;
             const double support=edgeSupport(pin.ellipse,gx,gy);if(support<.72)continue;
             const double spokes=needleSpokes(gray,pin.ellipse,radius);if(spokes<=0)continue;
-            const double score=support+.3*std::min(1.0,spokes/(radius*.4))-.1*offset;
+            // A circular cap on a tilted dial is foreshortened along
+            // roughly the same axis as the rim. A printed zero can have
+            // excellent edge and spoke support but elongate across it.
+            const double elongation=1-std::min(pin.ellipse.size.width,pin.ellipse.size.height)/size;
+            const double misalignment=std::abs(std::sin((pin.ellipse.angle-rim.angle)*CV_PI/180));
+            const double tiltPenalty=.8*(1-minor/major)*elongation*misalignment;
+            const double score=support-tiltPenalty+.3*std::min(1.0,spokes/(radius*.4))-.1*offset;
             bool duplicate=false;
             for(auto& hub:hubs)if(cv::norm(hub.point-pin.ellipse.center)<radius*.04){if(score>hub.score)hub={pin.ellipse.center,score,support};duplicate=true;break;}
             if(!duplicate)hubs.push_back({pin.ellipse.center,score,support});
@@ -455,6 +537,8 @@ inline Result detect(const cv::Mat& input,bool refineGeometry=true) {
             hubMatches==0?QStringLiteral(u"边界候选存在，但真实轴帽及针体关联未通过"):
             QStringLiteral(u"表盘校正点不可靠");
         failure.error=QStringLiteral(u"%1（标定底图 %2×%3）。可保存标定原图以复核，或手动调整。").arg(reason).arg(input.cols).arg(input.rows);
+        if(workingSize==800 && boundaries>0 && hubMatches==0 && std::max(input.cols,input.rows)>=1000)
+            return detectAtResolution(input,refineGeometry,1000);
         return failure;
     }
     GraduationExclusion exclusion;std::vector<cv::Vec4f> graduationSegments;
@@ -573,20 +657,23 @@ inline Result detect(const cv::Mat& input,bool refineGeometry=true) {
     if(refineGeometry&&!exclusion.surface.ambiguous) {
         const std::vector<cv::Point2f> unit{{0,-1},{1,0},{0,1},{-1,0}};
         const auto preliminary=cv::getPerspectiveTransform(result.points,unit);
-        const auto fitted=GraduationRectification::fit(graduationSegments,preliminary,[](const cv::RotatedRect& circle,cv::Point2f center){return metricHomography(circle,center);});
+        auto fitted=GraduationRectification::fit(graduationSegments,preliminary,[](const cv::RotatedRect& circle,cv::Point2f center){return metricHomography(circle,center);});
         if(fitted.valid()) {
-            const cv::Mat H=fitted.correction*preliminary;std::vector<cv::Point2f> points;
+            cv::Mat H=fitted.correction*preliminary;std::vector<cv::Point2f> points;
             cv::perspectiveTransform(unit,points,H.inv());
-            // Lower-arc consistency alone cannot justify extrapolating the top
-            // outside the measured rim. Reject such a correction; do not zoom
-            // it back into the image and present it as a supported boundary.
             bool inside=supportedMappingHandles(points,result.points,result.rim,gray.size());
+            std::vector<cv::Point2f> origin{{0,0}};cv::perspectiveTransform(origin,origin,H.inv());
+            if(!inside&&exclusion.surface.found&&result.graduationSupport>=24) {
+                inside=boundedGraduationFeedback(graduationSegments,preliminary,unit,result,gray.size(),
+                    origin.front(),fitted,points,H);
+            }
             const auto independent=graduationFit(graduationSegments,H);
             if(independent.support>=24&&result.graduationSupport>=24&&independent.aspect<result.graduationAspect-.005)inside=false;
             if(inside) {
                 result.points=points;result.structuralRectification=true;result.structuralSupport=fitted.support;result.structuralSymmetricPairs=fitted.symmetricPairs;
-                std::vector<cv::Point2f> origin{{0,0}};cv::perspectiveTransform(origin,origin,H.inv());result.graduationCenter=origin[0];
+                result.graduationCenter=origin[0];
                 result.structuralErrorBefore=fitted.before;result.structuralErrorAfter=fitted.after;
+                result.structuralSpanBefore=fitted.spanBefore;result.structuralSpanAfter=fitted.spanAfter;
                 const auto fit=graduationFit(graduationSegments,H);
                 result.graduationSupport=fit.support;result.graduationResidual=fit.residual;result.graduationAspect=fit.aspect;
             }
@@ -596,6 +683,9 @@ inline Result detect(const cv::Mat& input,bool refineGeometry=true) {
     result.hub*=float(1/scale);result.rim.center*=float(1/scale);result.rim.size.width/=float(scale);result.rim.size.height/=float(scale);
     if(result.structuralRectification)result.graduationCenter*=float(1/scale);
     return result;
+}
+inline Result detect(const cv::Mat& input,bool refineGeometry=true) {
+    return detectAtResolution(input,refineGeometry,800);
 }
 }
 

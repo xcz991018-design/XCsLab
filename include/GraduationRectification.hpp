@@ -11,7 +11,8 @@ struct Observation {cv::Point2f outer,inner;double angle,length;};
 struct Result {
     cv::Mat correction;
     int support{0},symmetricPairs{0};
-    double before{0},after{0},endpointError{0};
+    double before{0},after{0},spanBefore{0},spanAfter{0};
+    cv::Point2f firstTip,lastTip;
     bool valid() const {return !correction.empty();}
 };
 inline double angle(cv::Point2f p) {double a=std::atan2(p.y,p.x)*180/CV_PI;return a<90?a+360:a;}
@@ -152,11 +153,18 @@ inline Result fit(const std::vector<cv::Vec4f>& reliableLines,const cv::Mat& ini
             }
         }
         const double before=median(beforeErrors),after=median(afterErrors);
-        if(before<.006||inliers<int(points.size()*.8)||after>.014||after>before*.75||median(radialErrors)>.025)continue;
+        if(inliers<int(points.size()*.8)||after>.014||median(radialErrors)>.025)continue;
+        const bool rounder=before>=.006&&after<=before*.75;
+        // A projective transform can preserve the circular ring while moving
+        // its radial origin. Use the observed endpoints to detect that bias.
+        const double spanError=std::abs(span-270);
+        const bool betterSpan=std::abs(originalSpan-270)>=3&&spanError<=2&&
+            spanError<=std::abs(originalSpan-270)*.5&&after<=before+.002;
+        if(!rounder&&!betterSpan)continue;
         int pairs=0;const double symmetric=symmetryError(mapped,pairs);
         if(pairs<6||symmetric>.035)continue;
         const double cost=after+.0008*std::abs(span-270)+symmetric*.15;
-        if(cost<bestCost){bestCost=cost;best={C,inliers,pairs,before,after,std::abs(span-270)*.5};}
+        if(cost<bestCost){bestCost=cost;best={C,inliers,pairs,before,after,originalSpan,span,strokes[first].outer,strokes[last].outer};}
     }
     return best;
 }

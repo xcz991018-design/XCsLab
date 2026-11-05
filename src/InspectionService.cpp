@@ -287,7 +287,7 @@ InspectionOutcome recognize(CapturedTask data, const std::shared_ptr<std::atomic
         out.timings["profile_setup_ms"] = elapsedMs(profileStarted);
         GaugeReaderEngine engine;
         out.recognitionPerformed = true;
-        out.result = engine.process(data.frame, profile, data.task.runMode);
+        out.result = engine.process(data.frame, profile, data.task.runMode, data.task.patrolReading);
         out.timings["engine_steps"] = out.result.stageTimings;
         out.profileSnapshot["_runtime_quality_config"] = out.result.recognitionQuality["config"];
         if (!out.result.success) {

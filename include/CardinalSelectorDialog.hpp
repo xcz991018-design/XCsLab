@@ -51,6 +51,7 @@ public:
     void showLiquidMask(bool enabled) {m_showLiquidMask=enabled; clearMinorPreview(); update();}
     void selectLiquidSurface() {m_pickLiquidSurface=true;m_pickCenter=false;m_pendingRatio=-1;m_liquidClicks.clear();setCursor(Qt::CrossCursor);emit pickModeChanged();}
     void setRectifiedMode(bool enabled) { m_rectifiedMode=enabled; m_selectedIdx=-1; }
+    void showSourceAnnotations(bool enabled) { m_showSourceAnnotations=enabled; update(); }
 
 
 
@@ -70,6 +71,7 @@ protected:
 
 private:
     bool m_rectifiedMode{false};
+    bool m_showSourceAnnotations{false};
     bool m_pickCenter{false};
     bool m_pickLiquidSurface{false}, m_showLiquidMask{true};
     std::vector<cv::Point2f> m_liquidClicks;
