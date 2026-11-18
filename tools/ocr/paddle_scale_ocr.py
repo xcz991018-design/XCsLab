@@ -8,7 +8,7 @@ import sys
 import tempfile
 from pathlib import Path
 
-NUMERIC = re.compile(r"^[+-]?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)$")
+NUMERIC = re.compile(r"^(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)$")
 
 
 def numeric_text(text):
@@ -16,7 +16,7 @@ def numeric_text(text):
     text = text.strip().replace("．", ".").replace("−", "-")
     if text.endswith("-") and NUMERIC.fullmatch(text.rstrip("-")):
         return text.rstrip("-")
-    return text
+    return text if NUMERIC.fullmatch(text) else ""
 
 
 def narrow_digit_regions(view, numeric_heights):
@@ -373,7 +373,7 @@ def _recognize_encoded(encoded):
     tokens.extend(refinements)
     for token in tokens:
         token.pop("view_polygon", None)
-    return json.dumps(tokens, ensure_ascii=False, allow_nan=False)
+    return json.dumps([token for token in tokens if NUMERIC.fullmatch(token["text"])], ensure_ascii=False, allow_nan=False)
 
 
 def main():

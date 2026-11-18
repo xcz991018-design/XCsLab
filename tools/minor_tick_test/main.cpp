@@ -7,6 +7,48 @@
 #include <QJsonDocument>
 int main(int argc,char** argv){
     {
+        cv::Mat image(240,450,CV_8UC3,cv::Scalar::all(200));
+        cv::putText(image,"0.8",{50,170},cv::FONT_HERSHEY_SIMPLEX,2,cv::Scalar::all(20),4);
+        cv::line(image,{220,140},{350,140},cv::Scalar::all(20),5);
+        QJsonObject token{{"text","0.8"},{"raw_text","0.8-"},{"score",.88},
+            {"polygon",QJsonArray{QJsonArray{30,110},QJsonArray{370,110},QJsonArray{370,185},QJsonArray{30,185}}}};
+        const auto refined=PaddleScaleOcr::tightenTickSuffixBoxes(image,{token});
+        if(!refined[0].toObject()["glyph_bounds_refined"].toBool()||refined[0].toObject()["text"]!=token["text"])return 102;
+        if(PaddleScaleOcr::tightenTickSuffixBoxes(image,refined)!=refined)return 103;
+        token["raw_text"]="0.8";
+        if(PaddleScaleOcr::tightenTickSuffixBoxes(image,{token})!=QJsonArray{token})return 104;
+        token["raw_text"]="0.8-";
+        if(PaddleScaleOcr::tightenTickSuffixBoxes(cv::Mat(240,450,CV_8UC3,cv::Scalar::all(200)),{token})!=QJsonArray{token})return 105;
+    }
+    for(double value:{0.,.1,.3,1.,1.6,-.2,.1+.2})if(!MinorTickPreview::validLongValue(value))return 99;
+    for(double value:{.02,.28,.32,1.65})if(MinorTickPreview::validLongValue(value))return 100;
+    for(bool clockwise:{true,false}) {
+        const cv::Point2f hub(300,300);const double radius=270;
+        auto point=[&](double angle,double r){angle=(clockwise?angle:120-angle)*CV_PI/180;return hub+cv::Point2f(float(r*std::cos(angle)),float(r*std::sin(angle)));};
+        MinorTickPreview::Result base;base.divisionConfirmed=true;base.division=.02;base.confidence=.9;
+        for(const auto& entry:std::vector<cv::Point2d>{{0,0},{20,.22},{23,.24},{26,.26},{32,.30},{100,1}}) {
+            const auto p=point(entry.x,230);
+            base.previewPoints.append(QJsonObject{{"x",p.x},{"y",p.y},{"ratio",entry.y},{"source","minor_tick"}});
+        }
+        cv::Mat mask(600,600,CV_8UC1,cv::Scalar(0));cv::line(mask,point(29,210),point(29,245),cv::Scalar(255),6);
+        auto inferred=base;
+        if(MinorTickPreview::fillPointerGaps(inferred,hub,radius,0,1,clockwise,{},mask)!=1)return 91;
+        if(inferred.previewPoints.size()!=base.previewPoints.size()+1||inferred.marks.size()!=1||
+           !inferred.marks.front().inferred||inferred.marks.front().assigned||std::abs(inferred.marks.front().ratio-.28)>1e-6)return 92;
+        const auto stored=QJsonDocument::fromJson(QJsonDocument(inferred.previewPoints).toJson()).array();
+        if(stored!=inferred.previewPoints||stored[4].toObject()["source"].toString()!="minor_tick_inferred")return 93;
+        auto noMask=base;
+        if(MinorTickPreview::fillPointerGaps(noMask,hub,radius,0,1,clockwise,{},cv::Mat(600,600,CV_8UC1,cv::Scalar(0))))return 94;
+        auto uncertain=base;uncertain.divisionConfirmed=false;
+        if(MinorTickPreview::fillPointerGaps(uncertain,hub,radius,0,1,clockwise,{},mask))return 95;
+        LiquidSurface liquid;liquid.found=true;liquid.centerX=300;liquid.radius=270;liquid.y0=600;
+        auto masked=base;if(MinorTickPreview::fillPointerGaps(masked,hub,radius,0,1,clockwise,liquid,mask))return 96;
+        auto multiple=base;multiple.previewPoints.removeAt(4);
+        if(MinorTickPreview::fillPointerGaps(multiple,hub,radius,0,1,clockwise,{},mask))return 97;
+        auto irregular=base;auto moved=irregular.previewPoints[4].toObject();const auto p=point(50,230);moved["x"]=p.x;moved["y"]=p.y;irregular.previewPoints[4]=moved;
+        if(MinorTickPreview::fillPointerGaps(irregular,hub,radius,0,1,clockwise,{},mask))return 98;
+    }
+    {
         auto token=[](const char* text,double score,int x,int y,int w,int h){
             return QJsonObject{{"text",text},{"score",score},{"polygon",QJsonArray{QJsonArray{x,y},QJsonArray{x+w,y},QJsonArray{x+w,y+h},QJsonArray{x,y+h}}}};
         };
@@ -15,6 +57,19 @@ int main(int argc,char** argv){
         for(const auto& input:std::vector<QJsonArray>{{broad,tight,distant,other},{other,distant,tight,broad}}) {
             const auto filtered=PaddleScaleOcr::numericTokens(input);
             if(filtered.size()!=3 || filtered.contains(broad) || !filtered.contains(tight) || !filtered.contains(distant) || !filtered.contains(other))return 89;
+        }
+        const auto decimal=token("0.8",.88,100,100,90,70);
+        auto zero=token("0",1.,102,102,28,66);zero["orientation_preferred"]=true;
+        const auto endpoint=token("0",.99,300,300,28,66);
+        const auto broadTwo=token("2",.82,50,20,180,180),fullDecimal=token("0.2",.99,140,110,55,50);
+        const auto separateTwo=token("2",.98,400,100,40,60);
+        for(const auto& input:std::vector<QJsonArray>{{broadTwo,fullDecimal,separateTwo},{separateTwo,fullDecimal,broadTwo}}) {
+            const auto filtered=PaddleScaleOcr::numericTokens(input);
+            if(filtered.size()!=2||filtered.contains(broadTwo)||!filtered.contains(fullDecimal)||!filtered.contains(separateTwo))return 101;
+        }
+        for(const auto& input:std::vector<QJsonArray>{{zero,decimal,endpoint},{endpoint,decimal,zero}}) {
+            const auto filtered=PaddleScaleOcr::numericTokens(input);
+            if(filtered.size()!=2||filtered.contains(zero)||!filtered.contains(decimal)||!filtered.contains(endpoint))return 90;
         }
     }
     // Replay the observed major anchors from the dialog benchmark. This isolates
@@ -32,7 +87,7 @@ int main(int argc,char** argv){
         cv::Mat image;cv::warpPerspective(CameraUndistortion::image(raw),image,H,{int(size),int(size)},cv::INTER_CUBIC);
         const cv::Point2f center(hub[0].toDouble(),hub[1].toDouble());
         QJsonArray anchors,diagnostics;
-        for(auto v:record["scale_points"].toArray())if(v.toObject()["source"].toString()!="minor_tick")anchors.append(v);
+        for(auto v:record["scale_points"].toArray())if(!v.toObject()["source"].toString().startsWith("minor_tick"))anchors.append(v);
         if(std::string(argv[1])!="--dialog-points") {
             const auto surface=detectLiquidSurface(image,center,mid-margin);
             const auto tokens=record["ocr"].toArray();
@@ -292,7 +347,7 @@ int main(int argc,char** argv){
         auto blank=MinorTickPreview::detect(cv::Mat(600,600,CV_8UC1,cv::Scalar(255)),anchors,center,radius,0,1,clockwise,{});
         if(!blank.marks.empty()||blank.division!=0)return 4;
     }
-    // A convincing nine-way count must not publish repeating-decimal values.
+    // An unconfirmed nine-way count keeps preview estimates without saving assignments.
     {
         cv::Mat image(600,600,CV_8UC1,cv::Scalar(255));QJsonArray anchors;
         for(int i=0;i<=18;++i){const double angle=20+i*60./18;
@@ -300,7 +355,9 @@ int main(int argc,char** argv){
             if(i%9==0){const auto p=point(angle,230);anchors.append(QJsonObject{{"x",p.x},{"y",p.y},{"ratio",i/18.}});}}
         const auto uncertain=MinorTickPreview::detect(image,anchors,center,radius,0,.4,true,{});
         if(uncertain.divisionConfirmed)return 40;
-        for(const auto& m:uncertain.marks)if(m.assigned||m.ratio>=0)return 41;
+        if(uncertain.marks.empty()||!uncertain.previewPoints.isEmpty())return 41;
+        for(const auto& m:uncertain.marks)
+            if(m.assigned||(!m.gap&&(!std::isfinite(m.ratio)||m.ratio<0||m.ratio>1)))return 41;
     }
     // A known nonlinear local mapping gives a calculable change at the same angle.
     QJsonArray base;

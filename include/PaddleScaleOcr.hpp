@@ -62,6 +62,44 @@ inline QJsonArray restoreTokens(const QJsonArray& tokens,int top,const LiquidSur
     }
     return restored;
 }
+inline QJsonArray tightenTickSuffixBoxes(const cv::Mat& image,const QJsonArray& tokens) {
+    QJsonArray result;
+    for(const auto& entry:tokens) {
+        auto token=entry.toObject();const auto text=token["text"].toString();
+        if(image.empty()||!token.value("raw_text").toString().endsWith('-')||!text.contains('.')||token.value("glyph_bounds_refined").toBool()) {result.append(token);continue;}
+        std::vector<cv::Point> polygon;for(const auto& v:token["polygon"].toArray())polygon.emplace_back(v.toArray()[0].toInt(),v.toArray()[1].toInt());
+        if(polygon.size()!=4){result.append(token);continue;}
+        const auto box=cv::boundingRect(polygon)&cv::Rect(0,0,image.cols,image.rows);
+        if(box.width<8||box.height<8){result.append(token);continue;}
+        cv::Mat gray,ink,labels,stats,centroids;
+        if(image.channels()==1)gray=image(box);else cv::cvtColor(image(box),gray,cv::COLOR_BGR2GRAY);
+        cv::adaptiveThreshold(gray,ink,255,cv::ADAPTIVE_THRESH_GAUSSIAN_C,cv::THRESH_BINARY_INV,31,9);
+        const int count=cv::connectedComponentsWithStats(ink,labels,stats,centroids);
+        std::vector<cv::Rect> glyphs;
+        for(int i=1;i<count;++i) {
+            const cv::Rect r(stats.at<int>(i,0),stats.at<int>(i,1),stats.at<int>(i,2),stats.at<int>(i,3));
+            if(r.height>=box.height*.45&&r.height<=box.height*.98&&r.width>=r.height*.15&&r.width<=r.height*1.1&&stats.at<int>(i,4)>=r.area()*.08)glyphs.push_back(r);
+        }
+        const int digits=std::count_if(text.begin(),text.end(),[](QChar c){return c.isDigit();});
+        if(digits>=2&&int(glyphs.size())==digits) {
+            std::sort(glyphs.begin(),glyphs.end(),[](const cv::Rect& a,const cv::Rect& b){return a.x<b.x;});
+            bool aligned=true;cv::Rect tight=glyphs.front();
+            for(size_t i=1;i<glyphs.size();++i) {
+                aligned&=std::abs(glyphs[i].y-glyphs[0].y)<glyphs[0].height*.2&&
+                    glyphs[i].height>=glyphs[0].height*.7&&glyphs[i].height<=glyphs[0].height*1.3&&
+                    glyphs[i].x>=glyphs[i-1].br().x&&glyphs[i].x-glyphs[i-1].br().x<glyphs[0].height*.7;
+                tight|=glyphs[i];
+            }
+            if(aligned&&tight.area()<box.area()*.65) {
+                tight=(cv::Rect(tight.x-3,tight.y-3,tight.width+6,tight.height+6)&cv::Rect(0,0,box.width,box.height));tight.x+=box.x;tight.y+=box.y;
+                token["polygon"]=QJsonArray{QJsonArray{tight.x,tight.y},QJsonArray{tight.br().x,tight.y},QJsonArray{tight.br().x,tight.br().y},QJsonArray{tight.x,tight.br().y}};
+                token["glyph_bounds_refined"]=true;
+            }
+        }
+        result.append(token);
+    }
+    return result;
+}
 inline Recognition recognize(const cv::Mat& image,const std::shared_ptr<std::atomic_bool>& cancelled,const LiquidSurface& surface={},cv::Rect bounds={}) {
     Recognition result;
     try {
@@ -104,7 +142,8 @@ inline Recognition recognize(const cv::Mat& image,const std::shared_ptr<std::ato
             result.error=QStringLiteral(u"PaddleOCR 识别失败：%1。使用的 Python：%2。请检查 OCR 环境及模型配置。")
                 .arg(data["error"].toString(QStringLiteral(u"响应文件不可读")),python);return result;
         }
-        result.tokens=(surface.found||region.top||region.left)?restoreTokens(data["tokens"].toArray(),region.top,surface,region.left):data["tokens"].toArray();return result;
+        result.tokens=(surface.found||region.top||region.left)?restoreTokens(data["tokens"].toArray(),region.top,surface,region.left):data["tokens"].toArray();
+        result.tokens=tightenTickSuffixBoxes(image,result.tokens);return result;
     } catch(const std::exception& error) {result.error=QString::fromUtf8(error.what());return result;}
 }
 // Upright dial inspection accepts the built-in 0..2 vocabulary in steps of 0.1.
@@ -122,7 +161,7 @@ inline const std::vector<double>& builtInDialValues() {
     return values;
 }
 inline QJsonArray numericTokens(const QJsonArray& tokens,const std::vector<double>& allowedValues=builtInDialValues()) {
-    const QRegularExpression numeric(QStringLiteral("^[+-]?(?:[0-9]+(?:\\.[0-9]*)?|\\.[0-9]+)$"));
+    const QRegularExpression numeric(QStringLiteral("^(?:[0-9]+(?:\\.[0-9]*)?|\\.[0-9]+)$"));
     struct Candidate {QJsonObject token;cv::Point2f center;double extent;cv::Rect bounds;};
     std::vector<Candidate> candidates;
     for(const auto& entry:tokens) {
@@ -172,9 +211,18 @@ inline QJsonArray numericTokens(const QJsonArray& tokens,const std::vector<doubl
         const auto glyph=candidate.token["text"].toString();
         if(glyph.size()==1 && std::any_of(candidates.begin(),candidates.end(),[&](const Candidate& label){
             const auto text=label.token["text"].toString();
-            return text.contains('.') && text.contains(glyph) && label.token["score"].toDouble()>=.9 &&
-                candidate.bounds.width<.65*label.bounds.width &&
-                (candidate.bounds & label.bounds).area()>=.8*candidate.bounds.area();
+            // A complete accepted decimal label takes precedence over one of
+            // its glyphs, even when the isolated zero scores more highly.
+            if(!text.contains('.')||!text.contains(glyph))return false;
+            const auto overlap=(candidate.bounds & label.bounds).area();
+            const bool fragment=label.token["score"].toDouble()>=.65 &&
+                candidate.bounds.width<.65*label.bounds.width && overlap>=.8*candidate.bounds.area();
+            // A broad detector crop may read just "2" while enclosing a
+            // separately verified full "0.2" label plus needle/tick ink.
+            const bool broadMisread=label.token["score"].toDouble()>=.9 &&
+                label.token["score"].toDouble()>=candidate.token["score"].toDouble()+.05 &&
+                label.bounds.area()<candidate.bounds.area()*.65 && overlap>=.8*label.bounds.area();
+            return fragment||broadMisread;
         }))continue;
         const bool duplicate=std::any_of(selected.begin(),selected.end(),[&](const Candidate& existing){
             return cv::norm(candidate.center-existing.center)<std::min(candidate.extent,existing.extent)*.4;

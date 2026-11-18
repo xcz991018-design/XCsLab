@@ -57,10 +57,12 @@ class NumericTextTests(unittest.TestCase):
         self.assertEqual(numeric_text("80"), "80")
         self.assertEqual(numeric_text("90"), "90")
     def test_negative_sign_preserved_for_later_filter(self):
-        self.assertEqual(numeric_text("-0.2"), "-0.2")
+        self.assertEqual(numeric_text("-0.2"), "")
+        for text in ("+0.2", "0.2%", "0..2", "2MPa", "1/2", "0,2"):
+            self.assertEqual(numeric_text(text), "")
     def test_full_width_decimal(self):
         self.assertEqual(numeric_text(" 0．6 "), "0.6")
-        self.assertEqual(numeric_text("MPa-"), "MPa-")
+        self.assertEqual(numeric_text("MPa-"), "")
 
 class NarrowDigitTests(unittest.TestCase):
     def test_short_serif_digit_survives_decimal_box_height(self):

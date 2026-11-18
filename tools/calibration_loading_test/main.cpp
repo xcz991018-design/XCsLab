@@ -6,6 +6,7 @@
 #include "CameraInfoEditDialog.hpp"
 #include "CameraUndistortion.hpp"
 #include "GaugeReaderEngine.hpp"
+#include "PointerOcclusion.hpp"
 #include <QApplication>
 #include <QFontDatabase>
 #include <QEventLoop>
@@ -30,6 +31,14 @@ static void benchmarkCalibration(const QString& outputPath, const QStringList& i
         require(!raw.empty(),"cannot load benchmark image");
         qInfo().noquote()<<"benchmark image"<<path;
         GaugeProfile profile;
+        const auto profilePath=qEnvironmentVariable("GAUGE_TEST_CALIBRATION_PROFILE");
+        if(!profilePath.isEmpty()) {
+            QFile config(profilePath);
+            require(config.open(QIODevice::ReadOnly),"cannot read calibration replay profile");
+            const auto frozen=QJsonDocument::fromJson(config.readAll()).object();
+            const auto definition=frozen.contains("profile")?frozen["profile"].toObject():frozen;
+            require(profile.loadFromJson(definition),"invalid calibration replay profile");
+        }
         QElapsedTimer timer;
         timer.start();
         CardinalSelectorDialog dialog(raw,profile);
@@ -45,17 +54,73 @@ static void benchmarkCalibration(const QString& outputPath, const QStringList& i
             QThread::msleep(2);
         }
         const auto elapsed=timer.elapsed();
-        const auto minor=preview->minorPreview();
+        auto minor=preview->minorPreview();
         QJsonArray corners;
         for (const auto& p:dialog.findChild<InteractiveImageLabel*>("perspectiveImage")->getPoints())
             corners.append(QJsonArray{p.x,p.y});
         const auto hub=preview->getCenterPoint();
+        QJsonArray minorDiagnostics,minorMarks;
+        if(qEnvironmentVariableIsSet("GAUGE_TEST_MINOR_DIAGNOSTICS")) {
+            std::vector<cv::Point2f> sourceCorners;
+            for(const auto& p:corners)sourceCorners.emplace_back(p.toArray()[0].toDouble(),p.toArray()[1].toDouble());
+            const float mid=profile.rectified_size*.5f,margin=float(profile.rectified_margin);
+            const auto H=cv::getPerspectiveTransform(sourceCorners,std::vector<cv::Point2f>{{mid,margin},{2*mid-margin,mid},{mid,2*mid-margin},{margin,mid}});
+            const cv::Mat inverse=H.inv();
+            QJsonArray anchors;
+            for(const auto& p:preview->getScalePoints())if(!p.toObject()["source"].toString().startsWith("minor_tick"))anchors.append(p);
+            std::vector<cv::Point2f> sourceHub{hub};cv::perspectiveTransform(sourceHub,sourceHub,inverse);
+            auto frozen=profile;
+            frozen.center=CameraUndistortion::point(sourceHub.front(),raw.size(),true);
+            frozen.perspective_pts=CameraUndistortion::points(sourceCorners,raw.size(),true);
+            frozen.scalePoints=CameraUndistortion::scales(ScaleCalibration::transformed(anchors,inverse),raw.size(),true);
+            frozen.perspective_correction_enabled=true;frozen.auto_detect_roi=false;
+            frozen.calibrated_width=raw.cols;frozen.calibrated_height=raw.rows;
+            frozen.min_val=dialog.findChild<QDoubleSpinBox*>("ocrRangeMinimum")->value();
+            frozen.max_val=dialog.findChild<QDoubleSpinBox*>("ocrRangeMaximum")->value();
+            frozen.pointerBaseRadius=preview->getPointerBaseRadius()/RectifiedResolution::scale(profile);
+            const auto reading=GaugeReaderEngine().process(raw,frozen,GaugeRunMode::Evidence);
+            const auto mask=pointerOcclusionMask(reading.pointerDetectorResult,reading.step2_rectified.size());
+            minor=MinorTickPreview::detect(reading.step2_rectified,anchors,hub,mid-margin,frozen.min_val,frozen.max_val,
+                frozen.clockwise,preview->liquidSurface(),reading.pointer_angle_deg,0,&minorDiagnostics,{},mask);
+            cv::imwrite((outputPath+"-pointer-mask.png").toStdString(),mask);
+            for(const auto& m:minor.marks) {
+                const auto p=(m.a+m.b)*.5f;
+                minorMarks.append(QJsonObject{{"x",p.x},{"y",p.y},{"ratio",m.ratio},{"assigned",m.assigned},{"confidence",m.confidence},{"inferred",m.inferred}});
+            }
+            if(qEnvironmentVariableIsSet("GAUGE_TEST_OCCLUDED_PREFIX")) {
+                require(minor.divisionConfirmed,"occluded prefix requires a validated global division");
+                for(double ratio:{.22,.24,.26,.30})
+                    require(std::any_of(minor.marks.begin(),minor.marks.end(),[&](const MinorTickPreview::Mark& m){
+                        return m.assigned&&std::abs(m.ratio-ratio)<1e-6;
+                    }),"visible anchor-side ticks must survive an irregular pointer-adjacent stroke");
+                require(std::none_of(minor.marks.begin(),minor.marks.end(),[](const MinorTickPreview::Mark& m){
+                    return m.assigned&&std::abs(m.ratio-.28)<1e-6;
+                }),"irregular pointer-adjacent stroke must remain unassigned");
+                if(qEnvironmentVariableIsSet("GAUGE_TEST_INFERRED_POINTER_TICK"))
+                    require(std::any_of(minor.previewPoints.begin(),minor.previewPoints.end(),[](const QJsonValue& p){
+                        return p.toObject()["source"].toString()=="minor_tick_inferred"&&std::abs(p.toObject()["ratio"].toDouble()-.28)<1e-6;
+                    }),"single pointer-occluded tick must be filled with explicit inference provenance");
+                require(ScaleCalibration::valid(minor.previewPoints,reading.step2_rectified.cols,reading.step2_rectified.rows,hub),
+                    "occluded prefix must preserve a valid ordered calibration");
+            }
+            if(qEnvironmentVariableIsSet("GAUGE_TEST_LOCAL_ESTIMATE")) {
+                require(!minor.divisionConfirmed,"ambiguous global division must remain unconfirmed");
+                require(std::none_of(minor.marks.begin(),minor.marks.end(),[](const MinorTickPreview::Mark& m){return m.assigned;}),
+                    "provisional local numbering must not confirm measurements");
+                require(std::any_of(minor.marks.begin(),minor.marks.end(),[](const MinorTickPreview::Mark& m){
+                    const auto p=(m.a+m.b)*.5f;return cv::norm(p-cv::Point2f(501,525))<3&&std::abs(m.ratio-.3)<1e-6;
+                }),"visible 0.30 stroke must use the local measured pitch");
+                require(std::none_of(minor.previewPoints.begin(),minor.previewPoints.end(),[](const QJsonValue& p){
+                    return p.toObject()["source"].toString().startsWith("minor_tick");
+                }),"unconfirmed local estimates must not enter saved calibration proposals");
+            }
+        }
         const QJsonObject result{{"corners",corners},{"hub",QJsonArray{hub.x,hub.y}},
             {"ocr",preview->ocrNumbers()},{"scale_points",preview->getScalePoints()},
             {"range_min",dialog.findChild<QDoubleSpinBox*>("ocrRangeMinimum")->value()},
             {"range_max",dialog.findChild<QDoubleSpinBox*>("ocrRangeMaximum")->value()},
             {"preview_division",minor.division},{"preview_confirmed",minor.divisionConfirmed},{"preview_points",minor.previewPoints},
-            {"message",minor.message},{"stop",status->text()}};
+            {"message",minor.message},{"minor_diagnostics",minorDiagnostics},{"minor_marks",minorMarks},{"stop",status->text()}};
         const QByteArray record=QJsonDocument(QJsonObject{{"image",path},{"elapsed_ms",double(elapsed)},
             {"result",result}}).toJson(QJsonDocument::Compact)+'\n';
         require(output.write(record)==record.size() && output.flush(),"cannot write benchmark result");
@@ -64,6 +129,22 @@ static void benchmarkCalibration(const QString& outputPath, const QStringList& i
 
 int main(int argc, char** argv) {
     QApplication app(argc, argv);
+    if(app.arguments().contains("--retry-test")) {
+        try {
+        GaugeProfile profile;CardinalSelectorDialog dialog({},profile,"retry-test");
+        dialog.show();QApplication::processEvents();
+        auto* retry=dialog.findChild<QPushButton*>("retryCalibrationButton");
+        require(retry&&!retry->isHidden()&&!retry->isEnabled(),"retry must wait while capture is pending");
+        int requests=0;QObject::connect(&dialog,&CardinalSelectorDialog::retryCaptureRequested,[&]{++requests;});
+        dialog.showAcquisitionError("fixture capture failure");
+        require(retry->isEnabled(),"capture failure must enable retry");retry->click();
+        require(requests==1&&dialog.awaitingFrame()&&!retry->isEnabled(),"retry must request a new frame and prevent duplicate capture");
+        retry->click();require(requests==1,"busy retry must not queue another capture");
+        dialog.showAcquisitionError("fixture second capture failure");retry->click();
+        require(requests==2&&dialog.awaitingFrame(),"repeated acquisition failures must remain retryable");
+        std::cout<<"PASS: fresh capture request, retry after errors and duplicate-request prevention"<<std::endl;return 0;
+        } catch(const std::exception& error) {std::cerr<<error.what()<<std::endl;return 1;}
+    }
     try {
         GaugeReaderEngine engine;
         cv::Mat source(800,800,CV_8UC3);cv::randu(source,0,256);

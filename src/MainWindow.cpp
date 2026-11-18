@@ -1517,6 +1517,19 @@ void MainWindow::onCalibrateCardinalPoints() {
     m_liveCalibrationDialog=dialog;m_calibrationDialogOpen=true;
     dialog->setAttribute(Qt::WA_DeleteOnClose);
     dialog->setWindowModality(Qt::WindowModal);
+    connect(dialog,&CardinalSelectorDialog::retryCaptureRequested,this,[this,cameraId,dialog]{
+        if(m_liveCalibrationDialog!=dialog)return;
+        if(m_calibrationCaptureCancel)m_calibrationCaptureCancel->store(true);
+        ++m_cameraConnectionGeneration;
+        m_calibrationCaptureCancel=std::make_shared<std::atomic<bool>>(false);
+        m_calibrationSnapshot=FrameCaptureResult();m_calibrationSnapshotCamera.clear();
+        m_calibrationSnapshotLoading=false;m_calibrationQueries.clear();m_calibrationChecked.remove(cameraId);
+        m_pendingCalibrationCamera=cameraId;
+        applyCameraCalibrationAndProfile(cameraId);
+        m_discoveryService->deferHealthForCapture(cameraId);
+        m_statusLabel->setText(tr("正在重新获取设备 %1 的标定图片…").arg(cameraId));
+        requestCalibrationSnapshot(cameraId);checkCameraCalibration(cameraId);tryOpenCameraCalibration();
+    });
     connect(dialog,&QDialog::finished,this,[this,cameraId,dialog,sessionProfile](int result){
         if(m_liveCalibrationDialog!=dialog)return;
         if(m_calibrationCaptureCancel)m_calibrationCaptureCancel->store(true);

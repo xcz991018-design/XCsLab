@@ -253,10 +253,11 @@ inline Calibration calibrate(const cv::Mat& image,const QJsonArray& tokens,cv::P
     using namespace AutoScaleCalibration;
     Calibration result;
     if(surface.ambiguous){result.error=QStringLiteral(u"液面位置有歧义，请先确认液面；原刻度标定保留。");return result;}
-    const auto reliable=reliableNumbers(tokens,surface);
+    const auto refined=PaddleScaleOcr::tightenTickSuffixBoxes(image,tokens);
+    const auto reliable=reliableNumbers(refined,surface);
     result.range=detect(reliable,center,image.cols);
     if(!result.range.valid){result.error=QStringLiteral(u"液面下方缺少可靠的左下、右下端点数字，原标定保留。");return result;}
-    const auto majors=majorTicks(image,PaddleScaleOcr::numericTokens(tokens),center,radius,surface);
+    const auto majors=majorTicks(image,PaddleScaleOcr::numericTokens(refined),center,radius,surface);
     const auto printed=printedRing(majors,center,radius);
     std::vector<Tick> ticks;std::vector<double> shapeScores;
     for(const auto& m:majors){ticks.push_back(m.tick);shapeScores.push_back(std::clamp(m.innerWidth/std::max(1.,m.outerWidth)-1.,0.,2.)*.8);}

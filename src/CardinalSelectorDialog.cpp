@@ -199,7 +199,10 @@ void InteractiveImageLabel::paintEvent(QPaintEvent *event) {
         painter.setPen(QPen(mark.gap?QColor("#ff9e38"):(mark.assigned?QColor("#69d5ff"):QColor("#dc79ff")),2,
                             mark.gap?Qt::DashLine:Qt::SolidLine));
         painter.drawLine(mapToCanvas(mark.a),mapToCanvas(mark.b));
-        painter.drawText(mapToCanvas(mark.b)+QPointF(3,3),(mark.ratio>=0?(mark.assigned?QString():tr("估计 "))+MinorTickPreview::displayValue(m_rangeMinimum+mark.ratio*(m_rangeMaximum-m_rangeMinimum))+" / ":(mark.gap?QString():tr("待定 / ")))+QString::number(qRound(mark.confidence*100))+"%");
+        const QString label=mark.inferred?
+            tr("推算 %1").arg(MinorTickPreview::displayValue(m_rangeMinimum+mark.ratio*(m_rangeMaximum-m_rangeMinimum))):
+            (mark.ratio>=0?(mark.assigned?QString():tr("估计 "))+MinorTickPreview::displayValue(m_rangeMinimum+mark.ratio*(m_rangeMaximum-m_rangeMinimum))+" / ":(mark.gap?QString():tr("待定 / ")))+QString::number(qRound(mark.confidence*100))+"%";
+        painter.drawText(mapToCanvas(mark.b)+QPointF(3,3),label);
     }
     const bool hasCenter=m_centerPt.x>0 && m_centerPt.y>0;
     const QPointF centerCp=mapToCanvas(m_centerPt);
@@ -207,15 +210,16 @@ void InteractiveImageLabel::paintEvent(QPaintEvent *event) {
         const auto value=m_scalePoints[index];
         const auto p=value.toObject(); const QPointF cp=mapToCanvas({float(p["x"].toDouble()),float(p["y"].toDouble())});
         const bool selected=index==m_selectedScale;
-        const QColor color=selected?QColor("#ffb74d"):QColor(100,255,100);
-        painter.setPen(QPen(color,selected?3:1.5)); painter.setBrush(color);
+        const bool inferred=p["source"].toString()=="minor_tick_inferred";
+        const QColor color=selected||inferred?QColor("#ffb74d"):QColor(100,255,100);
+        painter.setPen(QPen(color,selected?3:1.5,inferred?Qt::DashLine:Qt::SolidLine)); painter.setBrush(color);
         const double ratio=p["ratio"].toDouble();
-        const bool labelled=p["source"].toString()=="minor_tick" || m_scalePoints.size()<=20 || std::abs(ratio*10-std::round(ratio*10))<1e-7;
+        const bool labelled=inferred || p["source"].toString()=="minor_tick" || m_scalePoints.size()<=20 || std::abs(ratio*10-std::round(ratio*10))<1e-7;
         if(hasCenter && (labelled||selected)) painter.drawLine(centerCp,cp);
         painter.drawEllipse(cp,selected?5:3,selected?5:3);
         if(labelled||selected) painter.drawText(cp+QPointF(7,-7),(m_hasScaleRange?
             tr("%1 刻度%2").arg(m_rangeMinimum+ratio*(m_rangeMaximum-m_rangeMinimum),0,'g',6):
-            tr("%1% 刻度%2").arg(ratio*100,0,'f',1)).arg(selected?tr("（已选中，可删除）"):QString()));
+            tr("%1% 刻度%2").arg(ratio*100,0,'f',1)).arg((inferred?tr("（推算）"):QString())+(selected?tr("（已选中，可删除）"):QString())));
     }
     // Draw 5th point (Dial Center Pin 🎯)
     if (hasCenter) {
@@ -416,7 +420,9 @@ void CardinalSelectorDialog::showAcquisitionError(const QString& reason) {
     setAutoDetectionBusy(true);m_autoProgress->hide();
     m_autoProgressLabel->setText(tr("标定准备失败：%1").arg(reason));
     m_interactiveLabel->setText(tr("无法获取标定图片"));
-    m_saveStatus->setText(tr("%1。请关闭窗口后重试，原标定未修改。").arg(reason));
+    m_saveStatus->setText(tr("%1。可点击重试重新取图，原标定未修改。").arg(reason));
+    m_autoDetectRunning=false;
+    m_retryBtn->setEnabled(true);
 }
 
 void CardinalSelectorDialog::setCapturedFrame(const cv::Mat& frame) {
@@ -523,7 +529,6 @@ void CardinalSelectorDialog::setupUi() {
     originalHeader->addStretch();
     auto* exportOriginal=new QPushButton(tr("保存标定原图"),this);
     exportOriginal->setObjectName("exportCalibrationOriginalButton");
-    exportOriginal->setToolTip(tr("保存本窗口实际使用的冻结原图，不含缩放、矫正或标记。"));
     originalHeader->addWidget(exportOriginal);leftLayout->addLayout(originalHeader);
     connect(exportOriginal,&QPushButton::clicked,this,[this]{
         const auto path=QFileDialog::getSaveFileName(this,tr("保存本次标定实际原图"),
@@ -562,15 +567,12 @@ void CardinalSelectorDialog::setupUi() {
     auto* autoScaleLayout=new QHBoxLayout;
     m_autoScaleBtn=new QPushButton(tr("识别表盘数字（PaddleOCR）"),this);
     m_autoScaleBtn->setObjectName("autoCalibrateScaleButton");
-    m_autoScaleBtn->setToolTip(tr("识别左下、右下数字设置量程，并在数字外侧寻找真实大刻度线，自动标定起止角度；结果可手动修正。"));
     autoScaleLayout->addWidget(m_autoScaleBtn);
     m_minorPreviewBtn=new QPushButton(tr("小刻度识别与预览"),this);
-    m_minorPreviewBtn->setToolTip(tr("使用已有大刻度锚点分析小刻度；紫色为候选，橙色虚线为推断缺口，可在保存时采用已确认小刻度，估计值与缺口不保存。"));
     autoScaleLayout->addWidget(m_minorPreviewBtn);
     auto* minorOptions=new QHBoxLayout;
     minorOptions->addWidget(new QLabel(tr("小刻度分度（0=自动）"),this));
     m_minorDivision=new QDoubleSpinBox(this);m_minorDivision->setDecimals(6);m_minorDivision->setRange(0,1e9);m_minorDivision->setSingleStep(.01);
-    m_minorDivision->setToolTip(tr("自动推断有歧义时，填写表盘实际最小分度，再点击小刻度识别与预览。"));
     m_minorDivision->setMaximumWidth(130);minorOptions->addWidget(m_minorDivision);
     connect(m_minorDivision,QOverload<double>::of(&QDoubleSpinBox::valueChanged),this,[this](double){m_previewLabel->clearMinorPreview();});
     m_saveMinorTicks=new QCheckBox(tr("保存时采用已确认小刻度"),this);m_saveMinorTicks->setChecked(true);
@@ -637,8 +639,6 @@ void CardinalSelectorDialog::setupUi() {
     auto* deleteSelected=new QPushButton(tr("删除选中刻度点"),this);
     deleteSelected->setObjectName("deleteSelectedIntermediateScaleButton");
     deleteSelected->setEnabled(false);
-    deleteSelected->setToolTip(tr("点击右图的中间刻度线或刻度点选中，再点击此按钮或按 Delete 删除。"));
-    m_previewLabel->setToolTip(tr("点击中间刻度线或刻度点可选中，按 Delete 删除；最小、最大刻度不可单独删除。"));
     connect(m_previewLabel,&InteractiveImageLabel::scaleSelectionChanged,this,[this,deleteSelected] {
         deleteSelected->setEnabled(m_previewLabel->hasSelectedIntermediateScale());
     });
@@ -710,6 +710,22 @@ void CardinalSelectorDialog::setupUi() {
     m_manualEditBtn=new QPushButton(tr("手动修改"),this);
     m_manualEditBtn->setObjectName("manualEditCalibrationButton");
     m_manualEditBtn->setVisible(!m_historicalSession);
+    m_retryBtn=new QPushButton(tr("重试：重新取图标定"),this);
+    m_retryBtn->setObjectName("retryCalibrationButton");
+    m_retryBtn->setVisible(!m_historicalSession&&!m_cameraId.isEmpty());
+    connect(m_retryBtn,&QPushButton::clicked,this,[this]{
+        if(m_saving||m_autoDetectRunning)return;
+        m_awaitingFrame=true;m_perspectiveConfirmed=false;m_centerConfirmed=false;
+        m_automaticReviewMode=true;
+        m_automaticAttemptFailed=false;m_endpointReviewRequired=false;m_manualLiquidSurface=false;
+        m_sourceScalePoints={};m_currentPts.clear();m_inverseHomography.release();
+        m_rawFrame.release();m_frame.release();
+        m_interactiveLabel->setImageAndPoints({},{});m_previewLabel->setImageAndPoints({},{});
+        m_previewLabel->setScalePoints({});setAutoDetectionBusy(true);
+        m_autoProgress->show();m_autoProgressLabel->setText(tr("正在重新获取高清标定图片…"));
+        m_saveStatus->setText(tr("重新取图后将从头开始自动标定。"));
+        emit retryCaptureRequested();
+    });
     connect(m_manualEditBtn,&QPushButton::clicked,this,[this]{setManualEditing(m_automaticReviewMode);});
 
     m_saveBtn->setObjectName("saveCalibrationButton");
@@ -735,6 +751,7 @@ void CardinalSelectorDialog::setupUi() {
     btnLayout->addWidget(m_confirmPerspectiveBtn);
     btnLayout->addStretch();
     btnLayout->addWidget(m_manualEditBtn);
+    btnLayout->addWidget(m_retryBtn);
     btnLayout->addWidget(m_saveBtn);
     btnLayout->addWidget(m_cancelBtn);
 
@@ -776,6 +793,7 @@ void CardinalSelectorDialog::setupUi() {
         for(auto* layout:{autoScaleLayout,minorOptions,rangeLayout,btnLayout})hideLayout(hideLayout,layout);
         m_scaleControls->hide();m_liquidControls->hide();
         m_scaleStatus->hide();m_geometryStatus->hide();m_geometryAcknowledged->hide();
+        m_retryBtn->setVisible(!m_cameraId.isEmpty());
     }
 }
 
@@ -990,6 +1008,7 @@ void CardinalSelectorDialog::setAutoDetectionBusy(bool busy) {
     m_minorDivision->setEnabled(!busy);m_saveMinorTicks->setEnabled(!busy);
     m_minorPreviewBtn->setEnabled(!busy&&m_perspectiveConfirmed&&m_centerConfirmed);
     m_manualEditBtn->setEnabled(!busy);
+    m_retryBtn->setEnabled(!busy&&!m_saving);
     m_scaleControls->setEnabled(!busy&&m_perspectiveConfirmed);
     m_liquidControls->setEnabled(!busy&&m_perspectiveConfirmed);
     m_baseRadiusSpinBox->setEnabled(!busy&&m_perspectiveConfirmed);
@@ -1013,7 +1032,7 @@ void CardinalSelectorDialog::onMinorTickPreview() {
         });
     } catch(const cv::Exception& error){m_saveStatus->setText(QString::fromUtf8(error.what()));return;}
     QJsonArray anchors;
-    for(const auto& p:m_previewLabel->getScalePoints())if(p.toObject()["source"].toString()!="minor_tick")anchors.append(p);
+    for(const auto& p:m_previewLabel->getScalePoints())if(!p.toObject()["source"].toString().startsWith("minor_tick"))anchors.append(p);
     const auto center=m_previewLabel->getCenterPoint();
     // Minor calibration always excludes detected liquid; display preferences
     // must not permit refracted upper strokes to enter the calibration.
@@ -1344,6 +1363,10 @@ void CardinalSelectorDialog::onSaveAndApply() {
         const auto proposal=m_previewLabel->minorPreview();
         if(proposal.divisionConfirmed&&std::any_of(proposal.marks.begin(),proposal.marks.end(),[](const MinorTickPreview::Mark& m){return m.assigned;})) {
             adoptedCoverage=proposal.coverage;
+            const int inferred=int(std::count_if(proposal.previewPoints.begin(),proposal.previewPoints.end(),[](const QJsonValue& p){
+                return p.toObject()["source"].toString()=="minor_tick_inferred";
+            }));
+            if(inferred)adoptedCoverage.append(tr("指针遮挡处推算补齐 %1 条（橙色虚线）").arg(inferred));
             m_previewLabel->setScalePoints(proposal.previewPoints);
         }
     }

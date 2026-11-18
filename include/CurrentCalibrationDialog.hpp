@@ -46,7 +46,7 @@ public:
         row(tr("轴心"),tr("轴帽屏蔽半径 %1（800 像素基准）").arg(device.pointerBaseRadius),device.centerX,device.centerY);
         for(const auto& value:device.scalePoints) {
             const auto p=value.toObject();const double lo=device.meterRange["min_val"].toDouble(),hi=device.meterRange["max_val"].toDouble();
-            row(tr("刻度 %1").arg(MinorTickPreview::displayValue(lo+(hi-lo)*p["ratio"].toDouble())),p["source"].toString()=="minor_tick"?tr("小刻度"):tr("大刻度 / 锚点"),p["x"].toDouble(),p["y"].toDouble());
+            row(tr("刻度 %1").arg(MinorTickPreview::displayValue(lo+(hi-lo)*p["ratio"].toDouble())),p["source"].toString()=="minor_tick_inferred"?tr("小刻度（指针遮挡推算）"):(p["source"].toString()=="minor_tick"?tr("小刻度"):tr("大刻度 / 锚点")),p["x"].toDouble(),p["y"].toDouble());
         }
         render({});return true;
     }

@@ -108,6 +108,8 @@ public:
     void showCapturedPreview(const cv::Mat& frame);
     void showAcquisitionError(const QString& reason);
     bool awaitingFrame() const { return m_awaitingFrame; }
+signals:
+    void retryCaptureRequested();
 
 private slots:
     void onPointsUpdated();
@@ -177,6 +179,7 @@ private:
     bool m_automaticReviewMode{false};
     bool m_automaticAttemptFailed{false};
     QPushButton* m_manualEditBtn{nullptr};
+    QPushButton* m_retryBtn{nullptr};
     std::vector<QWidget*> m_manualWidgets;
 };
 

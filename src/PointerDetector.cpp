@@ -1582,8 +1582,11 @@ RadialDirectionProfile PointerDetector::evaluateRadialDirectionProfile(
     // Scale that quality by observed body coverage. This is a soft score: an
     // occluded needle remains eligible, while a short clean fragment cannot
     // receive the same evidence weight as a long coherent pair of edges.
+    // Apply coverage quadratically: a short counterweight seam can score well
+    // on local geometry, but supplies too little span to establish the needle.
     const double referenceBodyLength = std::max(m_config.minCommonLengthPx, maxLenPossible * 0.5);
-    prof.bodyScore *= std::clamp(prof.validLength / std::max(1.0, referenceBodyLength), 0.0, 1.0);
+    const double bodyCoverage = std::clamp(prof.validLength / std::max(1.0, referenceBodyLength), 0.0, 1.0);
+    prof.bodyScore *= bodyCoverage * bodyCoverage;
 
     // Section XVI: First Layer Geometry Gate check - ABSOLUTE HARD REJECTION
     // If the candidate region failed geometric validation (not long, not parallel, not straight, or not starting at base),
