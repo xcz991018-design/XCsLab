@@ -127,10 +127,12 @@ private:
     void setManualEditing(bool enabled);
     void setAutoDetectionBusy(bool busy);
     void startAutoDetection(bool cornersOnly);
+    void startMinorTickCalibration(bool saveAutomatically);
     void finishAutomaticFailure(const QString& reason);
     bool m_autoSaved{false};
     bool m_awaitingFrame{true};
     std::pair<cv::Point2f,QJsonArray> sourceAnnotations() const;
+    std::pair<cv::Point2f,QJsonArray> sourceAnnotations(const QJsonArray& rectifiedScales) const;
 
     cv::Mat m_rawFrame;
     cv::Mat m_frame;
@@ -162,9 +164,10 @@ private:
     QLabel* m_scaleStatus{nullptr};
     QPushButton* m_minorPreviewBtn{nullptr};
     QDoubleSpinBox* m_minorDivision{nullptr};
-    QCheckBox* m_saveMinorTicks{nullptr};
     QLabel* m_geometryStatus{nullptr};
     QCheckBox* m_geometryAcknowledged{nullptr};
+    QCheckBox* m_majorRefinement{nullptr};
+    QLabel* m_rectificationReport{nullptr};
     QByteArray m_geometryReviewSignature;
     QWidget* m_liquidControls{nullptr};
     QCheckBox* m_liquidMaskEnabled{nullptr};
@@ -178,6 +181,7 @@ private:
     bool m_historicalSession{false};
     bool m_automaticReviewMode{false};
     bool m_automaticAttemptFailed{false};
+    int m_automaticFrameRetries{0};
     QPushButton* m_manualEditBtn{nullptr};
     QPushButton* m_retryBtn{nullptr};
     std::vector<QWidget*> m_manualWidgets;

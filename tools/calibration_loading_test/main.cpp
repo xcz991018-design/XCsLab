@@ -59,6 +59,10 @@ static void benchmarkCalibration(const QString& outputPath, const QStringList& i
         for (const auto& p:dialog.findChild<InteractiveImageLabel*>("perspectiveImage")->getPoints())
             corners.append(QJsonArray{p.x,p.y});
         const auto hub=preview->getCenterPoint();
+        const auto readingPoints=MinorTickPreview::readingAnchors(minor,ScaleCalibration::majorAnchors(preview->getScalePoints()),
+            {profile.rectified_size,profile.rectified_size},hub,
+            dialog.findChild<QDoubleSpinBox*>("ocrRangeMaximum")->value()-dialog.findChild<QDoubleSpinBox*>("ocrRangeMinimum")->value(),
+            profile.clockwise);
         QJsonArray minorDiagnostics,minorMarks;
         if(qEnvironmentVariableIsSet("GAUGE_TEST_MINOR_DIAGNOSTICS")) {
             std::vector<cv::Point2f> sourceCorners;
@@ -115,8 +119,8 @@ static void benchmarkCalibration(const QString& outputPath, const QStringList& i
                 }),"unconfirmed local estimates must not enter saved calibration proposals");
             }
         }
-        const QJsonObject result{{"corners",corners},{"hub",QJsonArray{hub.x,hub.y}},
-            {"ocr",preview->ocrNumbers()},{"scale_points",preview->getScalePoints()},
+        const QJsonObject result{{"geometry_report",dialog.findChild<QLabel*>("rectificationValidationReport")->text()},{"corners",corners},{"hub",QJsonArray{hub.x,hub.y}},
+            {"ocr",preview->ocrNumbers()},{"scale_points",preview->getScalePoints()},{"reading_points",readingPoints},
             {"range_min",dialog.findChild<QDoubleSpinBox*>("ocrRangeMinimum")->value()},
             {"range_max",dialog.findChild<QDoubleSpinBox*>("ocrRangeMaximum")->value()},
             {"preview_division",minor.division},{"preview_confirmed",minor.divisionConfirmed},{"preview_points",minor.previewPoints},
@@ -129,6 +133,25 @@ static void benchmarkCalibration(const QString& outputPath, const QStringList& i
 
 int main(int argc, char** argv) {
     QApplication app(argc, argv);
+    if(app.arguments().contains("--automatic-retry-test")) {
+        try {
+            GaugeProfile profile;CardinalSelectorDialog dialog({},profile,"automatic-retry");
+            dialog.show();QApplication::processEvents();
+            int requests=0;
+            QObject::connect(&dialog,&CardinalSelectorDialog::retryCaptureRequested,[&]{
+                ++requests;
+                QTimer::singleShot(0,&dialog,[&]{dialog.showAcquisitionError("fixture capture failure");});
+            });
+            dialog.showAcquisitionError("fixture initial failure");
+            QEventLoop loop;QTimer::singleShot(1800,&loop,&QEventLoop::quit);loop.exec();
+            require(requests==2,"automatic acquisition retries must stop after two fresh frames");
+            require(dialog.findChild<QLabel*>("calibrationLoadingStatus")->text().startsWith(QStringLiteral(u"自动标定未完成")),
+                    "exhausted retry must fail without saving");
+            dialog.reject();
+            std::cout<<"PASS: automatic capture recovery is bounded and needs no button clicks\n";
+            return 0;
+        }catch(const std::exception& error){std::cerr<<error.what()<<std::endl;return 1;}
+    }
     if(app.arguments().contains("--retry-test")) {
         try {
         GaugeProfile profile;CardinalSelectorDialog dialog({},profile,"retry-test");
@@ -319,6 +342,31 @@ int main(int argc, char** argv) {
             "scale positions must return to raw coordinates while ratios remain intact");
         require(std::abs(lensProfile.scalePoints[0].toObject()["origin_y"].toDouble()-158)<.001,
             "calibration UI save must persist the printed plane origin separately from the hub");
+        auto detailedProfile=lensProfile;
+        CardinalSelectorDialog detailedDialog(lensFrame,detailedProfile,QStringLiteral("verified-ticks"),nullptr,true);
+        for(auto* box:detailedDialog.findChildren<QCheckBox*>())box->setChecked(true);
+        auto* detailedPreview=detailedDialog.findChild<InteractiveImageLabel*>("rectifiedCalibrationImage");
+        const auto detailedHub=detailedPreview->getCenterPoint();
+        const auto majorPoints=detailedPreview->getScalePoints();
+        ScaleCalibration::Mapping majorMapping;
+        require(ScaleCalibration::buildForPointer(majorPoints,detailedHub,{},detailedProfile.clockwise,majorMapping),"major geometry for save test");
+        MinorTickPreview::Result measured;
+        measured.divisionConfirmed=true;
+        measured.division=(detailedProfile.max_val-detailedProfile.min_val)*.25;
+        measured.previewPoints.append(majorPoints.first());
+        for(double ratio:{.25,.5}) {
+            const double angle=(majorMapping.angles.front()+(detailedProfile.clockwise?1:-1)*
+                majorMapping.offsets.back()*ratio)*CV_PI/180;
+            const auto p=detailedHub+cv::Point2f(float(std::cos(angle)*290),float(std::sin(angle)*290));
+            measured.previewPoints.append(QJsonObject{{"x",p.x},{"y",p.y},{"ratio",ratio},{"source","minor_tick"}});
+            measured.marks.push_back({p,p,.9,false,ratio,true});
+        }
+        measured.previewPoints.append(majorPoints.last());
+        detailedPreview->setMinorPreview(measured);
+        require(QMetaObject::invokeMethod(&detailedDialog,"onSaveAndApply",Qt::DirectConnection)&&
+            detailedDialog.result()==QDialog::Accepted,"confirmed small divisions should save with the major anchors");
+        require(detailedProfile.scalePoints.size()==4&&ScaleCalibration::isVerifiedMinor(detailedProfile.scalePoints[1].toObject())&&
+            ScaleCalibration::isVerifiedMinor(detailedProfile.scalePoints[2].toObject()),"validated small divisions retain provenance in raw coordinates");
 
         // Repeated native-resolution save/reopen must not compound the display scale.
         auto radiusProfile=lensProfile;
@@ -340,6 +388,9 @@ int main(int argc, char** argv) {
         dialog.setAttribute(Qt::WA_DontShowOnScreen);
         dialog.show();
         app.processEvents();
+        require(dialog.findChild<QCheckBox*>("majorAnchorRefinement")!=nullptr,"major refinement assumption is visible in calibration UI");
+        auto* audit=dialog.findChild<QLabel*>("rectificationValidationReport");
+        require(audit&&audit->text().contains(QStringLiteral(u"仅数值检查")),"lens audit must not claim measured camera accuracy");
         auto* progress=dialog.findChild<QProgressBar*>("calibrationLoadingProgress");
         auto* manual=dialog.findChild<QPushButton*>("manualEditCalibrationButton");
         auto* save=dialog.findChild<QPushButton*>("saveCalibrationButton");
@@ -443,7 +494,7 @@ int main(int argc, char** argv) {
         // the preview endpoints, preserving the middle point and pending profile.
         cv::Mat tickFrame(800,800,CV_8UC3,cv::Scalar(245,245,245));
         const auto dialPoint=[](double angle,double radius){return cv::Point2f(400+radius*std::cos(angle*CV_PI/180),400+radius*std::sin(angle*CV_PI/180));};
-        for(double angle:{135.,45.}) {
+        for(double angle:{135.,270.,45.}) {
             const auto rawLine=CameraUndistortion::points({dialPoint(angle,261),dialPoint(angle,299)},tickFrame.size(),true);
             cv::line(tickFrame,rawLine[0],rawLine[1],{10,10,10},5);
         }
@@ -452,14 +503,14 @@ int main(int argc, char** argv) {
         tickProfile.center=CameraUndistortion::point({400,400},tickFrame.size(),true);
         tickProfile.scalePoints=CameraUndistortion::scales(QJsonArray{
             QJsonObject{{"x",dialPoint(140,280).x},{"y",dialPoint(140,280).y},{"ratio",0}},
-            QJsonObject{{"x",400},{"y",120},{"ratio",.5}},
+            QJsonObject{{"x",dialPoint(337.5,280).x},{"y",dialPoint(337.5,280).y},{"ratio",.75}},
             QJsonObject{{"x",dialPoint(40,280).x},{"y",dialPoint(40,280).y},{"ratio",1}}},tickFrame.size(),true);
         const auto originalTickProfile=tickProfile.toJson();
         CardinalSelectorDialog tickDialog(tickFrame,tickProfile,"endpoint-test",nullptr,true);
         tickDialog.setAttribute(Qt::WA_DontShowOnScreen);tickDialog.show();app.processEvents();
         auto* tickPreview=tickDialog.findChild<InteractiveImageLabel*>("rectifiedCalibrationImage");
         const auto oldTickPoints=tickPreview->getScalePoints();
-        qputenv("GAUGE_OCR_FIXTURE_MODE","range");qputenv("GAUGE_OCR_SCRIPT",QByteArray(OCR_FIXTURE_SCRIPT));
+        qputenv("GAUGE_OCR_FIXTURE_MODE","endpoints_only");qputenv("GAUGE_OCR_SCRIPT",QByteArray(OCR_FIXTURE_SCRIPT));
         tickDialog.findChild<QPushButton*>("autoCalibrateScaleButton")->click();
         QEventLoop tickLoop;QTimer tickPoll,tickTimeout;
         QObject::connect(&tickPoll,&QTimer::timeout,&tickLoop,[&]{if(!tickDialog.findChild<QProgressBar*>("calibrationLoadingProgress")->isVisible())tickLoop.quit();});
@@ -468,10 +519,28 @@ int main(int argc, char** argv) {
         qunsetenv("GAUGE_OCR_FIXTURE_MODE");
         if(previousScript.isNull())qunsetenv("GAUGE_OCR_SCRIPT");else qputenv("GAUGE_OCR_SCRIPT",previousScript);
         const auto newTickPoints=tickPreview->getScalePoints();
-        require(newTickPoints.size()==3&&newTickPoints[1]==oldTickPoints[1]&&newTickPoints[0]!=oldTickPoints[0]&&newTickPoints[2]!=oldTickPoints[2],
-            "GUI OCR action must replace actual endpoint ticks and retain middle calibration");
+        require(newTickPoints.size()==4&&newTickPoints[2]==oldTickPoints[1]&&newTickPoints.first()!=oldTickPoints.first()&&newTickPoints.last()!=oldTickPoints.last(),
+            "GUI OCR action must calibrate endpoints and unlabeled stroke and retain the manual middle point");
+        require(ScaleCalibration::isUnlabeledMajor(newTickPoints[1].toObject())&&std::abs(newTickPoints[1].toObject()["ratio"].toDouble()-.5)<1e-6,
+            "one unlabeled stroke divides the recognized 0 to 1.9 range at 0.95");
         require(tickProfile.toJson()==originalTickProfile,"automatic endpoint angles remain pending until save");
         require(tickDialog.findChild<QLabel*>("calibrationSaveStatus")->text().contains(QStringLiteral(u"刻度角度已自动标定")),"GUI must report endpoint auto calibration success");
+        auto savedTickProfile=tickProfile;
+        CardinalSelectorDialog saveTicks(tickFrame,savedTickProfile,"tick-save-test",nullptr,true);
+        auto* savePreview=saveTicks.findChild<InteractiveImageLabel*>("rectifiedCalibrationImage");
+        savePreview->setScalePoints(newTickPoints);
+        savePreview->pointsChanged();
+        saveTicks.findChild<QDoubleSpinBox*>("ocrRangeMaximum")->setValue(1.9);
+        saveTicks.findChild<QCheckBox*>("acknowledgeCalibrationGeometry")->setChecked(true);
+        QMetaObject::invokeMethod(&saveTicks,"onSaveAndApply",Qt::DirectConnection);
+        require(saveTicks.result()==QDialog::Accepted,qPrintable(saveTicks.findChild<QLabel*>("calibrationSaveStatus")->text()));
+        CardinalSelectorDialog restoredTicks(tickFrame,savedTickProfile,"tick-save-test",nullptr,true);
+        const auto restoredPoints=restoredTicks.findChild<InteractiveImageLabel*>("rectifiedCalibrationImage")->getScalePoints();
+        require(restoredPoints.size()==4,"reopen saved anchors");
+        const auto restoredLong=restoredPoints[1].toObject(),originalLong=newTickPoints[1].toObject();
+        require(ScaleCalibration::isUnlabeledMajor(restoredLong)&&restoredLong["ratio"]==originalLong["ratio"]&&
+            std::hypot(restoredLong["x"].toDouble()-originalLong["x"].toDouble(),restoredLong["y"].toDouble()-originalLong["y"].toDouble())<1,
+            "unlabeled value, source and measured position survive save/reopen");
         auto* tickOriginal=tickDialog.findChild<InteractiveImageLabel*>("perspectiveImage");
         auto adjustedCorners=tickOriginal->getPoints();adjustedCorners[0].y+=4;
         tickOriginal->setImageAndPoints(CameraUndistortion::image(tickFrame),adjustedCorners);
@@ -515,7 +584,11 @@ int main(int argc, char** argv) {
             if(previousScript.isNull())qunsetenv("GAUGE_OCR_SCRIPT");else qputenv("GAUGE_OCR_SCRIPT",previousScript);
             const auto photoPoints=photoDialog.findChild<InteractiveImageLabel*>("rectifiedCalibrationImage")->getScalePoints();
             require(photoPoints.size()>=2&&photoPoints.first().toObject().contains("origin_x"),"GUI OCR endpoints must carry the printed-plane origin");
-            if(!photoOcr.isEmpty())require(photoPoints.size()==4&&std::abs(photoPoints[1].toObject()["ratio"].toDouble()-.2)<1e-6&&std::abs(photoPoints[2].toObject()["ratio"].toDouble()-.8)<1e-6,"real-photo OCR must auto-calibrate both lower intermediate values");
+            if(!photoOcr.isEmpty()) {
+                QJsonArray numbered;
+                for(const auto& p:photoPoints)if(!ScaleCalibration::isUnlabeledMajor(p.toObject()))numbered.append(p);
+                require(numbered.size()==4&&std::abs(numbered[1].toObject()["ratio"].toDouble()-.2)<1e-6&&std::abs(numbered[2].toObject()["ratio"].toDouble()-.8)<1e-6,"real-photo OCR must auto-calibrate both lower intermediate values");
+            }
             if(!qEnvironmentVariable("GAUGE_TEST_MAJOR_PREVIEW").isEmpty())photoDialog.findChild<InteractiveImageLabel*>("rectifiedCalibrationImage")->grab().save(qEnvironmentVariable("GAUGE_TEST_MAJOR_PREVIEW"));
             for(auto* box:photoDialog.findChildren<QCheckBox*>())box->setChecked(true);
             QMetaObject::invokeMethod(&photoDialog,"onSaveAndApply",Qt::DirectConnection);
@@ -626,11 +699,11 @@ int main(int argc, char** argv) {
             std::cout<<"Automatic status: "<<status.toStdString()<<'\n';
             require(status.contains(QStringLiteral(u"无法保存")),"automatic stages must reach save validation without any button clicks");
             const auto points=automatic.findChild<InteractiveImageLabel*>("rectifiedCalibrationImage")->getScalePoints();
-            require(points.size()>15,"automatic chain must include major and minor calibration points");
+            require(points.size()>=2 && ScaleCalibration::majorAnchors(points)==points,"automatic chain must save only major anchors");
             require(automaticProfile.toJson()==initial,"missing device identity must not persist or mutate the original profile");
             for(auto* button:automatic.findChildren<QPushButton*>())require(button->isVisible()==(button->objectName()=="exportCalibrationOriginalButton"),"automatic completion/failure must retain only original-image export");
             automatic.reject();
-            std::cout<<"PASS: opening alone drives localization, OCR, major/minor ticks and save validation\n";
+            std::cout<<"PASS: opening alone drives localization, OCR, major anchors and save validation\n";
         }
         std::cout << "PASS: busy feedback, event loop responsiveness, failure recovery, cancellation and safe destruction\n";
         return 0;

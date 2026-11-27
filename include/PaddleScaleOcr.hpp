@@ -100,7 +100,7 @@ inline QJsonArray tightenTickSuffixBoxes(const cv::Mat& image,const QJsonArray& 
     }
     return result;
 }
-inline Recognition recognize(const cv::Mat& image,const std::shared_ptr<std::atomic_bool>& cancelled,const LiquidSurface& surface={},cv::Rect bounds={}) {
+inline Recognition recognize(const cv::Mat& image,const std::shared_ptr<std::atomic_bool>& cancelled,const LiquidSurface& surface={},cv::Rect bounds={},int recovery=0) {
     Recognition result;
     try {
         if(cancelled && cancelled->load()){result.error=QStringLiteral(u"OCR 已取消。");return result;}
@@ -109,7 +109,10 @@ inline Recognition recognize(const cv::Mat& image,const std::shared_ptr<std::ato
         if(region.image.empty()){result.error=QStringLiteral(u"液面屏蔽后没有有效 OCR 区域。");return result;}
         const auto appDir=QCoreApplication::applicationDirPath();
         QString ocrDir=appDir+"/ocr";
-        if(!QFile::exists(ocrDir+"/offline.json") && !QFile::exists(ocrDir+"/paddle_scale_ocr.py") && QFile::exists(appDir+"/../ocr/paddle_scale_ocr.py"))ocrDir=QDir(appDir+"/../ocr").absolutePath();
+        if(!QFile::exists(ocrDir+"/offline.json") &&
+           (QFile::exists(appDir+"/../ocr/offline.json") ||
+            (!QFile::exists(ocrDir+"/paddle_scale_ocr.py") && QFile::exists(appDir+"/../ocr/paddle_scale_ocr.py"))))
+            ocrDir=QDir(appDir+"/../ocr").absolutePath();
         const bool portable=QFile::exists(ocrDir+"/offline.json");
         const QString script=portable?ocrDir+"/paddle_scale_ocr.py":qEnvironmentVariable("GAUGE_OCR_SCRIPT",ocrDir+"/paddle_scale_ocr.py");
         QString python=portable?ocrDir+"/runtime/python.exe":qEnvironmentVariable("GAUGE_OCR_PYTHON");
@@ -126,7 +129,21 @@ inline Recognition recognize(const cv::Mat& image,const std::shared_ptr<std::ato
         QTemporaryDir temporary;
         if(!temporary.isValid()) {result.error=QStringLiteral(u"无法创建 OCR 临时目录。");return result;}
         const auto input=temporary.filePath("dial.png"),output=temporary.filePath("result.json");
-        std::vector<uchar> encoded; cv::imencode(".png",region.image,encoded,{cv::IMWRITE_PNG_COMPRESSION,1});
+        cv::Mat inputPixels=region.image;
+        double resizeFactor=1;
+        if(recovery>0) {
+            cv::Mat gray,enhanced;
+            if(inputPixels.channels()==1)gray=inputPixels;else cv::cvtColor(inputPixels,gray,cv::COLOR_BGR2GRAY);
+            cv::createCLAHE(recovery==1?2.:3.,{8,8})->apply(gray,enhanced);
+            if(recovery==2) {
+                cv::GaussianBlur(enhanced,gray,{0,0},1.);
+                cv::addWeighted(enhanced,1.5,gray,-.5,0,enhanced);
+            }
+            resizeFactor=1.5;
+            cv::resize(enhanced,inputPixels,{},resizeFactor,resizeFactor,cv::INTER_CUBIC);
+            cv::cvtColor(inputPixels,inputPixels,cv::COLOR_GRAY2BGR);
+        }
+        std::vector<uchar> encoded; cv::imencode(".png",inputPixels,encoded,{cv::IMWRITE_PNG_COMPRESSION,1});
         QFile file(input);
         if(!file.open(QIODevice::WriteOnly)||file.write(reinterpret_cast<const char*>(encoded.data()),qint64(encoded.size()))!=qint64(encoded.size())) {result.error=QStringLiteral(u"无法写入 OCR 图像。");return result;}file.close();
         auto environment=QProcessEnvironment::systemEnvironment();
@@ -142,7 +159,15 @@ inline Recognition recognize(const cv::Mat& image,const std::shared_ptr<std::ato
             result.error=QStringLiteral(u"PaddleOCR 识别失败：%1。使用的 Python：%2。请检查 OCR 环境及模型配置。")
                 .arg(data["error"].toString(QStringLiteral(u"响应文件不可读")),python);return result;
         }
-        result.tokens=(surface.found||region.top||region.left)?restoreTokens(data["tokens"].toArray(),region.top,surface,region.left):data["tokens"].toArray();
+        auto tokens=data["tokens"].toArray();
+        if(resizeFactor!=1)for(int i=0;i<tokens.size();++i) {
+            auto token=tokens[i].toObject();QJsonArray polygon;
+            for(const auto vertex:token["polygon"].toArray()) {
+                const auto p=vertex.toArray();polygon.append(QJsonArray{p[0].toDouble()/resizeFactor,p[1].toDouble()/resizeFactor});
+            }
+            token["polygon"]=polygon;tokens[i]=token;
+        }
+        result.tokens=(surface.found||region.top||region.left)?restoreTokens(tokens,region.top,surface,region.left):tokens;
         result.tokens=tightenTickSuffixBoxes(image,result.tokens);return result;
     } catch(const std::exception& error) {result.error=QString::fromUtf8(error.what());return result;}
 }
@@ -162,7 +187,7 @@ inline const std::vector<double>& builtInDialValues() {
 }
 inline QJsonArray numericTokens(const QJsonArray& tokens,const std::vector<double>& allowedValues=builtInDialValues()) {
     const QRegularExpression numeric(QStringLiteral("^(?:[0-9]+(?:\\.[0-9]*)?|\\.[0-9]+)$"));
-    struct Candidate {QJsonObject token;cv::Point2f center;double extent;cv::Rect bounds;};
+    struct Candidate {QJsonObject token;cv::Point2f center;double extent;cv::Rect bounds;bool hasFraction;};
     std::vector<Candidate> candidates;
     for(const auto& entry:tokens) {
         auto token=entry.toObject();QString text=token["text"].toString().trimmed();
@@ -189,7 +214,7 @@ inline QJsonArray numericTokens(const QJsonArray& tokens,const std::vector<doubl
         }
         if(points.size()!=4)continue;
         const double extent=std::max(cv::norm(points[0]-points[1]),cv::norm(points[1]-points[2]));
-        if(extent>1)candidates.push_back({token,center,extent,cv::boundingRect(points)});
+        if(extent>1)candidates.push_back({token,center,extent,cv::boundingRect(points),text.contains('.')&&!text.endsWith('.')});
     }
     std::sort(candidates.begin(),candidates.end(),[](const Candidate& a,const Candidate& b){
         const bool uprightA=a.token["orientation_preferred"].toBool(),uprightB=b.token["orientation_preferred"].toBool();
@@ -202,6 +227,8 @@ inline QJsonArray numericTokens(const QJsonArray& tokens,const std::vector<doubl
         // from a graduation. Prefer a reliable, substantially tighter box;
         // otherwise that broad box erases real strokes during text masking.
         if(std::any_of(candidates.begin(),candidates.end(),[&](const Candidate& tight){
+            // A single glyph inside "1.0" is not a tighter reading of the whole label.
+            if(candidate.hasFraction&&!tight.hasFraction)return false;
             return std::abs(tight.token["text"].toString().toDouble()-candidate.token["text"].toString().toDouble())<1e-6 &&
                 tight.token["score"].toDouble()>=.9 &&
                 tight.token["score"].toDouble()>=candidate.token["score"].toDouble()-.03 &&
@@ -213,7 +240,9 @@ inline QJsonArray numericTokens(const QJsonArray& tokens,const std::vector<doubl
             const auto text=label.token["text"].toString();
             // A complete accepted decimal label takes precedence over one of
             // its glyphs, even when the isolated zero scores more highly.
-            if(!text.contains('.')||!text.contains(glyph))return false;
+            // A trailing dot ("1.") has no fractional digits. Its broad box
+            // must not veto the tight "1" that superseded it above.
+            if(!label.hasFraction||!text.contains(glyph))return false;
             const auto overlap=(candidate.bounds & label.bounds).area();
             const bool fragment=label.token["score"].toDouble()>=.65 &&
                 candidate.bounds.width<.65*label.bounds.width && overlap>=.8*candidate.bounds.area();

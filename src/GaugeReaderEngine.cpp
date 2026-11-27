@@ -391,7 +391,7 @@ GaugeResult GaugeReaderEngine::process(const cv::Mat& rawFrame, GaugeProfile& st
     {
         const double sx = profile.calibrated_width>0 ? double(frame.cols)/profile.calibrated_width : 1;
         const double sy = profile.calibrated_height>0 ? double(frame.rows)/profile.calibrated_height : 1;
-        const auto points = ScaleCalibration::scaled(profile.scalePoints,sx,sy);
+        const auto points = ScaleCalibration::scaled(ScaleCalibration::readingAnchors(profile.scalePoints),sx,sy);
         if (profile.perspective_correction_enabled && invH.empty()) {
             res.errorMessage="刻度标定无法应用：透视校正失败"; finish(); return res;
         }
@@ -401,8 +401,8 @@ GaugeResult GaugeReaderEngine::process(const cv::Mat& rawFrame, GaugeProfile& st
             res.errorMessage="刻度标定无法应用：轴心不在校正图像内"; finish(); return res;
         }
         res.center=hub[0];
-        if (!ScaleCalibration::valid(points,frame.cols,frame.rows,{float(profile.center.x*sx),float(profile.center.y*sy)}) ||
-            !ScaleCalibration::buildForPointer(points,res.center,invH.empty()?cv::Mat():invH.inv(),profile.clockwise,scaleMapping)) {
+        if (!ScaleCalibration::buildReading(points,frame.size(),{float(profile.center.x*sx),float(profile.center.y*sy)},
+            res.center,invH.empty()?cv::Mat():invH.inv(),profile.clockwise,scaleMapping)) {
             res.errorStep = "Scale calibration";
             res.errorMessage = "刻度标定无效：请检查端点、中间点顺序和数值增长方向";
             finish(); return res;

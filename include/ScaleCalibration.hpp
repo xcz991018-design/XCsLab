@@ -5,10 +5,32 @@
 #include <opencv2/opencv.hpp>
 #include <cmath>
 #include <algorithm>
+#include <utility>
 
 // Points are stored in calibration-frame pixels. Ratios remain independent of
 // the selected template's unit and range; 0 and 1 are the required endpoints.
 namespace ScaleCalibration {
+inline bool isUnlabeledMajor(const QJsonObject& point) {
+    return point["source"].toString()==QStringLiteral("unlabeled_major_tick");
+}
+inline bool isVerifiedMinor(const QJsonObject& point) {
+    return point["source"].toString()==QStringLiteral("minor_tick_verified");
+}
+// Keep legacy untagged/manual anchors for the base calibration.
+inline QJsonArray majorAnchors(const QJsonArray& points) {
+    QJsonArray anchors;
+    for (const auto& point : points)
+        if (!point.toObject()["source"].toString().startsWith("minor_tick")) anchors.append(point);
+    return anchors;
+}
+inline QJsonArray readingAnchors(const QJsonArray& points) {
+    QJsonArray anchors;
+    for(const auto& value:points) {
+        const auto point=value.toObject();
+        if(isVerifiedMinor(point)||!point["source"].toString().startsWith("minor_tick"))anchors.append(value);
+    }
+    return anchors;
+}
 // Automatic plane rectification can distinguish the printed radial origin from
 // the apparent center of a raised needle cap. Old/manual points use the hub.
 inline cv::Point2f origin(const QJsonObject& p,cv::Point2f hub) {
@@ -101,6 +123,16 @@ inline bool buildForPointer(const QJsonArray& points, cv::Point2f center, const 
         hubPoints.append(p);
     }
     return build(hubPoints,center,H,clockwise,result);
+}
+inline bool buildReading(const QJsonArray& points, cv::Size sourceSize, cv::Point2f sourceHub,
+                         cv::Point2f hub, const cv::Mat& H, bool clockwise, Mapping& result) {
+    const auto major=majorAnchors(points);
+    if(!valid(major,sourceSize.width,sourceSize.height,sourceHub)||!buildForPointer(major,hub,H,clockwise,result))return false;
+    const auto reading=readingAnchors(points);
+    Mapping detailed;
+    if(reading.size()>major.size()&&valid(reading,sourceSize.width,sourceSize.height,sourceHub)&&
+       buildForPointer(reading,hub,H,clockwise,detailed))result=std::move(detailed);
+    return true;
 }
 inline double ratio(const Mapping& mapping, double offset) {
     offset=std::clamp(offset,0.0,mapping.offsets.back());

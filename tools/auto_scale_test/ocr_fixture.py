@@ -26,7 +26,9 @@ def respond(args):
             tokens.append(dict(text=str(index * 0.2), score=0.99,
                                polygon=[[x-8, y-8], [x+8, y-8], [x+8, y+8], [x-8, y+8]]))
         print("Library log deliberately outside the JSON response")
-        if mode == "range":
+        if mode == "endpoints_only":
+            tokens.clear()
+        if mode in ("range", "endpoints_only"):
             for text, x in (("0", 245), ("1.9", 555)):
                 tokens.append(dict(text=text, score=.98,polygon=[[x-10,515],[x+10,515],[x+10,555],[x-10,555]]))
         replay = os.environ.get("GAUGE_OCR_FIXTURE_TOKENS")

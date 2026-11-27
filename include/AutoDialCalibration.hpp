@@ -116,6 +116,26 @@ inline int rimInteriorBrightness(const cv::Mat& gray,cv::Point2f center,const cv
     }
     std::sort(samples.begin(),samples.end());return samples[4];
 }
+// A translation of the rectified frame preserves measured tick angles about
+// the printed origin, even when the raised hub projects to a different point.
+inline cv::Mat anchorHomography(const cv::Mat& warp,cv::Point2f source,cv::Point2f target={}) {
+    std::vector<cv::Point2f> mapped{source};
+    cv::perspectiveTransform(mapped,mapped,warp);
+    const auto delta=target-mapped.front();
+    const cv::Mat translate=(cv::Mat_<double>(3,3)<<1,0,delta.x,0,1,delta.y,0,0,1);
+    return translate*warp;
+}
+inline bool diametersMeetAt(const std::vector<cv::Point2f>& handles,cv::Point2f hub) {
+    if(handles.size()!=4)return false;
+    for(int i=0;i<2;++i) {
+        const cv::Point2d a=cv::Point2d(handles[i])-cv::Point2d(hub);
+        const cv::Point2d b=cv::Point2d(handles[i+2])-cv::Point2d(hub);
+        const auto chord=b-a;
+        // Perpendicular distance <= 1e-5 of this diameter (roundoff only).
+        if(!(a.dot(b)<0 && std::abs(a.cross(b))<=1e-5*chord.dot(chord)))return false;
+    }
+    return true;
+}
 inline bool supportedMappingHandles(const std::vector<cv::Point2f>& points,const std::vector<cv::Point2f>& measured,
                                     const cv::RotatedRect& rim,cv::Size size) {
     if(points.size()!=4||measured.size()!=4||!cv::isContourConvex(points))return false;
@@ -357,9 +377,7 @@ inline bool boundedGraduationFeedback(const std::vector<cv::Vec4f>& lines,const 
     cv::perspectiveTransform(training,target,fit.correction);
     const cv::Mat inverse=initial.inv();
     auto centered=[&](const cv::Mat& warp)->cv::Mat {
-        std::vector<cv::Point2f> center{sourceOrigin};cv::perspectiveTransform(center,center,warp);
-        const cv::Mat translate=(cv::Mat_<double>(3,3)<<1,0,-center[0].x,0,1,-center[0].y,0,0,1);
-        return translate*warp*inverse;
+        return anchorHomography(warp,sourceOrigin)*inverse;
     };
     auto loss=[&](const std::vector<cv::Point2f>& candidate) {
         const auto warp=cv::getPerspectiveTransform(candidate,unit);
@@ -380,9 +398,19 @@ inline bool boundedGraduationFeedback(const std::vector<cv::Vec4f>& lines,const 
         for(int pass=0;pass<6;++pass) {
             const double previous=best;
             for(size_t i=0;i<handles.size();++i) {
-                const auto base=handles[i];
-                for(auto direction:{cv::Point2f(1,0),cv::Point2f(-1,0),cv::Point2f(0,1),cv::Point2f(0,-1)}) {
-                    auto candidate=handles;candidate[i]=base+direction*float(step);
+                const auto base=handles;
+                const auto ray=base[i]-dial.hub;
+                const auto opposite=(i+2)%4;
+                const double length=cv::norm(ray);
+                const double oppositeLength=cv::norm(base[opposite]-dial.hub);
+                // Change either endpoint radius independently, or rotate the
+                // whole diameter about the fixed hub. Oblique radii can differ.
+                const cv::Point2f radial=ray/length,tangent(-radial.y,radial.x);
+                for(const auto direction:{radial,-radial,tangent,-tangent}) {
+                    auto candidate=base;
+                    const auto moved=ray+direction*float(step);
+                    candidate[i]=dial.hub+moved;
+                    candidate[opposite]=dial.hub-moved*(oppositeLength/cv::norm(moved));
                     if(!supportedMappingHandles(candidate,dial.points,dial.rim,size))continue;
                     const double cost=loss(candidate);
                     if(cost<best){best=cost;handles=candidate;}
@@ -660,22 +688,22 @@ inline Result detectAtResolution(const cv::Mat& input,bool refineGeometry,int wo
         auto fitted=GraduationRectification::fit(graduationSegments,preliminary,[](const cv::RotatedRect& circle,cv::Point2f center){return metricHomography(circle,center);});
         if(fitted.valid()) {
             cv::Mat H=fitted.correction*preliminary;std::vector<cv::Point2f> points;
+            std::vector<cv::Point2f> origin{{0,0}};cv::perspectiveTransform(origin,origin,H.inv());
+            H=anchorHomography(H,result.hub);
             cv::perspectiveTransform(unit,points,H.inv());
             bool inside=supportedMappingHandles(points,result.points,result.rim,gray.size());
-            std::vector<cv::Point2f> origin{{0,0}};cv::perspectiveTransform(origin,origin,H.inv());
             if(!inside&&exclusion.surface.found&&result.graduationSupport>=24) {
                 inside=boundedGraduationFeedback(graduationSegments,preliminary,unit,result,gray.size(),
                     origin.front(),fitted,points,H);
             }
-            const auto independent=graduationFit(graduationSegments,H);
+            const auto independent=graduationFit(graduationSegments,anchorHomography(H,origin.front()));
             if(independent.support>=24&&result.graduationSupport>=24&&independent.aspect<result.graduationAspect-.005)inside=false;
-            if(inside) {
+            if(inside && diametersMeetAt(points,result.hub)) {
                 result.points=points;result.structuralRectification=true;result.structuralSupport=fitted.support;result.structuralSymmetricPairs=fitted.symmetricPairs;
                 result.graduationCenter=origin[0];
                 result.structuralErrorBefore=fitted.before;result.structuralErrorAfter=fitted.after;
                 result.structuralSpanBefore=fitted.spanBefore;result.structuralSpanAfter=fitted.spanAfter;
-                const auto fit=graduationFit(graduationSegments,H);
-                result.graduationSupport=fit.support;result.graduationResidual=fit.residual;result.graduationAspect=fit.aspect;
+                result.graduationSupport=independent.support;result.graduationResidual=independent.residual;result.graduationAspect=independent.aspect;
             }
         }
     }

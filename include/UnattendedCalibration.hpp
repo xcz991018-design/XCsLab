@@ -59,11 +59,18 @@ inline Candidate solve(const cv::Mat& raw,const std::shared_ptr<std::atomic_bool
     std::vector<cv::Point2f> origin{dial.structuralRectification?dial.graduationCenter:dial.hub};
     cv::perspectiveTransform(origin,origin,H);
     const auto surface=detectLiquidSurface(rectified,origin.front(),360);
-    const auto ocr=PaddleScaleOcr::recognize(rectified,cancel,surface,PaddleScaleOcr::rectifiedDialBounds(rectified.size(),40));
+    auto ocr=PaddleScaleOcr::recognize(rectified,cancel,surface,PaddleScaleOcr::rectifiedDialBounds(rectified.size(),40));
     if(!ocr.valid()) return {{},ocr.error};
-    const auto numbers=OcrDialRange::reliableNumbers(ocr.tokens,surface,{});
-    const bool clockwise=OcrDialRange::detect(numbers,origin.front(),800,true,{}).valid;
-    const auto scale=OcrDialRange::calibrate(rectified,ocr.tokens,origin.front(),360,clockwise,surface,{});
+    auto numbers=OcrDialRange::reliableNumbers(ocr.tokens,surface);
+    bool clockwise=OcrDialRange::detect(numbers,origin.front(),800).valid;
+    auto scale=OcrDialRange::calibrate(rectified,ocr.tokens,origin.front(),360,clockwise,surface,{});
+    for(int attempt=1;!scale.valid()&&attempt<=2&&!(cancel&&cancel->load());++attempt) {
+        auto retry=PaddleScaleOcr::recognize(rectified,cancel,surface,PaddleScaleOcr::rectifiedDialBounds(rectified.size(),40),attempt);
+        if(!retry.valid())break;
+        const bool direction=OcrDialRange::detect(OcrDialRange::reliableNumbers(retry.tokens,surface),origin.front(),800).valid;
+        auto candidate=OcrDialRange::calibrate(rectified,retry.tokens,origin.front(),360,direction,surface,{});
+        if(candidate.valid()){ocr=retry;scale=candidate;clockwise=direction;}
+    }
     if(!scale.valid()) return {{},scale.error};
     ScaleCalibration::Mapping mapping;
     if(!ScaleCalibration::build(scale.points,origin.front(),{},clockwise,mapping))
@@ -93,7 +100,10 @@ inline Candidate solve(const cv::Mat& raw,const std::shared_ptr<std::atomic_bool
     if(!distributed) return {{},QStringLiteral(u"缺少可验证量程中段的数字刻度")};
     const auto hub=CameraUndistortion::point(dial.hub,raw.size(),true);
     const auto handles=CameraUndistortion::points(dial.points,raw.size(),true);
-    auto anchors=CameraUndistortion::scales(ScaleCalibration::transformed(scale.points,H.inv()),raw.size(),true);
+    QJsonArray readingPoints;
+    if(!OcrDialRange::mergeCalibration({},scale,origin.front(),rectified.cols,clockwise,readingPoints))
+        return {{},QStringLiteral(u"长刻度标定顺序不一致")};
+    auto anchors=CameraUndistortion::scales(ScaleCalibration::transformed(readingPoints,H.inv()),raw.size(),true);
     const int radius=cvRound(cv::norm(handles[0]-handles[2])*.04);
     for(int i=0;i<anchors.size();++i) {
         auto p=anchors[i].toObject();
@@ -139,7 +149,7 @@ inline bool agrees(const QJsonObject& first,const QJsonObject& second,const cv::
         const auto p=left.toObject(),q=right.toObject();
         if(std::abs(p["ratio"].toDouble()-q["ratio"].toDouble())>1e-6) continue;
         if(std::hypot(p["x"].toDouble()*sx-q["x"].toDouble(),p["y"].toDouble()*sy-q["y"].toDouble())>tolerance) return false;
-        ++shared;
+        if(!ScaleCalibration::isUnlabeledMajor(p)&&!ScaleCalibration::isUnlabeledMajor(q))++shared;
     }
     return shared>=3;
 }

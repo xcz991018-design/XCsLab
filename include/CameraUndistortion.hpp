@@ -64,6 +64,26 @@ inline cv::Point2f point(cv::Point2f p, cv::Size size, bool toRaw = false) {
     if (p.x < 0 || p.y < 0) return p; // Preserve the unset-center sentinel.
     return points({p}, size, toRaw).front();
 }
+// Numerical audit only; hardware identity is confirmed by the operator.
+inline QString audit(cv::Size size) {
+    if(size.width<=0||size.height<=0)return QStringLiteral(u"去畸变检查失败：图像尺寸无效。");
+    const auto K=matrix(size),D=coefficients();
+    if(!cv::checkRange(K)||!cv::checkRange(D)||K.at<double>(0,0)<=0||K.at<double>(1,1)<=0)
+        return QStringLiteral(u"去畸变检查失败：内参或畸变系数无效。");
+    std::vector<cv::Point2f> sample;
+    for(double y:{.2,.5,.8})for(double x:{.2,.5,.8})sample.emplace_back(float(x*size.width),float(y*size.height));
+    const auto restored=points(points(sample,size),size,true);double error=0;
+    for(size_t i=0;i<sample.size();++i) {
+        if(!std::isfinite(restored[i].x)||!std::isfinite(restored[i].y))return QStringLiteral(u"去畸变检查失败：坐标非有限值。");
+        error=std::max(error,cv::norm(sample[i]-restored[i]));
+    }
+    QString report=QStringLiteral(u"镜头参数：2304×1296 基准，当前 %1×%2；中央九点往返最大误差 %3 px（仅数值检查，非实测标定误差）。")
+        .arg(size.width).arg(size.height).arg(error,0,'f',3);
+    if(error>.5)report+=QStringLiteral(u" 坐标往返异常，请复核参数。");
+    if(std::abs(double(size.width)/size.height-2304./1296)>.01)
+        report+=QStringLiteral(u" 宽高比变化：仅支持整幅缩放；裁剪画面需重新标定。");
+    return report;
+}
 inline QJsonArray scales(const QJsonArray& input, cv::Size size, bool toRaw = false) {
     std::vector<cv::Point2f> positions;
     for (const auto& value : input) {

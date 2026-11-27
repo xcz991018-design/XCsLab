@@ -20,8 +20,6 @@ int main(int argc,char** argv){
         token["raw_text"]="0.8-";
         if(PaddleScaleOcr::tightenTickSuffixBoxes(cv::Mat(240,450,CV_8UC3,cv::Scalar::all(200)),{token})!=QJsonArray{token})return 105;
     }
-    for(double value:{0.,.1,.3,1.,1.6,-.2,.1+.2})if(!MinorTickPreview::validLongValue(value))return 99;
-    for(double value:{.02,.28,.32,1.65})if(MinorTickPreview::validLongValue(value))return 100;
     for(bool clockwise:{true,false}) {
         const cv::Point2f hub(300,300);const double radius=270;
         auto point=[&](double angle,double r){angle=(clockwise?angle:120-angle)*CV_PI/180;return hub+cv::Point2f(float(r*std::cos(angle)),float(r*std::sin(angle)));};
@@ -61,6 +59,13 @@ int main(int argc,char** argv){
         const auto decimal=token("0.8",.88,100,100,90,70);
         auto zero=token("0",1.,102,102,28,66);zero["orientation_preferred"]=true;
         const auto endpoint=token("0",.99,300,300,28,66);
+        const auto tightOne=token("1",.9999,1474,1059,39,171);
+        const auto dottedOne=token("1.",.89,1444,1030,147,217);
+        const auto decimalOne=token("1.0",.99,1444,1030,147,217);
+        for(const auto& input:std::vector<QJsonArray>{{tightOne,dottedOne},{dottedOne,tightOne}})
+            if(PaddleScaleOcr::numericTokens(input)!=QJsonArray{tightOne})return 106;
+        for(const auto& input:std::vector<QJsonArray>{{tightOne,decimalOne},{decimalOne,tightOne}})
+            if(PaddleScaleOcr::numericTokens(input)!=QJsonArray{decimalOne})return 107;
         const auto broadTwo=token("2",.82,50,20,180,180),fullDecimal=token("0.2",.99,140,110,55,50);
         const auto separateTwo=token("2",.98,400,100,40,60);
         for(const auto& input:std::vector<QJsonArray>{{broadTwo,fullDecimal,separateTwo},{separateTwo,fullDecimal,broadTwo}}) {
@@ -269,6 +274,28 @@ int main(int argc,char** argv){
        !MinorTickPreview::decimalDivision(.03)||!MinorTickPreview::decimalDivision(.125)||
        MinorTickPreview::displayValue(.12000000001)!="0.12")return 39;
     const cv::Point2f center(300,300);const double radius=270;
+    {
+        cv::Mat image(600,600,CV_8UC1,cv::Scalar(255));
+        QJsonArray anchors;
+        for(int i=0;i<=20;++i) {
+            const double a=(15+i*4)*CV_PI/180;
+            const cv::Point2f radial(float(std::cos(a)),float(std::sin(a)));
+            cv::line(image,center+radial*(i%5?222.f:204.f),center+radial*244.f,cv::Scalar(0),2,cv::LINE_AA);
+            if(i==0||i==20) {
+                const auto p=center+radial*230.f;
+                anchors.append(QJsonObject{{"x",p.x},{"y",p.y},{"ratio",i/20.}});
+            }
+        }
+        MinorTickPreview::Result longStage;
+        const auto result=MinorTickPreview::detect(image,anchors,center,radius,.2,.4,true,{},
+            std::numeric_limits<double>::quiet_NaN(),0,nullptr,[&](MinorTickPreview::Result stage){longStage=stage;});
+        if(longStage.marks.size()!=3)return 99;
+        for(double ratio:{.25,.5,.75}) {
+            const auto atRatio=[&](const MinorTickPreview::Mark& m){return !m.gap&&std::abs(m.ratio-ratio)<1e-6;};
+            if(std::none_of(longStage.marks.begin(),longStage.marks.end(),atRatio)||
+               std::none_of(result.marks.begin(),result.marks.end(),atRatio))return 100;
+        }
+    }
     auto point=[&](double a,double r){return center+cv::Point2f(float(r*cos(a*CV_PI/180)),float(r*sin(a*CV_PI/180)));};
     for(bool clockwise:{true,false})for(bool missing:{false,true})for(bool shadedOblique:{false,true}) {
         cv::Mat image(600,600,CV_8UC1,cv::Scalar(shadedOblique?115:255));QJsonArray anchors;
@@ -364,14 +391,30 @@ int main(int argc,char** argv){
     for(const auto& v:std::vector<cv::Point2d>{{20,0},{50,.5},{80,1}}){auto p=point(v.x,230);base.append(QJsonObject{{"x",p.x},{"y",p.y},{"ratio",v.y}});}
     const auto unchanged=base;
     MinorTickPreview::Result proposal;proposal.division=.2;proposal.divisionConfirmed=true;proposal.previewPoints=base;
-    for(const auto& v:std::vector<cv::Point2d>{{32,.2},{43,.4}}){auto p=point(v.x,230);proposal.previewPoints.append(QJsonObject{{"x",p.x},{"y",p.y},{"ratio",v.y}});proposal.marks.push_back({point(v.x,220),point(v.x,240),.9,false,v.y,true});}
+    for(const auto& v:std::vector<cv::Point2d>{{32,.2},{43,.4}}){auto p=point(v.x,230);proposal.previewPoints.append(QJsonObject{{"x",p.x},{"y",p.y},{"ratio",v.y},{"source","minor_tick"}});proposal.marks.push_back({point(v.x,220),point(v.x,240),.9,false,v.y,true});}
     std::vector<QJsonObject> sorted;for(auto p:proposal.previewPoints)sorted.push_back(p.toObject());
     std::sort(sorted.begin(),sorted.end(),[](const QJsonObject& a,const QJsonObject& b){return a["ratio"].toDouble()<b["ratio"].toDouble();});
     proposal.previewPoints={};for(auto p:sorted)proposal.previewPoints.append(p);
-    const auto comparison=MinorTickPreview::compare(proposal,base,center,true,0,1,40);
+    const cv::Size canvas(600,600);
+    const auto comparison=MinorTickPreview::compare(proposal,base,canvas,center,true,0,1,40);
     if(!comparison.valid||std::abs(comparison.baseline-1./3)>.00001||std::abs(comparison.enhanced-(.2+8./11*.2))>.00001||base!=unchanged)return 8;
-    if(MinorTickPreview::compare(proposal,base,center,true,0,1,100).valid)return 9;
+    if(MinorTickPreview::compare(proposal,base,canvas,center,true,0,1,100).valid)return 9;
+    const auto verified=MinorTickPreview::readingAnchors(proposal,base,canvas,center,1,true);
+    ScaleCalibration::Mapping runtime;
+    if(verified.size()!=5||!ScaleCalibration::isVerifiedMinor(verified[1].toObject())||
+       !ScaleCalibration::buildReading(verified,canvas,center,center,{},true,runtime)||
+       std::abs(ScaleCalibration::ratio(runtime,20)-comparison.enhanced)>1e-6)return 15;
+    auto invalid=verified;
+    auto offImage=invalid[1].toObject();offImage["x"]=-1;invalid[1]=offImage;
+    if(!ScaleCalibration::buildReading(invalid,canvas,center,center,{},true,runtime)||
+       std::abs(ScaleCalibration::ratio(runtime,20)-comparison.baseline)>1e-6)return 16;
+    if(!ScaleCalibration::buildReading(proposal.previewPoints,canvas,center,center,{},true,runtime)||
+       runtime.ratios.size()!=3)return 17;
+    proposal.marks.back().inferred=true;
+    if(MinorTickPreview::readingAnchors(proposal,base,canvas,center,1,true)!=base)return 18;
+    proposal.marks.back().inferred=false;
     proposal.divisionConfirmed=false;
-    if(MinorTickPreview::compare(proposal,base,center,true,0,1,40).valid)return 14;
+    if(MinorTickPreview::compare(proposal,base,canvas,center,true,0,1,40).valid||
+       MinorTickPreview::readingAnchors(proposal,base,canvas,center,1,true)!=base)return 14;
     std::cout<<"PASS: assignment, missing indices, text exclusion, unchanged anchors, comparison and abstention"<<std::endl;
 }

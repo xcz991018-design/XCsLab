@@ -11,7 +11,6 @@ struct Mark {
     cv::Point2f a,b; double confidence{0}; bool gap{false};
     double ratio{-1}; bool assigned{false};
     bool inferred{false};
-    bool longStroke{false};
 };
 struct Result {
     std::vector<Mark> marks;
@@ -20,6 +19,52 @@ struct Result {
     QJsonArray previewPoints; // Private proposal; never replaces saved anchors.
     QStringList coverage;
 };
+inline QJsonArray readingAnchors(const Result& result,const QJsonArray& major,cv::Size size,cv::Point2f hub,
+                                 double range,bool clockwise) {
+    ScaleCalibration::Mapping base;
+    if(!result.divisionConfirmed||!std::isfinite(range)||!std::isfinite(result.division)||
+       range<=0||result.division<=0||result.division>=range||
+       !ScaleCalibration::valid(major,size.width,size.height,hub)||
+       !ScaleCalibration::buildForPointer(major,hub,{},clockwise,base))return major;
+    const double step=result.division/range;
+    QJsonArray reading{major.first()};
+    for(size_t i=1;i<base.ratios.size();++i) {
+        struct Candidate {QJsonObject point;double ratio,offset;};
+        std::vector<Candidate> measured;
+        const double low=base.ratios[i-1],high=base.ratios[i];
+        const double pitch=step*(base.offsets[i]-base.offsets[i-1])/(high-low);
+        for(const auto& item:result.previewPoints) {
+            auto p=item.toObject();
+            const double ratio=p["ratio"].toDouble();
+            if(p["source"]!="minor_tick"||ratio<=low||ratio>=high)continue;
+            const cv::Point2f position(p["x"].toDouble(),p["y"].toDouble());
+            if(std::none_of(result.marks.begin(),result.marks.end(),[&](const Mark& mark){
+                return mark.assigned&&!mark.gap&&!mark.inferred&&mark.confidence>=.6&&
+                       std::abs(mark.ratio-ratio)<1e-6&&cv::norm((mark.a+mark.b)*.5f-position)<1;
+            }))continue;
+            const double angle=std::atan2(position.y-hub.y,position.x-hub.x)*180/CV_PI;
+            const double offset=ScaleCalibration::span(base.angles.front(),angle,clockwise);
+            const double expected=base.offsets[i-1]+(ratio-low)*pitch/step;
+            if(offset<=base.offsets[i-1]||offset>=base.offsets[i]||std::abs(offset-expected)>pitch*.45)continue;
+            p["source"]=QStringLiteral("minor_tick_verified");
+            measured.push_back({p,ratio,offset});
+        }
+        // Use adjacent measured divisions whose angle and value increments agree.
+        // Isolated observations cannot change the interpolation.
+        for(size_t j=0;j<measured.size();++j) {
+            const auto consistent=[&](const Candidate& a,const Candidate& b) {
+                return std::abs(b.ratio-a.ratio-step)<=step*.01&&std::abs(b.offset-a.offset-pitch)<=pitch*.30;
+            };
+            if((j>0&&consistent(measured[j-1],measured[j]))||
+               (j+1<measured.size()&&consistent(measured[j],measured[j+1])))reading.append(measured[j].point);
+        }
+        reading.append(major[int(i)]);
+    }
+    ScaleCalibration::Mapping checked;
+    if(!ScaleCalibration::valid(reading,size.width,size.height,hub)||
+       !ScaleCalibration::buildForPointer(reading,hub,{},clockwise,checked))return major;
+    return reading;
+}
 // A count hypothesis must produce a representable decimal step, not a
 // repeating quotient from a missed tick (e.g. 0.2 / 9). Never round that
 // hypothesis into another division; discard it and keep uncertainty explicit.
@@ -29,9 +74,6 @@ inline bool decimalDivision(double value) {
     for(int digits=0;digits<=6;++digits,factor*=10)
         if(std::abs(std::round(value*factor)/factor-value)<=value*1e-8)return true;
     return false;
-}
-inline bool validLongValue(double value) {
-    return std::isfinite(value)&&std::abs(value*10-std::round(value*10))<1e-6;
 }
 inline QString displayValue(double value) {
     QString text=QString::number(value,'f',6);
@@ -105,7 +147,7 @@ inline int fillPointerGaps(Result& out,cv::Point2f hub,double radius,double mini
     return int(additions.size());
 }
 struct Comparison {bool valid{false};double baseline{0},enhanced{0},delta{0};QString message;};
-inline Comparison compare(const Result& result,const QJsonArray& anchors,cv::Point2f hub,
+inline Comparison compare(const Result& result,const QJsonArray& anchors,cv::Size size,cv::Point2f hub,
                           bool clockwise,double minimum,double maximum,double pointerAngle) {
     Comparison out;ScaleCalibration::Mapping base,enhanced;
     if(!std::isfinite(pointerAngle)||maximum<=minimum||!ScaleCalibration::buildForPointer(anchors,hub,{},clockwise,base)) {
@@ -114,16 +156,15 @@ inline Comparison compare(const Result& result,const QJsonArray& anchors,cv::Poi
     const double offset=ScaleCalibration::span(base.angles.front(),pointerAngle,clockwise);
     if(offset>base.offsets.back()) {out.message=QStringLiteral(u"指针位于有效量程之外，未输出对比读数。");return out;}
     out.baseline=minimum+(maximum-minimum)*ScaleCalibration::ratio(base,offset);
-    if(!result.divisionConfirmed||!ScaleCalibration::buildForPointer(result.previewPoints,hub,{},clockwise,enhanced)) {
+    const auto reading=readingAnchors(result,anchors,size,hub,maximum-minimum,clockwise);
+    if(reading.size()==anchors.size()||!ScaleCalibration::buildForPointer(reading,hub,{},clockwise,enhanced)) {
         out.message=QStringLiteral(u"仅大刻度读数 %1；小刻度赋值尚未确认，增强读数待确认。").arg(out.baseline,0,'f',6);return out;
     }
     // Comparison requires two measured minor ticks around the needle; do not
     // present an unchanged/unconstrained section as locally improved.
     double lower=-1,upper=1e9;
-    for(const auto& m:result.marks)if(m.assigned) {
-        const auto p=(m.a+m.b)*.5f;const auto o=hub;
-        const double a=AutoScaleCalibration::wrap(std::atan2(p.y-o.y,p.x-o.x)*180/CV_PI);
-        const double x=ScaleCalibration::span(base.angles.front(),a,clockwise);
+    for(int i=0;i<reading.size();++i)if(ScaleCalibration::isVerifiedMinor(reading[i].toObject())) {
+        const double x=enhanced.offsets[i];
         if(x<=offset)lower=std::max(lower,x);if(x>=offset)upper=std::min(upper,x);
     }
     if(lower<0||upper>base.offsets.back()||upper-lower>result.division/(maximum-minimum)*base.offsets.back()*3) {
@@ -280,7 +321,7 @@ inline Result detect(const cv::Mat& image,const QJsonArray& anchors,cv::Point2f 
         // in ratios so the same geometry works for any range or zero offset.
         // Require distributed strokes on both sides; length alone cannot assign a value.
         const double middleRatio=(section.leftRatio+section.rightRatio)*.5;
-        if((interval==1||interval==anchors.size()-1)&&validLongValue(minimum+middleRatio*(maximum-minimum))) {
+        if(interval==1||interval==anchors.size()-1) {
             std::vector<const Candidate*> central;std::vector<double> lengths;
             for(const auto& c:candidates) {
                 lengths.push_back(c.tick.length);
@@ -315,7 +356,7 @@ inline Result detect(const cv::Mat& image,const QJsonArray& anchors,cv::Point2f 
                     longer.push_back(i);
             std::sort(longer.begin(),longer.end(),[&](int a,int b){return candidates[a].offset<candidates[b].offset;});
             const int parts=int(longer.size())+1;
-            bool regular=parts>=2 && parts<=8;
+            bool regular=parts>=2;
             for(int i=0;i<int(longer.size());++i)
                 if(std::abs(candidates[longer[i]].offset/sweep*parts-(i+1))>.30)regular=false;
             // On the 1.6 dial a short stroke touching the needle can look
@@ -347,19 +388,6 @@ inline Result detect(const cv::Mat& image,const QJsonArray& anchors,cv::Point2f 
             }
             if(regular)for(int i:longer)section.longMarks.push_back(section.marks[i]);
         }
-        std::vector<double> strokeLengths;
-        for(const auto& c:candidates)strokeLengths.push_back(c.tick.length);
-        std::sort(strokeLengths.begin(),strokeLengths.end());
-        if(!strokeLengths.empty())for(size_t i=0;i<candidates.size();++i)
-            out.marks[section.marks[i]].longStroke=candidates[i].confidence>=.6&&
-                candidates[i].tick.length>strokeLengths[strokeLengths.size()/2]*1.35;
-        for(int index:section.longMarks)out.marks[index].longStroke=true;
-        // A hierarchy proposing hundredths for a long graduation is invalid.
-        const double longStep=(section.rightRatio-section.leftRatio)/(section.longMarks.size()+1);
-        for(size_t i=0;i<section.longMarks.size();++i)
-            if(!validLongValue(minimum+(section.leftRatio+longStep*(i+1))*(maximum-minimum))) {
-                section.longMarks.clear();break;
-            }
         intervals.push_back(section);
         // Adjacent observed strokes also constrain the pitch. Use the median
         // so an isolated missed stroke or a split edge cannot set the spacing.
@@ -511,9 +539,9 @@ inline Result detect(const cv::Mat& image,const QJsonArray& anchors,cv::Point2f 
                 const double lo=k?offsetOf(section.longMarks[k-1]):0;
                 const double hi=k+1==parts?section.sweep:offsetOf(section.longMarks[k]);
                 int count=cvRound(steps);
-                // The confirmed 1.6 dial layout has four divisions before its first 0.1 long mark.
-                if(k==0 && section.leftRatio==0 && minimum==0 && std::abs(maximum-1.6)<1e-6 &&
-                   std::abs(valueSpan-.1)<1e-6 && count==5)count=4;
+                // The four-part 0..0.4 layout has four *short* divisions before its first long mark.
+                if(k==0 && parts==4 && section.leftRatio==0 && minimum==0 && std::abs(maximum-1.6)<1e-6 &&
+                   std::abs(section.rightRatio*maximum-.4)<1e-6 && count==5)count=4;
                 std::vector<std::vector<int>> matches(count);
                 for(int i:section.marks) {
                     if(out.marks[i].assigned || out.marks[i].confidence<.6)continue;
@@ -787,22 +815,26 @@ inline Result detect(const cv::Mat& image,const QJsonArray& anchors,cv::Point2f 
         out.previewPoints=measuredPoints;
         for(auto& m:out.marks)m.assigned=false;
     }
-    for(auto& mark:out.marks)if(mark.longStroke&&mark.ratio>=0&&
-        !validLongValue(minimum+mark.ratio*(maximum-minimum))) {
-        const auto position=(mark.a+mark.b)*.5f;
-        QJsonArray filtered;
-        for(const auto& value:out.previewPoints) {
-            const auto p=value.toObject();
-            if(p["source"].toString()=="minor_tick"&&
-               cv::norm(position-cv::Point2f(p["x"].toDouble(),p["y"].toDouble()))<1)continue;
-            filtered.append(value);
+    for(const auto& section:intervals) {
+        const double step=(section.rightRatio-section.leftRatio)/(section.longMarks.size()+1);
+        for(size_t k=0;k<section.longMarks.size();++k) {
+            auto& mark=out.marks[section.longMarks[k]];
+            const double counted=section.leftRatio+(k+1)*step;
+            if(mark.assigned&&std::abs(mark.ratio-counted)>1e-6) {
+                // A competing short-tick numbering cannot replace a counted long value.
+                const auto middle=(mark.a+mark.b)*.5f;
+                for(int j=out.previewPoints.size()-1;j>=0;--j) {
+                    const auto p=out.previewPoints[j].toObject();
+                    if(p["source"]=="minor_tick"&&cv::norm(middle-cv::Point2f(p["x"].toDouble(),p["y"].toDouble()))<1)
+                        out.previewPoints.removeAt(j);
+                }
+                mark.assigned=false;
+            }
+            mark.ratio=counted;
         }
-        out.previewPoints=filtered;mark.assigned=false;
-        const double estimate=std::round((minimum+mark.ratio*(maximum-minimum))*10)/10;
-        mark.ratio=(estimate>=minimum&&estimate<=maximum)?(estimate-minimum)/(maximum-minimum):-1;
     }
     const int gaps=int(std::count_if(out.marks.begin(),out.marks.end(),[](const Mark& m){return m.gap;}));
-    out.message=QStringLiteral(u"小刻度预览：%1 条候选（紫色），%2 处推断缺口（橙色虚线）；候选分度值 %3；规则置信度 %4%。%5 可选择在保存时采用已确认的小刻度。")
+    out.message=QStringLiteral(u"小刻度预览：%1 条候选（紫色），%2 处推断缺口（橙色虚线）；候选分度值 %3；规则置信度 %4%。%5")
         .arg(int(out.marks.size())-gaps).arg(gaps).arg(out.division>0?displayValue(out.division):QStringLiteral(u"待确认"))
         .arg(qRound(out.confidence*100)).arg(!out.divisionConfirmed?QStringLiteral(u"分度尚未通过多个区间验证，显示的估计数值仅供预览，不保存为标定点。 "):(manualDivision?QStringLiteral(u"使用人工指定分度。 "):QStringLiteral(u"分度已通过多个区间验证。 ")));
     if(!intervals.empty()&&intervals.front().middleOffset>=0)
@@ -817,7 +849,10 @@ inline Result detect(const cv::Mat& image,const QJsonArray& anchors,cv::Point2f 
         const bool special=minimum==0 && std::abs(maximum-1.6)<1e-6 && section.leftRatio==0 && section.longMarks.size()==3 && out.marks[section.longMarks.front()].assigned && std::abs(section.rightRatio*maximum-.4)<1e-6 && std::abs(out.division-.02)<1e-6;
         for(size_t i=1;i<ratios.size();++i){
             double delta=(ratios[i]-ratios[i-1])*(maximum-minimum);
-            if(special)delta-=.2*std::max(0.,std::min(.1,ratios[i]*maximum)-ratios[i-1]*maximum);
+            if(special) {
+                const double firstLong=out.marks[section.longMarks.front()].ratio*maximum;
+                delta-=.2*std::max(0.,std::min(firstLong,ratios[i]*maximum)-ratios[i-1]*maximum);
+            }
             largest=std::max(largest,delta);
         }
         QString line=QStringLiteral(u"%1～%2：候选 %3，确认 %4")
@@ -829,7 +864,7 @@ inline Result detect(const cv::Mat& image,const QJsonArray& anchors,cv::Point2f 
     }
     if(!out.coverage.isEmpty())out.message+="\n"+out.coverage.join("\n");
     const int inferred=fillPointerGaps(out,center,radius,minimum,maximum,clockwise,surface,pointerMask);
-    if(inferred)out.message+=QStringLiteral(u"\n指针遮挡处自动补齐 %1 条（橙色虚线，推算刻度，单独标记保存；不作为实测校验依据）。").arg(inferred);
+    if(inferred)out.message+=QStringLiteral(u"\n指针遮挡处推算 %1 条（橙色虚线，仅用于预览）。").arg(inferred);
     return out;
 }
 }

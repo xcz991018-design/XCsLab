@@ -46,7 +46,13 @@ public:
         row(tr("轴心"),tr("轴帽屏蔽半径 %1（800 像素基准）").arg(device.pointerBaseRadius),device.centerX,device.centerY);
         for(const auto& value:device.scalePoints) {
             const auto p=value.toObject();const double lo=device.meterRange["min_val"].toDouble(),hi=device.meterRange["max_val"].toDouble();
-            row(tr("刻度 %1").arg(MinorTickPreview::displayValue(lo+(hi-lo)*p["ratio"].toDouble())),p["source"].toString()=="minor_tick_inferred"?tr("小刻度（指针遮挡推算）"):(p["source"].toString()=="minor_tick"?tr("小刻度"):tr("大刻度 / 锚点")),p["x"].toDouble(),p["y"].toDouble());
+            const auto source=p["source"].toString();
+            QString type=tr("大刻度 / 锚点");
+            if(ScaleCalibration::isUnlabeledMajor(p))type=tr("无数字长刻度");
+            else if(source=="minor_tick_inferred")type=tr("小刻度（指针遮挡推算）");
+            else if(ScaleCalibration::isVerifiedMinor(p))type=tr("已验证小刻度");
+            else if(source=="minor_tick")type=tr("小刻度");
+            row(tr("刻度 %1").arg(MinorTickPreview::displayValue(lo+(hi-lo)*p["ratio"].toDouble())),type,p["x"].toDouble(),p["y"].toDouble());
         }
         render({});return true;
     }

@@ -1,5 +1,6 @@
 #include "PaddleScaleOcr.hpp"
 #include "OcrDialRange.hpp"
+#include "EndpointAngleRectification.hpp"
 #include "AutoDialCalibration.hpp"
 #include "CameraUndistortion.hpp"
 #include <iostream>
@@ -12,6 +13,61 @@ static cv::Point2f point(double angle,double r=260) {
 int main(int argc,char** argv) {
     QCoreApplication app(argc,argv);
     try {
+        {
+            require(CameraUndistortion::audit({2304,1296}).contains(QStringLiteral(u"仅数值检查")),"lens audit distinguishes numerical and physical accuracy");
+            require(CameraUndistortion::audit({640,480}).contains(QStringLiteral(u"宽高比变化")),"cropped aspect ratio needs explicit review");
+            require(CameraUndistortion::audit({0,0}).contains(QStringLiteral(u"失败")),"invalid image extent rejected");
+            for(bool clockwise:{true,false}) {
+                const double sign=clockwise?1.:-1.;
+                const cv::Mat projection=(cv::Mat_<double>(3,3)<<1.04,.025,-26,.01,.96,12,.00003,-.00002,1);
+                std::vector<MajorAnchorRectification::Observation> observations;
+                for(int i=0;i<6;++i) {
+                    const double a=135+sign*270*i/5.;
+                    std::vector<cv::Point2f> p{point(a,290),point(a,250)};
+                    cv::perspectiveTransform(p,p,projection);
+                    observations.push_back({p[0],p[1],i/5.});
+                }
+                const auto refined=MajorAnchorRectification::fit(observations,{400,400},360,clockwise);
+                std::cout<<"Major holdout: "<<refined.message.toStdString()<<"\n";
+                require(refined.valid()&&refined.after<.01,"major tips recover projective geometry with independent holdouts");
+                // Entirely unseen needle directions, not used by fitting or acceptance.
+                std::vector<cv::Point2f> probe{point(135,290),{400,400}};
+                for(int i=1;i<20;++i)probe.push_back(point(135+sign*270*i/20.,260));
+                cv::perspectiveTransform(probe,probe,refined.correction*projection);
+                const auto pivot=probe[1];const auto start=probe[0]-pivot;
+                const double originAngle=std::atan2(start.y,start.x)*180/CV_PI;
+                for(int i=1;i<20;++i) {
+                    const auto v=probe[i+1]-pivot;
+                    const double measured=ScaleCalibration::span(AutoScaleCalibration::wrap(originAngle),AutoScaleCalibration::wrap(std::atan2(v.y,v.x)*180/CV_PI),clockwise);
+                    require(std::abs(measured/270-i/20.)<1e-5,"unseen known readings recover the correct fraction");
+                }
+                auto corrupted=observations;corrupted[1].outer+=cv::Point2f(20,-20);
+                require(!MajorAnchorRectification::fit(corrupted,{400,400},360,clockwise).valid(),"held-out mismatch rejects correction instead of refitting");
+                observations.pop_back();
+                require(!MajorAnchorRectification::fit(observations,{400,400},360,clockwise).valid(),"insufficient majors preserve original four points");
+            }
+        }
+        // Sparse, nonuniform anchors must interpolate in either direction across zero.
+        for (bool clockwise : {true, false}) {
+            const double sign=clockwise?1:-1;
+            QJsonArray anchors;
+            for (const auto& pair : std::vector<std::pair<double,double>>{{0,0},{80,.4},{200,1}}) {
+                const auto p=point(350+sign*pair.first);
+                anchors.append(QJsonObject{{"x",p.x},{"y",p.y},{"ratio",pair.second}});
+            }
+            auto contaminated=anchors;
+            const auto wrong=point(350+sign*30);
+            contaminated.append(QJsonObject{{"x",wrong.x},{"y",wrong.y},{"ratio",.9},{"source","minor_tick"}});
+            contaminated.append(QJsonObject{{"x",wrong.x},{"y",wrong.y},{"ratio",.8},{"source","minor_tick_inferred"}});
+            const auto clean=ScaleCalibration::majorAnchors(contaminated);
+            require(clean==anchors,"legacy minor ticks cannot affect sparse anchors");
+            ScaleCalibration::Mapping mapping;
+            require(ScaleCalibration::valid(clean,800,800,{400,400}) &&
+                ScaleCalibration::buildForPointer(clean,{400,400},{},clockwise,mapping),"sparse mapping crosses zero in both directions");
+            require(std::abs(ScaleCalibration::ratio(mapping,40)-.2)<1e-6,"first interval interpolation");
+            require(std::abs(ScaleCalibration::ratio(mapping,140)-.7)<1e-6,"second interval interpolation");
+            require(ScaleCalibration::ratio(mapping,0)==0 && ScaleCalibration::ratio(mapping,200.01)==1,"endpoint values");
+        }
         {
             cv::Mat image(800,800,CV_8UC3);cv::randu(image,0,256);
             const auto bounds=PaddleScaleOcr::rectifiedDialBounds(image.size(),40);
@@ -109,12 +165,19 @@ int main(int argc,char** argv) {
             QJsonArray strokes;for(const auto& m:majors)strokes.append(QJsonObject{{"angle",m.tick.angle},{"r",m.tick.radius},{"length",m.tick.length},{"inner_width",m.innerWidth},{"outer_width",m.outerWidth}});
             QJsonArray rawStrokes;for(const auto& t:AutoScaleCalibration::ticks(image,{image.cols*.5f,image.rows*.5f},image.cols*.5-40,.055))rawStrokes.append(QJsonObject{{"angle",t.angle},{"r",t.radius},{"length",t.length}});
             output.write(QJsonDocument(QJsonObject{{"tokens",tokens},{"endpoint_points",endpoints.points},{"endpoint_error",endpoints.error},
-                {"calibration_points",calibration.points},{"calibration_error",calibration.error},{"major_ticks",strokes},{"raw_ticks",rawStrokes},{"stroke_probes",probes},{"liquid_y",surface.y0}}).toJson());
+                {"calibration_points",calibration.points},{"unlabeled_major_points",calibration.unlabeledPoints},{"calibration_error",calibration.error},{"major_ticks",strokes},{"raw_ticks",rawStrokes},{"stroke_probes",probes},{"liquid_y",surface.y0}}).toJson());
             std::cout<<"Major calibration "<<calibration.valid()<<" strokes="<<majors.size()<<" points="<<calibration.points.size()<<" "<<calibration.error.toStdString()<<'\n';
             std::cout<<"Endpoints "<<endpoints.valid()<<" "<<endpoints.error.toStdString()<<" "<<QJsonDocument(endpoints.points).toJson(QJsonDocument::Compact).toStdString()<<'\n';
             for(const auto& value:calibration.points) {
                 const auto p=value.toObject();const cv::Point end(cvRound(p["x"].toDouble()),cvRound(p["y"].toDouble()));
                 cv::line(image,{image.cols/2,image.rows/2},end,{0,255,0},2);cv::circle(image,end,6,{0,0,255},2);
+            }
+            for(const auto& value:calibration.unlabeledPoints) {
+                const auto p=value.toObject();
+                const cv::Point end(cvRound(p["x"].toDouble()),cvRound(p["y"].toDouble()));
+                const double reading=calibration.range.minimum+p["ratio"].toDouble()*(calibration.range.maximum-calibration.range.minimum);
+                cv::circle(image,end,7,{255,160,80},2);
+                cv::putText(image,QString::number(reading).toStdString(),end+cv::Point(8,-6),cv::FONT_HERSHEY_SIMPLEX,.8,{255,160,80},2);
             }
             for(const auto& token:tokens) {
                 const auto item=token.toObject();std::vector<cv::Point> points;
@@ -265,6 +328,14 @@ int main(int argc,char** argv) {
         require(OcrDialRange::mergeEndpoints(QJsonArray{middle},matchedEndpoints,{400,400},800,true,merged)&&merged.size()==3&&merged[1].toObject()==middle,
             "endpoint replacement preserves existing middle points");
         const auto original=merged;
+        const QJsonObject badMinor{{"x",400},{"y",680},{"ratio",.3},{"source","minor_tick"}};
+        require(OcrDialRange::mergeEndpoints(QJsonArray{middle,badMinor},matchedEndpoints,{400,400},800,true,merged)&&merged==original,
+            "endpoint refresh discards legacy minor ticks but preserves manual anchors");
+        OcrDialRange::Calibration sparseCalibration;
+        sparseCalibration.range=endpointRange;
+        sparseCalibration.points=original;
+        require(OcrDialRange::mergeCalibration(QJsonArray{badMinor},sparseCalibration,{400,400},800,true,merged)&&merged==original,
+            "automatic calibration cannot reintroduce legacy minor ticks");
         require(!OcrDialRange::mergeEndpoints(QJsonArray{QJsonObject{{"x",400},{"y",680},{"ratio",.5}}},matchedEndpoints,{400,400},800,true,merged)&&merged==original,
             "conflicting middle point rejects update without altering existing calibration");
         endpointTicks.erase(endpointTicks.begin());
@@ -302,9 +373,195 @@ int main(int argc,char** argv) {
             cv::line(image,{400,400},point(183,315),{10,10,10},6);return image;
         };
         QJsonArray majorLabels;for(int i=0;i<=5;++i){const auto p=point(135+i*54,220);majorLabels.append(label(QString::number(i*.2),p.x,p.y));}
+        const auto fullMajors=OcrDialRange::calibrate(majorImage(false),majorLabels,{400,400},360,true);
+        std::cout<<"Complete major geometry: "<<fullMajors.geometry.size()<<" / "<<fullMajors.points.size()<<"\n";
+        require(fullMajors.valid()&&fullMajors.points.size()==6&&fullMajors.geometry.size()==6,
+            "OCR major matches retain six measured full-stroke endpoints for refinement");
+        require(fullMajors.unlabeledPoints.isEmpty(),"ordinary short ticks do not become reading anchors");
+        for(bool clockwise:{true,false}) {
+            cv::Mat image(800,800,CV_8UC3,cv::Scalar::all(240));
+            QJsonArray labels;
+            const auto angle=[&](double ratio){return clockwise?135+270*ratio:45-270*ratio;};
+            for(int i=0;i<=50;++i) {
+                const double ratio=i/50.;
+                const bool numbered=i%10==0;
+                const bool blank=i==5||i==15||i==45;
+                const double a=angle(ratio)+(i==5?2.:0.);
+                cv::line(image,point(a,numbered?256:blank?267:282),point(a,300),{15,15,15},3);
+                if(numbered) {
+                    const auto p=point(a,220);
+                    labels.append(label(QString::number(.2+ratio),p.x,p.y));
+                }
+            }
+            for(double extra:{.05,.15,.6+.2/3,.6+2*.2/3})
+                cv::line(image,point(angle(extra),267),point(angle(extra),300),{15,15,15},3);
+            auto cal=OcrDialRange::calibrate(image,labels,{400,400},360,clockwise);
+            require(cal.valid()&&cal.points.size()==6&&cal.unlabeledPoints.size()==7,"each numbered interval uses its own count of observed long ticks");
+            QJsonArray saved;
+            require(OcrDialRange::mergeCalibration({},cal,{400,400},800,clockwise,saved)&&saved.size()==13,"save labeled and unlabeled anchors together");
+            ScaleCalibration::Mapping reading;
+            require(ScaleCalibration::buildForPointer(ScaleCalibration::majorAnchors(saved),{400,400},{},clockwise,reading),"new anchors participate in pointer mapping");
+            const double expected[]={.05,.1,.15,.3,.6+.2/3,.6+2*.2/3,.9};
+            for(int i=0;i<7;++i) {
+                const auto p=cal.unlabeledPoints[i].toObject();
+                const double a=angle(expected[i])+(i==1?2.:0.);
+                require(ScaleCalibration::isUnlabeledMajor(p)&&std::abs(p["ratio"].toDouble()-expected[i])<1e-6&&
+                    std::abs(ScaleCalibration::ratio(reading,ScaleCalibration::span(reading.angles.front(),a,clockwise))-expected[i])<.001,
+                    "reading interpolates through measured stroke even when displaced from the ideal angle");
+            }
+            auto manual=cal.unlabeledPoints.first().toObject();manual.remove("source");manual["x"]=manual["x"].toDouble()+1;
+            saved[1]=manual;
+            QJsonArray refreshed;
+            require(OcrDialRange::mergeCalibration(saved,cal,{400,400},800,clockwise,refreshed)&&refreshed==saved,"manual correction takes precedence on retry");
+            cal.unlabeledPoints={};
+            require(OcrDialRange::mergeCalibration(saved,cal,{400,400},800,clockwise,refreshed)&&refreshed.size()==7,"refresh drops unobserved automatic points");
+            LiquidSurface liquid;liquid.found=true;liquid.centerX=400;liquid.radius=360;liquid.y0=245;liquid.margin=5;
+            const auto masked=OcrDialRange::calibrate(image,labels,{400,400},360,clockwise,liquid);
+            require(masked.valid()&&masked.unlabeledPoints.size()==4,"partially masked count must not renumber visible ticks");
+            cv::line(image,point(angle(.25),267),point(angle(.25),300),{15,15,15},3);
+            for(double nearNeedle:{.48,.52})
+                cv::line(image,point(angle(nearNeedle),267),point(angle(nearNeedle),300),{15,15,15},3);
+            const auto irregular=OcrDialRange::calibrate(image,labels,{400,400},360,clockwise);
+            require(irregular.valid()&&irregular.unlabeledPoints.size()==6,"missing or crowded long strokes reject only the affected intervals");
+
+            // A liquid boundary hides the central graduations; both edge runs
+            // have visible ink, and each adjacent complete interval measures a 0.15 step.
+            cv::Mat wet(800,800,CV_8UC3,cv::Scalar::all(240));
+            QJsonArray wetLabels;
+            for(int k=0;k<=50;++k) {
+                const double a=angle(k/50.);
+                const bool numbered=k==0||k==10||k==40||k==50;
+                cv::line(wet,point(a,numbered?256:k%5==0?267:282),point(a,300),{15,15,15},3);
+                if(numbered) {
+                    const auto p=point(a,220);
+                    wetLabels.append(label(QString::number(.2+1.5*k/50.),p.x,p.y));
+                }
+            }
+            liquid.y0=180;
+            const auto partial=OcrDialRange::calibrate(wet,wetLabels,{400,400},360,clockwise,liquid);
+            require(partial.valid()&&partial.unlabeledPoints.size()==4,"visible long ticks survive a masked middle");
+            const double visibleRatios[]={.1,.3,.7,.9};
+            for(int k=0;k<4;++k)
+                require(std::abs(partial.unlabeledPoints[k].toObject()["ratio"].toDouble()-visibleRatios[k])<1e-6,
+                    "partial interval uses the neighboring measured step in reading order");
+            // The label for ratio .4 is visible below the liquid, while its
+            // stroke is masked. Only the right neighbor supplies a counted step.
+            auto broken=wet.clone();
+            cv::line(broken,point(angle(.1),264),point(angle(.1),304),cv::Scalar::all(240),9);
+            auto brokenLabels=wetLabels;
+            const auto unmatched=point(angle(.4),205);
+            brokenLabels.append(label("0.8",unmatched.x,unmatched.y)); // range .2..1.7
+            const auto edges=OcrDialRange::calibrate(broken,brokenLabels,{400,400},360,clockwise,liquid);
+            require(edges.valid()&&edges.points.size()==4&&edges.unlabeledPoints.size()==3,
+                    "an unmatched label must isolate the break and preserve measured edge strokes");
+            for(int k=0;k<3;++k)
+                require(std::abs(edges.unlabeledPoints[k].toObject()["ratio"].toDouble()-visibleRatios[k+1])<1e-6,
+                        "edge recovery must use the verified increment and leave the unmatched value open");
+            cv::line(broken,point(angle(.3),264),point(angle(.3),304),cv::Scalar::all(240),9);
+            const auto oneSided=OcrDialRange::calibrate(broken,brokenLabels,{400,400},360,clockwise,liquid);
+            require(oneSided.valid()&&oneSided.unlabeledPoints.size()==2&&
+                    std::abs(oneSided.unlabeledPoints.first().toObject()["ratio"].toDouble()-.7)<1e-6,
+                    "an unmatched label and a missing left stroke must preserve the independently verified right side");
+            cv::line(wet,point(angle(.3),264),point(angle(.3),304),cv::Scalar::all(240),9);
+            const auto missing=OcrDialRange::calibrate(wet,wetLabels,{400,400},360,clockwise,liquid);
+            require(missing.valid()&&missing.unlabeledPoints.size()==3&&
+                std::abs(missing.unlabeledPoints[1].toObject()["ratio"].toDouble()-.7)<1e-6,
+                "a missing edge stroke is not synthesized or borrowed from the other side");
+        }
         LiquidSurface majorSurface;majorSurface.found=true;majorSurface.centerX=400;majorSurface.radius=360;majorSurface.y0=240;majorSurface.margin=10;
         const auto automatic=OcrDialRange::calibrate(majorImage(false),majorLabels,{400,400},360,true,majorSurface);
         require(automatic.valid()&&automatic.points.size()==4,"lower 0,0.2,0.8,1 must all match actual long ticks; upper 0.4,0.6 excluded");
+        {
+            const auto unchanged=EndpointAngleRectification::closeLoop(majorImage(false),majorLabels,{400,400},360,true,majorSurface,automatic);
+            require(unchanged.converged&&!unchanged.refinement.valid(),"already orthogonal endpoints do not change geometry");
+            for(double stretch:{.95,1.05}) {
+                const cv::Mat warp=(cv::Mat_<double>(3,3)<<1,0,0,0,stretch,400*(1-stretch),0,0,1);
+                cv::Mat distortedImage;cv::warpPerspective(majorImage(false),distortedImage,warp,{800,800},cv::INTER_LINEAR,cv::BORDER_CONSTANT,cv::Scalar::all(240));
+                QJsonArray labels;
+                for(auto entry:majorLabels) {auto token=entry.toObject();QJsonArray polygon;
+                    for(auto vertex:token["polygon"].toArray()) {const auto xy=vertex.toArray();polygon.append(QJsonArray{xy[0].toDouble(),400+stretch*(xy[1].toDouble()-400)});}
+                    token["polygon"]=polygon;labels.append(token);
+                }
+                auto liquid=majorSurface;liquid.y0=400+stretch*(liquid.y0-400);liquid.margin*=stretch;
+                const auto initial=OcrDialRange::calibrate(distortedImage,labels,{400,400},360,true,liquid);
+                require(initial.valid()&&initial.points.size()==4,"liquid leaves four reliable anchors for feedback");
+                const auto closed=EndpointAngleRectification::closeLoop(distortedImage,labels,{400,400},360,true,liquid,initial);
+                std::cout<<"Endpoint feedback: "<<closed.refinement.message.toStdString()<<"\n";
+                require(closed.converged&&closed.refinement.valid(),"four-anchor liquid scene converges from either side of 90 degrees");
+                auto finalCalibration=closed.calibration;
+                finalCalibration.points=ScaleCalibration::transformed(finalCalibration.points,closed.refinement.correction);
+                require(std::abs(EndpointAngleRectification::sweep(finalCalibration,{400,400},true)-270)<=.5,"freshly measured endpoint angle meets tolerance");
+                auto endpointsOnly=initial;endpointsOnly.points=QJsonArray{initial.points.first(),initial.points.last()};
+                require(!EndpointAngleRectification::closeLoop(distortedImage,labels,{400,400},360,true,liquid,endpointsOnly).converged,"two endpoints alone cannot validate local deformation");
+            }
+        }
+        {
+            for(double shear:{0.,-3.,3.}) {
+                cv::Mat wet=majorImage(false);
+                cv::rectangle(wet,{0,0},{799,239},{190,190,190},-1);
+                cv::line(wet,{80,224},{720,256},{70,70,70},2);
+                cv::Mat warp=(cv::Mat_<double>(3,3)<<1,0,0,shear,1.025,-10-400*shear,0,0,1);
+                cv::getRotationMatrix2D(cv::Point2f(400,400),shear,1).copyTo(warp.rowRange(0,2));
+                cv::Mat image;cv::warpPerspective(wet,image,warp,{800,800},cv::INTER_LINEAR,cv::BORDER_CONSTANT,cv::Scalar::all(240));
+                QJsonArray labels;
+                for(auto entry:majorLabels) {auto token=entry.toObject();QJsonArray polygon;
+                    for(auto vertex:token["polygon"].toArray()){auto p=vertex.toArray();const auto q=cv::Matx33d(warp)*cv::Vec3d(p[0].toDouble(),p[1].toDouble(),1);polygon.append(QJsonArray{q[0],q[1]});}
+                    token["polygon"]=polygon;labels.append(token);
+                }
+                const auto liquid=detectLiquidSurface(image,{400,400},360);
+                require(liquid.found,"synthetic sloped liquid must provide reliable image evidence");
+                const auto initial=OcrDialRange::calibrate(image,labels,{400,400},360,true,liquid);
+                require(initial.valid(),"liquid fixture has reliable initial endpoints");
+                const auto closed=EndpointAngleRectification::closeLoop(image,labels,{400,400},360,true,liquid,initial);
+                require(closed.converged,"tick feedback must tolerate a tilted liquid edge");
+                if(shear==0)require(!closed.refinement.valid(),"liquid tilt alone cannot change calibration");
+                else {
+                    require(closed.refinement.valid(),"printed anchors recover camera roll");
+                    const cv::Mat A=closed.refinement.correction(cv::Rect(0,0,2,2));
+                    require(cv::norm(A.t()*A-cv::Mat::eye(2,2,CV_64F))<1e-6,"roll preserves angles and lengths");
+                }
+            }
+        }
+        {
+            cv::Mat dial(800,800,CV_8U,cv::Scalar(235));
+            cv::line(dial,{319,640},{481,640},25,2);
+            double tilt=0;
+            require(!EndpointAngleRectification::batchUnderline(dial,{400,400},360,tilt),"isolated line is insufficient");
+            cv::putText(dial,"2606007819",{326,635},cv::FONT_HERSHEY_SIMPLEX,.73,25,2);
+            for(double rotation:{-4.,0.,4.}) {
+                cv::Mat rotated;
+                cv::warpAffine(dial,rotated,cv::getRotationMatrix2D({400,400},rotation,1),dial.size());
+                require(EndpointAngleRectification::batchUnderline(rotated,{400,400},360,tilt)&&std::abs(tilt+rotation)<1,
+                        "printed batch number identifies the signed underline angle");
+            }
+        }
+        if(argc==6&&QString::fromLocal8Bit(argv[1])=="--batch-underline") {
+            const auto photo=cv::imread(argv[2]);
+            const cv::Point2f pivot(QString(argv[3]).toFloat(),QString(argv[4]).toFloat());
+            double tilt=0;
+            const bool found=EndpointAngleRectification::batchUnderline(photo,pivot,QString(argv[5]).toDouble(),tilt);
+            std::cout<<"Batch underline found="<<found<<" angle="<<tilt<<" degrees\n";
+            return found?0:1;
+        }
+        {
+            QJsonArray visible;
+            for(double r:{0.,.2,.5,.8,1.}) {
+                const auto p=point(135+270*r+3,280);
+                visible.append(QJsonObject{{"ratio",r},{"x",p.x},{"y",p.y}});
+            }
+            auto mirror=EndpointAngleRectification::mirrorEvidence(visible,{400,400});
+            require(mirror.left==2&&mirror.right==2&&mirror.axisOffsets.size()==2&&
+                std::abs(mirror.axisOffsets[0]-3)<.01&&std::abs(mirror.maxMismatch-6)<.01,"mirror pairs recover signed roll and exclude center mark");
+            visible.removeAt(1);
+            mirror=EndpointAngleRectification::mirrorEvidence(visible,{400,400});
+            require(mirror.left==1&&mirror.right==2&&mirror.axisOffsets.size()==1,"occlusion must not create a mirror partner");
+        }
+        {
+            const QJsonObject anchor{{"x",700},{"y",400}};
+            const auto along=EndpointAngleRectification::displacement(anchor,QJsonObject{{"x",682},{"y",401}},{400,400});
+            const auto across=EndpointAngleRectification::displacement(anchor,QJsonObject{{"x",700},{"y",417}},{400,400});
+            require(along.consistent(360)&&!across.consistent(360),"along-stroke midpoint shift and neighboring ray must be distinguished");
+        }
         ScaleCalibration::Mapping majorMapping;require(ScaleCalibration::build(automatic.points,{400,400},{},true,majorMapping),"automatic intermediate mapping");
         require(std::abs(automatic.points[1].toObject()["ratio"].toDouble()-.2)<1e-6&&distance(majorMapping.angles[1],189)<1.5,
             "0.2 must match its long tick rather than the nearby needle or shorter tick");
@@ -326,6 +583,26 @@ int main(int argc,char** argv) {
             "stroke-width allowance must not admit a clearly inconsistent major angle");
         const auto withoutMajor=OcrDialRange::calibrate(majorImage(true),majorLabels,{400,400},360,true,majorSurface);
         require(withoutMajor.valid()&&withoutMajor.points.size()==3,"missing long tick must not be replaced by a short tick or a predicted angle");
+        {
+            // Oblique 0.8 has a thick head and a separate thin stem. The
+            // short graduation below it is closer to the nominal angular grid.
+            const cv::Point2f center(100,250),mid(855,70);
+            auto splitMajor=[&](int lateralShift) {
+                cv::Mat patch(350,1050,CV_8U,cv::Scalar(220));
+                cv::fillConvexPoly(patch,std::vector<cv::Point>{{766,75},{852,64},{854,77},{768,88}},25);
+                std::vector<cv::Point> stem{{861,66},{943,58},{944,65},{862,73}};
+                for(auto& p:stem)p.y+=lateralShift;
+                cv::fillConvexPoly(patch,stem,25);
+                cv::line(patch,{858,161},{944,160},25,6);
+                std::vector<OcrDialRange::MajorTick> ticks;
+                OcrDialRange::majorTicks(patch,{},center,1037,{},nullptr,false,nullptr,&ticks);
+                return std::any_of(ticks.begin(),ticks.end(),[&](const OcrDialRange::MajorTick& m){
+                    return m.complete&&m.tick.length>160&&cv::norm(m.tick.point-mid)<8;
+                });
+            };
+            require(splitMajor(0),"aligned head and stem must supply one measured long graduation");
+            require(!splitMajor(18),"laterally displaced ink must not extend a short graduation");
+        }
         majorSurface.ambiguous=true;
         require(!OcrDialRange::calibrate(majorImage(false),majorLabels,{400,400},360,true,majorSurface).valid(),"ambiguous liquid must prevent automatic scale matching");
         majorSurface.ambiguous=false;majorSurface.y0=370;
@@ -403,6 +680,27 @@ int main(int argc,char** argv) {
         const cv::Mat normalize=(cv::Mat_<double>(3,3)<<1./300,0,-400./300,0,1./300,-400./300,0,0,1);
         const cv::Mat bias=(cv::Mat_<double>(3,3)<<.95,.02,.015,.005,1.04,.025,.015,-.02,1);
         const cv::Mat initial=bias*normalize*knownProjection.inv();
+        // A raised hub and a printed origin may be distinct in an oblique view.
+        const cv::Point2f raisedHub(413,388),printedOrigin(400,400);
+        std::vector<cv::Point2f> centers{raisedHub,printedOrigin};
+        cv::perspectiveTransform(centers,centers,knownProjection);
+        const cv::Mat printWarp=normalize*knownProjection.inv();
+        const auto hubWarp=AutoDialCalibration::anchorHomography(printWarp,centers[0]);
+        const std::vector<cv::Point2f> unitHandles{{0,-1},{1,0},{0,1},{-1,0}};
+        std::vector<cv::Point2f> handles;
+        cv::perspectiveTransform(unitHandles,handles,hubWarp.inv());
+        require(AutoDialCalibration::diametersMeetAt(handles,centers[0]) &&
+                !AutoDialCalibration::diametersMeetAt(handles,centers[1]),
+                "both source diameters must cross the measured hub under perspective");
+        for(int i=0;i<2;++i) {
+            auto shifted=handles;
+            shifted[i]+=cv::Point2f(9,11);
+            require(!AutoDialCalibration::diametersMeetAt(shifted,centers[0]),
+                    "one accurate diameter cannot hide an off-center opposite pair");
+        }
+        cv::perspectiveTransform(centers,centers,hubWarp);
+        require(cv::norm(centers[0])<1e-5 && cv::norm(centers[1]-(printedOrigin-raisedHub)/300)<1e-5,
+                "centering the handles must preserve the independent printed origin");
         auto projectedLines=graduationLines;
         for(auto& line:projectedLines) {
             std::vector<cv::Point2f> p{{line[0],line[1]},{line[2],line[3]}};cv::perspectiveTransform(p,p,knownProjection);
@@ -477,6 +775,8 @@ int main(int argc,char** argv) {
         cv::Mat oblique;cv::warpPerspective(synthetic,oblique,knownProjection,{800,600});
         const auto autoDial=AutoDialCalibration::detect(oblique);
         require(autoDial.valid(),"automatic four-point detection on known projected dial");
+        require(AutoDialCalibration::diametersMeetAt(autoDial.points,autoDial.hub),
+                "automatic refinement must preserve both projected diameters through the detected hub");
         const auto corrected=cv::getPerspectiveTransform(autoDial.points,std::vector<cv::Point2f>{{400,40},{760,400},{400,760},{40,400}});
         std::vector<cv::Point2f> reference;for(int i=0;i<36;++i)reference.push_back(point(i*10,275));
         std::vector<cv::Point2f> measured;cv::perspectiveTransform(reference,measured,corrected*knownProjection);

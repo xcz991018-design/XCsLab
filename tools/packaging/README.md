@@ -13,7 +13,7 @@ cmake -S tools/ocr_package_test -B build/ocr_package_test -DQt5_DIR=C:/Qt/Qt5.14
 cmake --build build/ocr_package_test --config Release
 ```
 
-准备 Python 3.12 的 `site-packages`（包含 `tools/ocr/requirements.txt` 的固定版本）及 PP-OCRv5 server 检测/识别模型。
+准备 Python 3.12 的 `site-packages`（包含 `tools/ocr/requirements.txt` 的固定版本）及 PP-OCRv5 mobile 检测/识别模型。
 目前项目开发环境可直接作为输入。打包脚本仅复制所需文件，不复制 venv 解释器或 `pyvenv.cfg`。
 
 下载官方 [Python 3.12.10 Windows x64 嵌入式运行时](https://www.python.org/ftp/python/3.12.10/python-3.12.10-embed-amd64.zip)，

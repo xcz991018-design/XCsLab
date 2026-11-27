@@ -53,7 +53,7 @@ def main():
             parser.error(f"Required input missing: {path}")
     if sha256(args.python_archive) != PYTHON_ARCHIVE_SHA256:
         parser.error("CPython archive SHA256 differs from the official Python SPDX checksum")
-    model_names = {"detection": "PP-OCRv5_server_det", "recognition": "PP-OCRv5_server_rec"}
+    model_names = {"detection": "PP-OCRv5_mobile_det", "recognition": "PP-OCRv5_mobile_rec"}
     for name in model_names.values():
         for filename in ("inference.json", "inference.pdiparams", "inference.yml"):
             if not (args.models / name / filename).is_file():

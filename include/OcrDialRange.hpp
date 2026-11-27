@@ -2,10 +2,12 @@
 #include "PaddleScaleOcr.hpp"
 #include "LiquidSurface.hpp"
 #include <array>
+#include <limits>
+#include "MajorAnchorRectification.hpp"
 
 namespace OcrDialRange {
 struct Result {bool valid{false};double minimum{0},maximum{0};cv::Point2f minimumPosition{},maximumPosition{};};
-inline Result detect(const QJsonArray& tokens,cv::Point2f center,double size) {
+inline Result detect(const QJsonArray& tokens,cv::Point2f center,double size,bool clockwise=true) {
     struct Candidate {double value,cost;cv::Point2f position;};
     std::vector<Candidate> sides[2];
     for(const auto& entry:PaddleScaleOcr::numericTokens(tokens)) {
@@ -24,8 +26,10 @@ inline Result detect(const QJsonArray& tokens,cv::Point2f center,double size) {
         for(size_t i=1;i<side.size();++i)
             if(side[i].cost-side[0].cost<8&&std::abs(side[i].value-side[0].value)>1e-6)return {};
     }
-    if(sides[0][0].value>=sides[1][0].value)return {};
-    return {true,sides[0][0].value,sides[1][0].value,sides[0][0].position,sides[1][0].position};
+    const auto& low=sides[clockwise?0:1].front();
+    const auto& high=sides[clockwise?1:0].front();
+    if(low.value>=high.value)return {};
+    return {true,low.value,high.value,low.position,high.position};
 }
 struct Endpoints {QJsonArray points;QString error;bool valid() const {return points.size()==2&&error.isEmpty();}};
 inline QJsonArray reliableNumbers(const QJsonArray& tokens,const LiquidSurface& surface) {
@@ -43,7 +47,24 @@ inline QJsonArray reliableNumbers(const QJsonArray& tokens,const LiquidSurface& 
     }
     return result;
 }
-struct MajorTick {AutoScaleCalibration::Tick tick;double innerWidth{0},outerWidth{0};};
+struct MajorTick {AutoScaleCalibration::Tick tick;double innerWidth{0},outerWidth{0};cv::Point2f outer{},inner{};bool complete{false};};
+inline bool joinMajorStem(const MajorTick& head,const MajorTick& stem,cv::Point2f center,double radius,MajorTick& joined) {
+    if(!head.complete || !stem.complete || stem.tick.radius<=head.tick.radius)return false;
+    const cv::Point2f axis=(head.outer-head.inner)/head.tick.length;
+    const cv::Point2f stemAxis=(stem.outer-stem.inner)/stem.tick.length;
+    const auto gap=stem.inner-head.outer;
+    const double width=std::max(head.outerWidth,stem.innerWidth);
+    // Compare the measured ink axes; a nearby parallel minor tick has a
+    // lateral offset, even when its angle from the hub is a close match.
+    if(axis.dot(stemAxis)<.99 || std::abs(axis.cross(gap))>width*.5 ||
+       gap.dot(axis)<-width*.5 || cv::norm(gap)>radius*.015)return false;
+    const double length=cv::norm(stem.outer-head.inner);
+    if(length<radius*.13||length>radius*.24)return false;
+    const auto mid=(head.inner+stem.outer)*.5f,radial=mid-center;
+    const double angle=AutoScaleCalibration::wrap(std::atan2(radial.y,radial.x)*180/CV_PI);
+    joined={{mid,angle,cv::norm(radial),length},head.innerWidth,stem.outerWidth,stem.outer,head.inner,true};
+    return true;
+}
 inline double exteriorStrokeBoundary(const AutoScaleCalibration::Tick& tick,const QJsonArray& numbers,cv::Point2f center,double radius) {
     const auto direction=(tick.point-center)*float(1/tick.radius);
     const auto inner=tick.point-direction*float(tick.length*.5),outer=tick.point+direction*float(tick.length*.5);
@@ -63,16 +84,22 @@ inline double exteriorStrokeBoundary(const AutoScaleCalibration::Tick& tick,cons
     }
     return -1;
 }
-inline std::vector<MajorTick> majorTicks(const cv::Mat& image,const QJsonArray& numbers,cv::Point2f center,double radius,const LiquidSurface& surface,QJsonArray* probes=nullptr) {
+inline std::vector<MajorTick> majorTicks(const cv::Mat& image,const QJsonArray& numbers,cv::Point2f center,double radius,const LiquidSurface& surface,QJsonArray* probes=nullptr,bool obliqueMajors=false,std::vector<AutoScaleCalibration::Tick>* shortStrokes=nullptr,std::vector<MajorTick>* recoveredMajors=nullptr,bool faintComponentsOnly=false) {
     std::vector<MajorTick> result;if(image.empty()||radius<40||surface.ambiguous)return result;
+    struct Component {
+        MajorTick stroke;
+        bool standalone;
+        int partners{0};
+    };
+    std::vector<Component> components;
     cv::Mat gray,ink;
     if(image.channels()==1)gray=image;else cv::cvtColor(image,gray,cv::COLOR_BGR2GRAY);
-    cv::adaptiveThreshold(gray,ink,255,cv::ADAPTIVE_THRESH_GAUSSIAN_C,cv::THRESH_BINARY_INV,31,9);
+    cv::adaptiveThreshold(gray,ink,255,cv::ADAPTIVE_THRESH_GAUSSIAN_C,cv::THRESH_BINARY_INV,31,faintComponentsOnly?4:9);
     for(int y=0;y<ink.rows;++y)for(int x=0;x<ink.cols;++x) {
         const double r=std::hypot(x-center.x,y-center.y);
         if(r<radius*.60||r>radius*.96||surface.excludes(x,y-2))ink.at<uchar>(y,x)=0;
     }
-    const auto exteriorInk=ink.clone();
+    const auto exteriorInk=faintComponentsOnly?cv::Mat():ink.clone();
     // OCR regions are text, not stroke evidence. Keep a small separation from
     // their edges so glyphs cannot join a nearby graduation component.
     cv::Mat text=cv::Mat::zeros(ink.size(),CV_8U);
@@ -81,12 +108,12 @@ inline std::vector<MajorTick> majorTicks(const cv::Mat& image,const QJsonArray& 
         if(p.size()==4)cv::fillConvexPoly(text,p,255);
     }
     cv::dilate(text,text,cv::getStructuringElement(cv::MORPH_ELLIPSE,{5,5}));ink.setTo(0,text);
-    cv::Mat components,stats,centroids;const int count=cv::connectedComponentsWithStats(ink,components,stats,centroids,8);
+    cv::Mat pixelLabels,stats,centroids;const int count=cv::connectedComponentsWithStats(ink,pixelLabels,stats,centroids,8);
     for(int label=1;label<count;++label) {
         if(stats.at<int>(label,cv::CC_STAT_AREA)<radius*.05)continue;
         const cv::Rect bounds(stats.at<int>(label,cv::CC_STAT_LEFT),stats.at<int>(label,cv::CC_STAT_TOP),stats.at<int>(label,cv::CC_STAT_WIDTH),stats.at<int>(label,cv::CC_STAT_HEIGHT));
         std::vector<cv::Point2f> pixels;
-        for(int y=bounds.y;y<bounds.br().y;++y)for(int x=bounds.x;x<bounds.br().x;++x)if(components.at<int>(y,x)==label)pixels.emplace_back(float(x),float(y));
+        for(int y=bounds.y;y<bounds.br().y;++y)for(int x=bounds.x;x<bounds.br().x;++x)if(pixelLabels.at<int>(y,x)==label)pixels.emplace_back(float(x),float(y));
         cv::Vec4f line;cv::fitLine(pixels,line,cv::DIST_HUBER,0,.01,.01);
         cv::Point2f direction(line[0],line[1]),anchor(line[2],line[3]);
         if(direction.dot(anchor-center)<0)direction=-direction;
@@ -94,8 +121,9 @@ inline std::vector<MajorTick> majorTicks(const cv::Mat& image,const QJsonArray& 
         std::sort(projections.begin(),projections.end());
         const double lo=projections[projections.size()/50],hi=projections[projections.size()-1-projections.size()/50],length=hi-lo;
         const auto middle=anchor+direction*float((lo+hi)*.5),radial=middle-center;const double r=cv::norm(radial);
-        if(length<radius*.07||length>radius*.24||r<radius*.64||r+length*.5<radius*.72||r>radius*.95||
-           std::abs(direction.x*radial.y-direction.y*radial.x)>radius*.09)continue;
+        const double axisOffset=std::abs(direction.cross(radial));
+        if(length<radius*(shortStrokes?.035:.07)||length>radius*.24||r<radius*.64||r+length*.5<radius*.72||r>radius*.95||
+           axisOffset>radius*.13)continue;
         // Compare transverse ink width along the inner and outer thirds. The
         // inner thick head is supporting evidence; straight long ticks also work.
         double innerArea=0,outerArea=0;
@@ -110,8 +138,41 @@ inline std::vector<MajorTick> majorTicks(const cv::Mat& image,const QJsonArray& 
             if(!safe)continue;
         }
         const double a=AutoScaleCalibration::wrap(std::atan2(radial.y,radial.x)*180/CV_PI);
-        result.push_back({{middle,a,r,length},innerWidth,outerWidth});
+        const bool standalone=axisOffset<=radius*.09 || (obliqueMajors&&length>=radius*.13);
+        if(length<radius*.07) {
+            if(standalone)shortStrokes->push_back({middle,a,r,length});
+            continue;
+        }
+        const auto outer=anchor+direction*float(hi),inner=anchor+direction*float(lo);
+        const bool complete=cv::norm(outer-center)<radius*.96-3 && cv::norm(inner-center)>radius*.60+3;
+        MajorTick stroke{{middle,a,r,length},innerWidth,outerWidth,outer,inner,complete};
+        if(standalone)result.push_back(stroke);
+        if(recoveredMajors&&complete)components.push_back({stroke,standalone});
     }
+    if(faintComponentsOnly)return result;
+    // Resolve pairs before applying the single-component radial test. A
+    // re-warp can put either piece just outside that tolerance.
+    struct Joined {size_t head,stem; MajorTick stroke;};
+    std::vector<Joined> joined;
+    for(size_t i=0;i<components.size();++i)for(size_t j=i+1;j<components.size();++j) {
+        if(components[i].standalone && components[j].standalone)continue;
+        const bool iFirst=components[i].stroke.tick.radius<components[j].stroke.tick.radius;
+        const size_t head=iFirst?i:j,stem=iFirst?j:i;
+        MajorTick stroke;
+        if(joinMajorStem(components[head].stroke,components[stem].stroke,center,radius,stroke)) {
+            ++components[head].partners;
+            ++components[stem].partners;
+            joined.push_back({head,stem,stroke});
+        }
+    }
+    for(const auto& pair:joined)if(components[pair.head].partners==1&&components[pair.stem].partners==1) {
+        recoveredMajors->push_back(pair.stroke);
+    }
+    // A complete tilted line may also qualify when its thin and thick parts
+    // are connected. Only the label-aware matching stage can promote it.
+    for(const auto& component:components)
+        if(!component.standalone && component.partners==0 && component.stroke.tick.length>=radius*.13)
+            recoveredMajors->push_back(component.stroke);
     // A tick can touch the needle or a zero-stop symbol. Recover its straight
     // stem with LSD, then verify real ink and width along that stem instead of
     // discarding the entire joined connected component.
@@ -226,6 +287,13 @@ struct Calibration {
     QJsonArray points;
     QString error;
     int skipped{0};
+    std::vector<MajorAnchorRectification::Observation> geometry;
+    // Derived values are reading anchors, never independent evidence for rectification.
+    QJsonArray unlabeledPoints;
+    void transformPoints(const cv::Mat& H) {
+        points=ScaleCalibration::transformed(points,H);
+        unlabeledPoints=ScaleCalibration::transformed(unlabeledPoints,H);
+    }
     bool valid() const {return error.isEmpty()&&points.size()>=2;}
 };
 inline cv::RotatedRect printedRing(const std::vector<MajorTick>& ticks,cv::Point2f center,double radius) {
@@ -249,31 +317,247 @@ inline cv::RotatedRect printedRing(const std::vector<MajorTick>& ticks,cv::Point
     if(inliers.size()<18||inliers.size()<tips.size()*.8)return {};
     ellipse=cv::fitEllipse(inliers);return valid(ellipse)?ellipse:cv::RotatedRect{};
 }
-inline Calibration calibrate(const cv::Mat& image,const QJsonArray& tokens,cv::Point2f center,double radius,bool clockwise,const LiquidSurface& surface={},QJsonArray* diagnostics=nullptr) {
+inline QJsonArray unlabeledMajorAnchors(const cv::Mat& image,const QJsonArray& tokens,const Calibration& calibration,const ScaleCalibration::Mapping& mapping,
+        const std::vector<MajorTick>& strokes,const std::vector<AutoScaleCalibration::Tick>& shortStrokes,const std::vector<AutoScaleCalibration::Number>& labels,
+        cv::Point2f center,double radius,bool clockwise,const cv::RotatedRect& printed,const LiquidSurface& surface) {
+    QJsonArray points;
+    const double range=calibration.range.maximum-calibration.range.minimum;
+    // Use the stroke lengths and outer tips measured at the two bounding labels.
+    std::vector<const MajorTick*> references;
+    for(const auto& entry:calibration.points) {
+        const auto p=entry.toObject();
+        const cv::Point2f position(p["x"].toDouble(),p["y"].toDouble());
+        const auto found=std::find_if(strokes.begin(),strokes.end(),[&](const MajorTick& m){return cv::norm(m.tick.point-position)<.5;});
+        if(found==strokes.end())return {};
+        references.push_back(&*found);
+    }
+    struct Candidate {const AutoScaleCalibration::Tick* tick; double offset,relativeLength; bool major;};
+    struct MaskedInterval {
+        size_t index;
+        double arc,firstHidden,lastHidden,minimumLength;
+        double firstUnmatchedRatio,lastUnmatchedRatio;
+        std::vector<Candidate> ticks;
+    };
+    std::vector<MaskedInterval> maskedIntervals;
+    std::vector<double> countedSteps(references.size(),0);
+    const bool fittedRing=printed.size.width>0;
+    const auto ringAt=[&](const AutoScaleCalibration::Tick& tick,cv::Point2f outer) {
+        return fittedRing?printedRadius(printed,outer):tick.radius+tick.length*.5;
+    };
+    const auto radialTip=[&](const AutoScaleCalibration::Tick& tick) {
+        return center+(tick.point-center)*float(1+tick.length/(2*tick.radius));
+    };
+    const auto majorRing=[&](const MajorTick& mark) {
+        return ringAt(mark.tick,mark.complete?mark.outer:radialTip(mark.tick));
+    };
+    const auto anchor=[&](const Candidate& c,double ratio) {
+        return QJsonObject{{"x",c.tick->point.x},{"y",c.tick->point.y},{"ratio",ratio},
+            {"origin_x",center.x},{"origin_y",center.y},{"source",QStringLiteral("unlabeled_major_tick")}};
+    };
+    for(size_t i=1;i<references.size();++i) {
+        const auto& left=references[i-1]->tick;
+        const auto& right=references[i]->tick;
+        const double arc=mapping.offsets[i]-mapping.offsets[i-1];
+        const double low=calibration.range.minimum+range*mapping.ratios[i-1];
+        const double high=calibration.range.minimum+range*mapping.ratios[i];
+        double firstHidden=arc,lastHidden=-1;
+        double firstUnmatchedRatio=mapping.ratios[i],lastUnmatchedRatio=mapping.ratios[i-1];
+        for(const auto& label:labels) {
+            if(label.value<=low+1e-6||label.value>=high-1e-6)continue;
+            const auto radial=label.center-center;
+            const double angle=std::atan2(radial.y,radial.x)*180/CV_PI;
+            const double offset=ScaleCalibration::span(left.angle,angle,clockwise);
+            const double ratio=(label.value-calibration.range.minimum)/range;
+            firstUnmatchedRatio=std::min(firstUnmatchedRatio,ratio);
+            lastUnmatchedRatio=std::max(lastUnmatchedRatio,ratio);
+            // Stop at the unmatched label's observed ray as well as its value.
+            // A label outside this arc cannot localize the break.
+            firstHidden=std::min(firstHidden,offset<=arc?offset:0.);
+            lastHidden=std::max(lastHidden,offset<=arc?offset:arc);
+        }
+        if(surface.found) {
+            const int samples=int(std::ceil(arc));
+            for(int j=0;j<=samples;++j) {
+                const double f=double(j)/samples;
+                const double angle=(left.angle+(clockwise?1:-1)*arc*f)*CV_PI/180;
+                const double r=left.radius+(right.radius-left.radius)*f;
+                const double length=left.length+(right.length-left.length)*f;
+                for(double tip:{r-length*.5,r+length*.5}) {
+                    if(surface.excludes(center.x+tip*std::cos(angle),center.y+tip*std::sin(angle)-2)) {
+                        firstHidden=std::min(firstHidden,arc*f);
+                        lastHidden=std::max(lastHidden,arc*f);
+                    }
+                }
+            }
+        }
+        std::vector<Candidate> candidates;
+        const double leftRing=majorRing(*references[i-1]),rightRing=majorRing(*references[i]);
+        const auto collect=[&](const AutoScaleCalibration::Tick& t,double ring,bool major) {
+            const double offset=ScaleCalibration::span(left.angle,t.angle,clockwise);
+            if(offset<1.7||offset>arc-1.7)return;
+            const double f=offset/arc;
+            const double length=left.length+(right.length-left.length)*f;
+            if(std::abs(ring-(leftRing+(rightRing-leftRing)*f))>(fittedRing?.02:radius*.045))return;
+            candidates.push_back({&t,offset,t.length/length,major});
+        };
+        for(const auto& m:strokes)collect(m.tick,majorRing(m),m.complete);
+        for(const auto& t:shortStrokes)collect(t,ringAt(t,radialTip(t)),false);
+        if(candidates.empty())continue;
+        // Use the shorter strokes on the same ring as a length reference. On a
+        // long-only dial the matched numeric ticks supply that reference instead.
+        std::vector<double> lengths;
+        for(const auto& c:candidates)lengths.push_back(c.relativeLength);
+        std::sort(lengths.begin(),lengths.end());
+        const double shorter=lengths[lengths.size()/4];
+        const double minimumLength=shorter<.8?std::max(.65,shorter*1.30):.85;
+        std::vector<Candidate> longTicks;
+        for(const auto& c:candidates)
+            if(c.major&&c.relativeLength>=minimumLength&&c.relativeLength<=1.30)longTicks.push_back(c);
+        std::sort(longTicks.begin(),longTicks.end(),[](const Candidate& a,const Candidate& b){return a.offset<b.offset;});
+        if(lastHidden>=0) {
+            maskedIntervals.push_back({i,arc,firstHidden,lastHidden,minimumLength,firstUnmatchedRatio,lastUnmatchedRatio,std::move(longTicks)});
+            continue;
+        }
+        if(longTicks.empty())continue;
+
+        const double parts=double(longTicks.size()+1);
+        const double pitch=arc/parts;
+        QJsonArray interval;
+        double previous=0;
+        for(size_t k=0;k<longTicks.size();++k) {
+            const auto& c=longTicks[k];
+            // A skipped or competing line must not renumber the rest of the arc.
+            if(std::abs(c.offset-(k+1)*pitch)>std::min(5.,pitch*.28)||
+               std::abs((c.offset-previous)-pitch)>pitch*.30)break;
+            previous=c.offset;
+            const double ratio=mapping.ratios[i-1]+(mapping.ratios[i]-mapping.ratios[i-1])*(k+1)/parts;
+            interval.append(anchor(c,ratio));
+        }
+        if(size_t(interval.size())==longTicks.size()) {
+            countedSteps[i]=(mapping.ratios[i]-mapping.ratios[i-1])/parts;
+            for(const auto& p:interval)points.append(p);
+        }
+    }
+    // The hidden middle supplies no count. Work inward from each numbered
+    // edge only while actual visible long strokes support the adjacent measured step.
+    std::vector<MajorTick> faintStrokes;
+    bool searchedFaintStrokes=false;
+    for(auto& section:maskedIntervals) {
+        const size_t i=section.index;
+        const double leftStep=countedSteps[i-1],rightStep=i+1<countedSteps.size()?countedSteps[i+1]:0;
+        if(leftStep>0&&rightStep>0&&std::abs(leftStep-rightStep)>1e-6)continue;
+        if(leftStep<=0&&rightStep<=0)continue;
+        if(surface.found&&fittedRing) {
+            if(!searchedFaintStrokes) {
+                faintStrokes=majorTicks(image,tokens,center,radius,surface,nullptr,false,nullptr,nullptr,true);
+                searchedFaintStrokes=true;
+            }
+            const auto& left=references[i-1]->tick;
+            const auto& right=references[i]->tick;
+            const double leftRing=majorRing(*references[i-1]),rightRing=majorRing(*references[i]);
+            const auto strongCount=section.ticks.size();
+            for(const auto& mark:faintStrokes) {
+                if(!mark.complete)continue;
+                const auto& tick=mark.tick;
+                const double offset=ScaleCalibration::span(left.angle,tick.angle,clockwise);
+                if(offset<1.7||offset>section.arc-1.7||
+                   (offset>=section.firstHidden&&offset<=section.lastHidden))continue;
+                const double f=offset/section.arc;
+                const double relativeLength=tick.length/(left.length+(right.length-left.length)*f);
+                // Two contrast passes must agree on the ink before allowing
+                // another half percent of local ring deviation after re-warping.
+                if(relativeLength<section.minimumLength||relativeLength>1.30||
+                   std::abs(majorRing(mark)-(leftRing+(rightRing-leftRing)*f))>.025)continue;
+                if(std::any_of(section.ticks.begin(),section.ticks.begin()+strongCount,[&](const Candidate& c){
+                    return std::abs(c.offset-offset)<1.7;
+                }))continue;
+                // The lower-contrast fit must extend or refine ink also found in
+                // the original pass. A faint edge by itself cannot add an anchor.
+                const auto axis=(mark.outer-mark.inner)/tick.length;
+                if(std::none_of(strokes.begin(),strokes.end(),[&](const MajorTick& strong){
+                    if(!strong.complete||AutoScaleCalibration::distance(strong.tick.angle,tick.angle)>=1.7)return false;
+                    const auto d=strong.tick.point-tick.point;
+                    return std::abs(axis.cross(d))<=radius*.012&&std::abs(axis.dot(d))<=tick.length*.5;
+                }))continue;
+                section.ticks.push_back({&tick,offset,relativeLength,true});
+            }
+            std::sort(section.ticks.begin(),section.ticks.end(),[](const Candidate& a,const Candidate& b){return a.offset<b.offset;});
+        }
+        const double span=mapping.ratios[i]-mapping.ratios[i-1];
+        for(bool fromLeft:{true,false}) {
+            // A break at a known value lets either edge use the verified step
+            // from the opposite neighbor. Each intervening stroke must still match.
+            const bool hasUnmatched=section.firstUnmatchedRatio<=section.lastUnmatchedRatio;
+            const double step=hasUnmatched?std::max(leftStep,rightStep):(fromLeft?leftStep:rightStep);
+            if(step<=0)continue;
+            const double parts=std::round(span/step);
+            if(parts<2||std::abs(span/step-parts)>1e-5)continue;
+            const double pitch=section.arc/parts;
+            const double tolerance=std::min(5.,pitch*.28);
+            const double visible=fromLeft?section.firstHidden:section.arc-section.lastHidden;
+            double previous=0;
+            for(size_t k=0;k<section.ticks.size();++k) {
+                const auto& c=section.ticks[fromLeft?k:section.ticks.size()-1-k];
+                const double offset=fromLeft?c.offset:section.arc-c.offset;
+                const double expected=(k+1)*pitch;
+                if(offset>=visible||k+1>=parts||std::abs(offset-expected)>tolerance||
+                   std::abs(offset-previous-pitch)>pitch*.30)break;
+                if(k+1<section.ticks.size()) {
+                    const double next=fromLeft?section.ticks[k+1].offset:section.arc-section.ticks[section.ticks.size()-2-k].offset;
+                    if(std::abs(next-expected)<=tolerance)break;
+                }
+                const double ratio=fromLeft?mapping.ratios[i-1]+(k+1)*step:mapping.ratios[i]-(k+1)*step;
+                if(fromLeft?ratio>=section.firstUnmatchedRatio-1e-6:ratio<=section.lastUnmatchedRatio+1e-6)break;
+                previous=offset;
+                int index=0;
+                while(index<points.size()&&points.at(index).toObject()["ratio"].toDouble()<ratio-1e-6)++index;
+                if(index==points.size()||std::abs(points.at(index).toObject()["ratio"].toDouble()-ratio)>1e-6)
+                    points.insert(index,anchor(c,ratio));
+            }
+        }
+    }
+    return points;
+}
+inline Calibration calibrate(const cv::Mat& image,const QJsonArray& tokens,cv::Point2f center,double radius,bool clockwise,const LiquidSurface& surface={},QJsonArray* diagnostics=nullptr,const QJsonArray& expectedAnchors={},bool obliqueMajors=false) {
     using namespace AutoScaleCalibration;
     Calibration result;
     if(surface.ambiguous){result.error=QStringLiteral(u"液面位置有歧义，请先确认液面；原刻度标定保留。");return result;}
     const auto refined=PaddleScaleOcr::tightenTickSuffixBoxes(image,tokens);
     const auto reliable=reliableNumbers(refined,surface);
-    result.range=detect(reliable,center,image.cols);
+    result.range=detect(reliable,center,image.cols,clockwise);
     if(!result.range.valid){result.error=QStringLiteral(u"液面下方缺少可靠的左下、右下端点数字，原标定保留。");return result;}
-    const auto majors=majorTicks(image,PaddleScaleOcr::numericTokens(refined),center,radius,surface);
+    std::vector<Tick> shortStrokes;
+    std::vector<MajorTick> recoveredMajors;
+    const auto numericTokens=PaddleScaleOcr::numericTokens(refined);
+    auto majors=majorTicks(image,numericTokens,center,radius,surface,nullptr,obliqueMajors,&shortStrokes,&recoveredMajors);
     const auto printed=printedRing(majors,center,radius);
     std::vector<Tick> ticks;std::vector<double> shapeScores;
     for(const auto& m:majors){ticks.push_back(m.tick);shapeScores.push_back(std::clamp(m.innerWidth/std::max(1.,m.outerWidth)-1.,0.,2.)*.8);}
     const auto endpoints=matchEndpoints(result.range,ticks,center,radius,clockwise,shapeScores,printed);
     if(!endpoints.valid()){result.error=endpoints.error;return result;}
+    const int ordinaryCount=int(majors.size());
+    majors.insert(majors.end(),recoveredMajors.begin(),recoveredMajors.end());
     const auto first=endpoints.points[0].toObject(),last=endpoints.points[1].toObject();
     const cv::Point2f firstPoint(first["x"].toDouble(),first["y"].toDouble()),lastPoint(last["x"].toDouble(),last["y"].toDouble());
     const double firstAngle=wrap(std::atan2(firstPoint.y-center.y,firstPoint.x-center.x)*180/CV_PI);
     const double lastAngle=wrap(std::atan2(lastPoint.y-center.y,lastPoint.x-center.x)*180/CV_PI);
     const double sweep=ScaleCalibration::span(firstAngle,lastAngle,clockwise),ring=(cv::norm(firstPoint-center)+cv::norm(lastPoint-center))*.5;
     struct Choice {double ratio,cost;int tick;};std::vector<Choice> choices;
-    for(const auto& number:numbers(reliable,result.range.minimum,result.range.maximum)) {
+    const auto labels=numbers(reliable,result.range.minimum,result.range.maximum);
+    for(const auto& number:labels) {
         const double ratio=(number.value-result.range.minimum)/(result.range.maximum-result.range.minimum);
         if(ratio<=0||ratio>=1)continue;
         const auto d=number.center-center;const double labelAngle=wrap(std::atan2(d.y,d.x)*180/CV_PI),labelRadius=cv::norm(d);
+        // Re-detection on a warped copy has a prediction from the same frozen frame.
+        double trackedAngle=std::numeric_limits<double>::quiet_NaN();
+        for(const auto& entry:expectedAnchors) {
+            const auto prior=entry.toObject();
+            if(std::abs(prior["ratio"].toDouble()-ratio)>1e-6)continue;
+            trackedAngle=std::atan2(prior["y"].toDouble()-center.y,prior["x"].toDouble()-center.x)*180/CV_PI;
+            break;
+        }
         std::vector<Choice> candidates;
+        std::vector<Choice> recoveredChoices;
         for(int i=0;i<int(majors.size());++i) {
             const auto& m=majors[i];const auto& t=m.tick;
             const double expected=wrap(firstAngle+(clockwise?1:-1)*sweep*ratio),angularError=distance(t.angle,expected);
@@ -281,6 +565,7 @@ inline Calibration calibrate(const cv::Mat& image,const QJsonArray& tokens,cv::P
             // interval occupied by that stroke, allowing at most one degree of
             // measured half-width beyond the nominal 5-degree model residual.
             const double uncertainty=std::min(1.,std::atan2(std::max(m.innerWidth,m.outerWidth)*.5,t.radius)*180/CV_PI);
+            if(std::isfinite(trackedAngle)&&distance(trackedAngle,t.angle)>1.5)continue;
             auto onRing=[&](const Tick& t) {
                 bool sameRing=std::abs(t.radius-ring)<=radius*.08;
                 if(printed.size.width>0) {
@@ -315,7 +600,19 @@ inline Calibration calibrate(const cv::Mat& image,const QJsonArray& tokens,cv::P
             // A nearby needle edge can be closer to the uniform-angle prior
             // than the real printed tick. Give the observed numeric label
             // enough weight to distinguish those competing measured strokes.
-            candidates.push_back({ratio,angularError+labelError*.5-t.length/radius*12-taper*.8,i});
+            const Choice choice{ratio,angularError+labelError*.5-t.length/radius*12-taper*.8,i};
+            if(i<ordinaryCount)candidates.push_back(choice);
+            else if(directMajor)recoveredChoices.push_back(choice);
+        }
+        // Correct a competing short tick only when a unique measured long stroke
+        // directly outside the number is longer and closer to the label.
+        if(recoveredChoices.size()==1&&(!candidates.empty()||std::isfinite(trackedAngle))) {
+            const auto& recovered=majors[recoveredChoices.front().tick].tick;
+            const double recoveredError=distance(recovered.angle,labelAngle);
+            if(std::all_of(candidates.begin(),candidates.end(),[&](const Choice& c){
+                const auto& other=ticks[c.tick];
+                return other.length<recovered.length*.70 && distance(other.angle,labelAngle)>recoveredError+2.5;
+            }))candidates=recoveredChoices;
         }
         if(candidates.empty()){++result.skipped;continue;}
         std::sort(candidates.begin(),candidates.end(),[](const Choice& a,const Choice& b){return a.cost<b.cost;});
@@ -325,35 +622,55 @@ inline Calibration calibrate(const cv::Mat& image,const QJsonArray& tokens,cv::P
     std::sort(choices.begin(),choices.end(),[](const Choice& a,const Choice& b){return a.cost<b.cost;});
     std::set<int> usedTicks;std::set<double> usedRatios;
     std::vector<QJsonObject> points{first,last};
-    for(const auto& c:choices)if(usedTicks.insert(c.tick).second&&usedRatios.insert(c.ratio).second) {
-        const auto p=ticks[c.tick].point;points.push_back({{"x",p.x},{"y",p.y},{"ratio",c.ratio}});
+    for(const auto& c:choices)if(!usedTicks.count(c.tick)&&!usedRatios.count(c.ratio)) {
+        usedTicks.insert(c.tick);usedRatios.insert(c.ratio);
+        const auto p=majors[c.tick].tick.point;points.push_back({{"x",p.x},{"y",p.y},{"ratio",c.ratio}});
     }
+    // Only selected repairs may supply evidence for unlabeled graduations.
+    majors.resize(ordinaryCount);
+    for(int index:usedTicks)if(index>=ordinaryCount)majors.push_back(recoveredMajors[index-ordinaryCount]);
     std::sort(points.begin(),points.end(),[](const QJsonObject& a,const QJsonObject& b){return a["ratio"].toDouble()<b["ratio"].toDouble();});
-    for(auto p:points){p["origin_x"]=center.x;p["origin_y"]=center.y;result.points.append(p);}
+    for(auto p:points){
+        p["origin_x"]=center.x;p["origin_y"]=center.y;result.points.append(p);
+        const cv::Point2f position(p["x"].toDouble(),p["y"].toDouble());
+        for(const auto& m:majors)if(m.complete&&cv::norm(m.tick.point-position)<.5) {
+            result.geometry.push_back({m.outer,m.inner,p["ratio"].toDouble()});break;
+        }
+    }
     ScaleCalibration::Mapping mapping;
     if(!ScaleCalibration::valid(result.points,image.cols,image.rows,center)||!ScaleCalibration::build(result.points,center,{},clockwise,mapping)) {
         result.points={};result.error=QStringLiteral(u"数字与长刻度的顺序不一致，原标定保留。");
-    }
+    } else result.unlabeledPoints=unlabeledMajorAnchors(image,numericTokens,result,mapping,majors,shortStrokes,labels,center,radius,clockwise,printed,surface);
     return result;
 }
 inline bool mergeCalibration(const QJsonArray& existing,const Calibration& calibration,cv::Point2f hub,int size,bool clockwise,QJsonArray& merged) {
     if(!calibration.valid())return false;
     std::vector<QJsonObject> points;for(const auto& p:calibration.points)points.push_back(p.toObject());
-    for(const auto& value:existing) {
+    for(const auto& value:ScaleCalibration::majorAnchors(existing)) {
         const auto p=value.toObject();const double ratio=p["ratio"].toDouble();if(ratio<=0||ratio>=1)continue;
+        if(ScaleCalibration::isUnlabeledMajor(p))continue; // Reacquire automatic strokes on each run.
         bool replaced=false;for(const auto& automatic:points)if(std::abs(automatic["ratio"].toDouble()-ratio)<1e-6)replaced=true;
         if(!replaced)points.push_back(p);
     }
     std::sort(points.begin(),points.end(),[](const QJsonObject& a,const QJsonObject& b){return a["ratio"].toDouble()<b["ratio"].toDouble();});
     QJsonArray candidate;for(const auto& p:points)candidate.append(p);ScaleCalibration::Mapping mapping;
     if(!ScaleCalibration::valid(candidate,size,size,hub)||!ScaleCalibration::build(candidate,hub,{},clockwise,mapping))return false;
+    for(const auto& value:calibration.unlabeledPoints) {
+        const double ratio=value.toObject()["ratio"].toDouble();
+        int index=0;
+        while(index<candidate.size()&&candidate[index].toObject()["ratio"].toDouble()<ratio-1e-6)++index;
+        if(index==0||index==candidate.size()||std::abs(candidate[index].toObject()["ratio"].toDouble()-ratio)<1e-6)continue;
+        auto trial=candidate;
+        trial.insert(index,value);
+        if(ScaleCalibration::valid(trial,size,size,hub)&&ScaleCalibration::build(trial,hub,{},clockwise,mapping))candidate=trial;
+    }
     merged=candidate;return true;
 }
 inline bool mergeEndpoints(const QJsonArray& existing,const Endpoints& endpoints,cv::Point2f center,
                            int size,bool clockwise,QJsonArray& merged) {
     if(!endpoints.valid())return false;
     QJsonArray candidate{endpoints.points[0]};
-    for(const auto& p:existing)if(p.toObject()["ratio"].toDouble()>0&&p.toObject()["ratio"].toDouble()<1)candidate.append(p);
+    for(const auto& p:ScaleCalibration::majorAnchors(existing))if(p.toObject()["ratio"].toDouble()>0&&p.toObject()["ratio"].toDouble()<1)candidate.append(p);
     candidate.append(endpoints.points[1]);ScaleCalibration::Mapping mapping;
     if(!ScaleCalibration::valid(candidate,size,size,center)||!ScaleCalibration::build(candidate,center,{},clockwise,mapping))return false;
     merged=candidate;return true;

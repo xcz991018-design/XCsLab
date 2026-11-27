@@ -179,7 +179,7 @@ def refine_tall_digits(pipeline_options, view, tokens, rotation, restore, shared
             regions.append(region)
     if not regions:
         return []
-    model_name = pipeline_options.get("text_recognition_model_name", "PP-OCRv5_server_rec")
+    model_name = pipeline_options.get("text_recognition_model_name", "PP-OCRv5_mobile_rec")
     crops, owners = [], []
     for region in regions[:64]:
         left, top, right, bottom = region
@@ -278,6 +278,9 @@ def configure_runtime():
     config = json.loads(settings.read_text(encoding="utf-8"))
     options = dict(ocr_version=config["ocr_version"])
     for kind in ("detection", "recognition"):
+        expected = "PP-OCRv5_mobile_" + ("det" if kind == "detection" else "rec")
+        if config[f"{kind}_model_name"] != expected:
+            raise ValueError("This build requires mobile OCR models; redeploy the mobile offline bundle")
         directory = (root / config[f"{kind}_model_dir"]).resolve()
         if not directory.is_relative_to(root) or not all((directory / name).is_file() for name in ("inference.json", "inference.pdiparams", "inference.yml")):
             raise FileNotFoundError(f"Offline {kind} model missing or invalid: {directory}")
@@ -315,6 +318,8 @@ def create_pipeline():
 
     options = dict(
         ocr_version=os.environ.get("GAUGE_OCR_VERSION", "PP-OCRv5"),
+        text_detection_model_name="PP-OCRv5_mobile_det",
+        text_recognition_model_name="PP-OCRv5_mobile_rec",
         device="cpu",
         # Paddle 3.3 Windows oneDNN can reject PIR attributes in PP-OCRv5.
         enable_mkldnn=False,
